@@ -89,6 +89,8 @@ git config --global http.version HTTP/1.1
 git config --global url."https://<你的镜像>/https://github.com/".insteadOf "https://github.com/"
 ```
 
+本机没有 Python ≥ 3.10 时，脚本会自动切换到 PATH 里可用的新版解释器（`python3.11` / `python3.12` 等）；仍然找不到时会打印用 uv 装解释器的命令 —— 无需 root，也不动系统 Python。
+
 ## Docker（可选）
 
 用 `python quickstart.py --docker` 可让脚本自动生成 `JWT_SECRET` 并起容器。

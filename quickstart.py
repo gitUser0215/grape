@@ -92,8 +92,13 @@ def probe() -> dict:
     ver = sys.version_info
     py_ok = ver >= (3, 10)
     (ok if py_ok else warn)(f"Python：{sys.executable} {ver.major}.{ver.minor}（{'满足' if py_ok else '低于'} >= 3.10）")
+    alt = None
     if not py_ok:
-        warn("本脚本自身也需要 Python >= 3.10；请升级 Python 后重跑，或直接使用 Docker：docker compose up -d")
+        alt = find_newer_python()
+        if alt:
+            ok(f"发现可用解释器：{alt[0]}（Python {alt[1]}）→ 将用它重新执行本脚本")
+        else:
+            warn("本机没有 Python >= 3.10（Grape 的虚拟环境需要 3.10+；本脚本自身 3.8+ 即可运行）")
 
     node = shutil.which("node")
     if node:
@@ -111,7 +116,38 @@ def probe() -> dict:
 
     busy = [p for p in (3000, 8080, 80) if port_busy(p)]
     (warn if busy else ok)(f"端口：{'被占用 ' + ', '.join(map(str, busy)) if busy else '3000 / 8080 / 80 空闲'}")
-    return {"os": os_name, "py_ok": py_ok, "docker": dc, "busy": busy}
+    return {"os": os_name, "py_ok": py_ok, "alt": alt, "docker": dc, "busy": busy}
+
+
+NEWER_PY_HELP = (
+    "    可选路径：\n"
+    "    ① 用 uv 装一个新解释器（不 sudo、不动系统 Python）：\n"
+    "       curl -LsSf https://astral.sh/uv/install.sh | sh\n"
+    "       ~/.local/bin/uv python install 3.12\n"
+    "       ~/.local/bin/uv venv --python 3.12 /tmp/py312\n"
+    "       /tmp/py312/bin/python quickstart.py\n"
+    "    ② 或用包管理器装一个（如 dnf install -y python3.11），再 python3.11 quickstart.py\n"
+    "    ③ 或安装 Docker 后重跑"
+)
+
+
+PY_CANDIDATES = ("python3.14", "python3.13", "python3.12", "python3.11", "python3.10", "python3")
+
+
+def find_newer_python() -> tuple[str, str] | None:
+    """在 PATH 里找一个 >= 3.10 的解释器（本机系统 Python 太旧时用它重新执行本脚本）。"""
+    for name in PY_CANDIDATES:
+        cand = shutil.which(name)
+        if not cand or Path(cand).resolve() == Path(sys.executable).resolve():
+            continue
+        r = subprocess.run([cand, "-c", "import sys;sys.exit(0 if sys.version_info>=(3,10) else 1)"],
+                           capture_output=True)
+        if r.returncode != 0:
+            continue
+        v = subprocess.run([cand, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                           capture_output=True, text=True).stdout.strip()
+        return (cand, v)
+    return None
 
 
 def python_ok_marker(path: Path) -> bool:
@@ -125,6 +161,9 @@ def python_ok_marker(path: Path) -> bool:
 def ensure_venv() -> Path:
     step("虚拟环境 .venv")
     vp = venv_python()
+    if vp.exists() and not python_ok_marker(vp):
+        die(f".venv 已存在，但其 Python 低于 3.10（{vp}）。\n"
+            "    删掉旧环境后重跑即可按当前解释器重建：rm -rf .venv && python quickstart.py")
     if python_ok_marker(vp):
         ok(f".venv 已存在：{vp}")
         return vp
@@ -262,6 +301,10 @@ def main() -> None:
             "    请把 quickstart.py 放到已 clone 的 grape 仓库根目录后再执行。")
 
     info = probe()
+    if not info["py_ok"] and info.get("alt") and not a.docker:
+        cand, ver = info["alt"]
+        step(f"用 Python {ver} 重新执行本脚本（{cand}）")
+        os.execv(cand, [cand, str(Path(__file__).resolve()), *sys.argv[1:]])
     if a.docker:
         mode = "docker"
     elif a.native:
@@ -271,9 +314,9 @@ def main() -> None:
     step(f"选择的安装路径：{mode}")
 
     if mode == "native" and not info["py_ok"]:
-        die("指定了 --native，但本机 Python 低于 3.10。请升级 Python，或改用 --docker")
+        die("指定了 --native，但本机 Python 低于 3.10，且 PATH 里没有可用的新解释器。\n" + NEWER_PY_HELP)
     if mode == "docker" and not info["docker"]:
-        die("Docker 路径不可用：未检测到 docker compose。\n    可选：① 安装 Docker 后重跑；② 安装 Python >= 3.10 后重跑（会自动走原生路径）")
+        die("Docker 路径不可用：未检测到 docker compose，且本机没有 Python >= 3.10。\n" + NEWER_PY_HELP)
     if a.check:
         print("\n  --check：仅探测，不执行安装。去掉该参数即可开始。\n")
         return
