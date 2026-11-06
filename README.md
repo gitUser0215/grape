@@ -10,12 +10,12 @@
   </p>
 
   <p>
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/gitUser0215/grape?color=blue" alt="License: MIT"></a>
-    <a href="https://github.com/gitUser0215/grape/tree/main"><img src="https://img.shields.io/badge/branch-main-blue" alt="main"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue" alt="License: MIT"></a>
+    <a href="https://github.com/grape-dev/grape/tree/main"><img src="https://img.shields.io/badge/branch-main-blue" alt="main"></a>
     <a href="https://www.grapedev.cn/"><img src="https://img.shields.io/badge/website-grapedev.cn-blue" alt="Website"></a>
     <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
     <img src="https://img.shields.io/badge/node.js-18%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 18+">
-    <img src="https://img.shields.io/github/stars/gitUser0215/grape?style=social" alt="Stars">
+    <img src="https://img.shields.io/github/stars/grape-dev/grape?style=social" alt="Stars">
     <a href="README.zh.md"><img src="https://img.shields.io/badge/README-中文-blue" alt="中文"></a>
   </p>
 
@@ -89,7 +89,7 @@ These stages complete without human execution, which leaves developers as decisi
 Hand the line below to your AI agent and let it handle everything:
 
 ```text
-Install and start the Grape platform for me following SETUP.AGENT.md
+Install and start the Grape platform for me by following https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md
 ```
 
 Execution engine and model configuration, hosting your first repository, the preflight check and deployment are covered in **[SETUP.AGENT.md](SETUP.AGENT.md)**.
@@ -98,8 +98,9 @@ Execution engine and model configuration, hosting your first repository, the pre
 
 **Install and start — one command does it all**:
 
+<!-- Prerequisite: quickstart.py must be merged into the root of grape-dev/grape; until then this line does not work for readers. -->
 ```powershell
-cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
+cd ~ ; git clone https://github.com/grape-dev/grape.git ; cd grape ; python quickstart.py
 ```
 
 If `python` does not exist on your machine, use `python3`.
@@ -108,7 +109,7 @@ The first sign-in, platform-facing configuration and deployment are covered in *
 
 ## Community
 
-- **Issues** — https://github.com/gitUser0215/grape/issues
+- **Issues** — https://github.com/grape-dev/grape/issues
 - **Feishu** — feedback in your bound group chat after connecting Grape
 - **Community** — https://www.grapedev.cn/community.html
 

@@ -10,19 +10,19 @@
   </p>
 
   <p>
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/gitUser0215/grape?color=blue" alt="License: MIT"></a>
-    <a href="https://github.com/gitUser0215/grape/tree/main"><img src="https://img.shields.io/badge/branch-main-blue" alt="main"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue" alt="License: MIT"></a>
+    <a href="https://github.com/grape-dev/grape/tree/main"><img src="https://img.shields.io/badge/branch-main-blue" alt="main"></a>
     <a href="https://www.grapedev.cn/"><img src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-grapedev.cn-blue" alt="官网"></a>
     <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
     <img src="https://img.shields.io/badge/node.js-18%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 18+">
-    <img src="https://img.shields.io/github/stars/gitUser0215/grape?style=social" alt="Stars">
+    <img src="https://img.shields.io/github/stars/grape-dev/grape?style=social" alt="Stars">
     <a href="README.md"><img src="https://img.shields.io/badge/README-English-blue" alt="English"></a>
   </p>
 
   <p>
     <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
     <a href="#四快速开始">快速开始</a> ·
-    <a href="CONTRIBUTING.md">参与贡献</a> ·
+    <a href="CONTRIBUTING.zh.md">参与贡献</a> ·
     <a href="README.md">English</a>
   </p>
 
@@ -89,7 +89,7 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 把下面这句丢给你的 AI Agent，让它全程搞定：
 
 ```text
-根据 SETUP.AGENT.md 为我安装 Grape 平台并启动
+按 https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
 ```
 
 执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
@@ -98,8 +98,9 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 
 **安装并启动，一个命令搞定**：
 
+<!-- 前提：quickstart.py 需随上游 PR 合入 grape-dev/grape 仓根目录；未合入前这一行对读者不可用。 -->
 ```powershell
-cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
+cd ~ ; git clone https://github.com/grape-dev/grape.git ; cd grape ; python quickstart.py
 ```
 
 命令里的 `python` 若不存在请换成 `python3`。
@@ -108,7 +109,7 @@ cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python qu
 
 ## 社群
 
-- **Issues** —— https://github.com/gitUser0215/grape/issues
+- **Issues** —— https://github.com/grape-dev/grape/issues
 - **飞书** —— 接入 Grape 后可在绑定群内直接反馈
 - **社群** —— https://www.grapedev.cn/community.html
 
