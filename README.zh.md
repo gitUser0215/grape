@@ -1,322 +1,121 @@
-<h1 align="center">Grape</h1>
+<div align="center">
+  <img src="assets/grape-logo.jpg" alt="Grape" width="140">
 
-<p align="center"><a href="README.md">English</a> | 中文</p>
+  <h1>Grape</h1>
 
-<p align="center">
-  <strong>AI Native DevOps —— 将任意 Git 项目一键变为 AI 自主驱动的开发工作流</strong>
-  <br>
-  无需 IDE，随处设计、开发、测试、发布——让团队每个人都是交付者
-  <br>
-  <em>Turn any Git project into an AI-native one with one click. Design, develop, test, and ship anywhere, anytime.</em>
-</p>
+  <p>
+    <strong>AI Native DevOps —— 将任意 Git 项目一键变为 AI 自主驱动的开发工作流</strong>
+    <br>
+    无需 IDE，随处设计、开发、测试、发布——让团队每个人都是交付者
+  </p>
 
-<p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#核心价值">核心价值</a> ·
-  <a href="#核心能力">核心能力</a> ·
-  <a href="#安装部署">安装部署</a> ·
-  <a href="#开发测试">开发测试</a> ·
-  <a href="#如何贡献">如何贡献</a> ·
-  <a href="#反馈问题">反馈问题</a>
-</p>
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/gitUser0215/grape?color=blue" alt="License: MIT"></a>
+    <a href="https://github.com/gitUser0215/grape/tree/main"><img src="https://img.shields.io/badge/branch-main-blue" alt="main"></a>
+    <a href="https://www.grapedev.cn/"><img src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-grapedev.cn-blue" alt="官网"></a>
+    <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
+    <img src="https://img.shields.io/badge/node.js-18%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 18+">
+    <img src="https://img.shields.io/github/stars/gitUser0215/grape?style=social" alt="Stars">
+    <a href="README.md"><img src="https://img.shields.io/badge/README-English-blue" alt="English"></a>
+  </p>
+
+  <p>
+    <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
+    <a href="#四快速开始">快速开始</a> ·
+    <a href="CONTRIBUTING.md">参与贡献</a> ·
+    <a href="README.md">English</a>
+  </p>
+
+  <sub>VOD Agent → Issue Agent → Coding Agent → QA Agent → SRE Agent · + Chat Agent</sub>
+</div>
+
+<img src="assets/issue-agent-flow-zh.gif" alt="Issue 在 Agent 间自动流转，QA 驳回时退回 Coding 重做" width="100%">
 
 ---
 
-## 核心价值
+## 一、理念与价值
+
+**从「流程驱动人把 AI 当工具」到「工作流驱动 AI 和人协作」** —— 把任意 Git 项目变成可自主演进的 AI 开发工作流：人只做需求创建与 Review，AI 完成从需求到交付的端到端旅程。
+
+| 理念与特征 | 含义 | 在 Grape 中的体现 |
+| --- | --- | --- |
+| **代码仓第一等公民**（设计原点） | 仓是工程知识的事实来源：需求、决策、评审证据与交付记录都由仓持有 | 上下文跨成员、跨任务、跨工具连续，不因人员变动断档 |
+| **端到端闭环 · 短小精简** | 打破角色墙，让上下文在闭环内流动；以小型闭环团队为单位，决策链条大幅缩短 | 一个仓即一条完整旅程：需求 → Coding → QA → SRE 在同一闭环内交接，无跨角色提单 |
+| **上下文即资产** | 决策、反问、经验跨成员、跨任务、跨工具可见可复用，组织记忆可被显式管理 | 决策、问答与任务摘要沉淀在仓上，跨会话可查 |
+| **AI 是流程的主要参与者** | 与人并列的执行单元：被分配任务、被编排进交付链路、以结构化接口与其他 Agent 协同 | Agent 有角色、输入、上下文与产物，经 A2A 交接；人在关键节点审批放行 |
+| **经验飞轮** | 每跑一次任务，组织变聪明一次；平台异步提炼经验、决策、反问 Q&A 三类资产 | 三类资产沉淀在仓上，由后续任务按相关性召回注入 |
+
+### 价值主张
 
 Grape 重新定义了软件开发工作流——不再是"人驱动 AI 辅助"，而是"AI 驱动、人把关"。
 
 | # | 核心价值 | 说明 |
-|---|---------|------|
+| --- | --- | --- |
 | **1** | **一键 AI 托管，项目自主演进** | 将任意 Git 项目接入 Grape 后，从需求到落地的全流程由 Multi-Agent 接力驱动。Issue 自动分诊、代码自动实现、PR 自动审查、构建自动部署——项目迭代速度**跃升**。 |
 | **2** | **无需 IDE，随时随地的研发全流程** | 飞书 / WebUI 即开发入口。设计、开发、测试、发布——无需打开编辑器，团队每个人都能直接参与交付。 |
 | **3** | **开源即模板，快速体验与二次开发** | 社区海量开源项目都是你的项目模板。一键创建、自动体验部署、Skill 驱动二次开发——从 0 到 1 的 AI 开发工作流即刻就绪。 |
 
----
+## 二、核心特性
 
-## 这是什么
+| # | 核心特性 | 说明 |
+| --- | --- | --- |
+| 1 | **需求入仓即托管** | VOD 聚类反馈建单，Issue 自动分诊与指派 |
+| 2 | **Agent 间自主交接** | 五段流水线经 A2A 交接，无需人工路由与状态同步 |
+| 3 | **验证闭环** | QA 驳回退回 Coding 重做，质量门由流程保证 |
+| 4 | **人在环上把关** | 关键节点的审批与放行由人决定 |
+| 5 | **多引擎广播** | 同一任务并行多引擎执行，自动择优 |
+| 6 | **飞轮资产** | 决策、问答与任务摘要留在仓上，由后续任务按相关性召回 |
+| 7 | **全程可观测** | 任务中心、流水线时间线、Agent 状态与健康度可查 |
+| 8 | **IM 原生协同** | 飞书内提需求、审批、看进展；Chat Agent 承接会话入口 |
+
+## 三、解决的问题
 
 Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节全部交由 AI 接力完成。一个传统 Git 项目接入 Grape 后，即获得完整的 AI 开发工作流——从需求澄清、代码实现、审查验证到构建部署，全流程 AI Native。
 
-**一句话：把你的 Git 项目变成 AI 驱动的自主开发团队。**
-
-## 解决的问题
-
-传统 DevOps 中，从需求到发布的大量工作依赖人工：Issue 要手动分诊打标签、代码要开发自己写、PR 要人肉 Review、构建部署要手动触发。项目越多，人力成本越高。
-
-Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变为决策者——只需定义方向、Review 结果。
+这些环节交由 AI 完成，开发者从执行者转变为决策者：定义方向、Review 结果。
 
 | 环节 | 传统工作流 | Grape AI Native 工作流 |
-|------|-----------|----------------------|
+| --- | --- | --- |
+| 需求收集 | 人工汇总反馈 | VOD Agent 收集开发者声音并聚类提炼 |
 | Issue 处理 | 人工分诊、标签、指派 | VOD / Issue Agent 自动分类、分派 |
-| 代码实现 | 开发者手动编码 | Coding Agent 自动实现 + 提交 PR |
-| 代码审查 | 人工 Review | QA Agent 自动审查 + 安全扫描 |
-| 构建部署 | 手动 / CI 触发 | SRE Agent 自动构建、部署、运维 |
-| 需求收集 | 人工汇总反馈 | VOD Agent 收集开发者声音、聚类提炼 |
+| 代码实现 | 开发者手动编码 | Coding Agent 自动实现并提交 PR |
+| 代码审查 | 人工 Review | QA Agent 自动审查与安全扫描 |
+| 构建部署 | 手动 / CI 触发 | SRE Agent 自动构建、部署与运维 |
 
-## 核心能力
+## 四、快速开始
 
-### Multi-Agent 工作流
+### 让 Agent 安装
 
-项目接入后，每个 Issue / PR 事件由多个 Agent 按流水线接力处理：
+把下面这句丢给你的 AI Agent，让它全程搞定：
 
-```
-VOD Agent → Issue Agent → Coding Agent → QA Agent → SRE Agent
- 收集声音    分类需求      编码实现      审查验证    构建部署
+```text
+根据 SETUP.AGENT.md 为我安装 Grape 平台并启动
 ```
 
-- **VOD Agent**：收集开发者反馈、聚类共性、自动创建 Issue
-- **Issue Agent**：分类、打标签、指派、触发 Coding
-- **Coding Agent**：代码实现、PR 创建、自我审查
-- **QA Agent**：PR 审查、自动化测试、安全检查
-- **SRE Agent**：构建部署、发布管理、运维监控
-- **Chat Agent**：个人对话助手，通过飞书或 WebUI 随时查询 / 操作
+执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
 
-Agent 之间通过 A2A 协议链式协作，一个任务自动贯穿全流程。
+### 手动安装
 
-### 一键转化为 AI Native 项目
-
-```
-选择模板 / 现有 Git 项目
-  → 一键创建 & 托管
-  → 自动应用开发场景（Agent × Skill 映射）
-  → 异步首次引导（分析项目、创建体验部署与探索方向 Issue）
-  → 从此该项目的每个 Issue / PR 由 Multi-Agent 流水线自主处理
-```
-
-### Skills 技能库
-
-15+ 官方技能覆盖开发全流程：`vod`（声音收集）、`issue` / `issue-advance`（Issue 管理）、`implementation`（代码实现）、`pr` / `qa` / `skill-pr`（PR 审查）、`build-debug` / `cloud-deploy` / `deploy-guard` / `changelog-gen` / `incident-triage`（构建部署运维）、`chat` / `im-notify`（对话通知）、`repo-onboarding`（首次托管引导）。
-
-支持上传自定义技能（官方 / 仓库级 / 个人级三态），并可按仓库配置。
-
-### 支持的入口
-
-| 入口 | 方式 | 说明 |
-|------|------|------|
-| GitCode | HTTP Webhook | Issue / PR / 评论 / 构建 / 部署 事件 |
-| 飞书 | WebSocket 长连接 | 多 Bot 隔离运行，支持 100+ Bot |
-| WebUI | SPA | Dashboard / Pipeline / Agent 详情 / Chat / Skills / Settings |
-
-### 其他特性
-
-- **多飞书 Bot**：单进程隔离运行 100+ 飞书机器人，热加载、自动重连
-- **GitCode ↔ 飞书用户映射**：私聊身份确认绑定，防误绑
-- **多租户**：GitCode OAuth 登录动态建号，登录白名单，凭据按用户隔离
-- **事件审计**：每次 Agent 执行留痕（日志、耗时、结论），Pipeline 可视化追踪
-- **多后端**：opencode / codearts 可插拔切换
-
-## 快速开始
-
-### 环境要求
-
-| 组件 | 版本要求 | 说明 |
-|------|---------|------|
-| **Python** | >= 3.10（必须） | 主服务与 devbox sandbox 均要求 Python 3.10+（新式类型注解/语法依赖；低于 3.10 启动会显式提示并退出） |
-| **Node.js** | >= 18（Agent CLI） | `npm install -g opencode` |
-| **Git** | 任意较新版本 | |
-
-### Windows (PowerShell)
+**安装并启动，一个命令搞定**：
 
 ```powershell
-git clone https://github.com/grape-dev/grape.git
-cd grape
-
-# 一键启动：自动建 venv + 装依赖 + 复制 .env + 自检 + 启动
-.\start.ps1                    # 本地开发（最小依赖，SQLite）
-.\start.ps1 -Full              # 完整依赖（含 OBS/MySQL/飞书）
-.\start.ps1 -SkipDoctor        # 跳过自检，直接启动
-
-# 或手动操作：
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements-local.txt
-Copy-Item .env.example .env
-New-Item -ItemType Directory -Force -Path data
-python -m src.api.run --dev    # 开发模式，打开 http://localhost:3000
+cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
 
-> 如遇 PowerShell 执行策略拦截：`Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+命令里的 `python` 若不存在请换成 `python3`。
 
-### macOS / Linux
+首次登录、平台对外配置、上线部署等其余事项见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
 
-```bash
-git clone https://github.com/grape-dev/grape.git
-cd grape
+## 社群
 
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-local.txt     # 最小依赖（不含 OBS/MySQL/飞书）
-# pip install -r requirements.txt         # 完整依赖
+- **Issues** —— https://github.com/gitUser0215/grape/issues
+- **飞书** —— 接入 Grape 后可在绑定群内直接反馈
+- **社群** —— https://www.grapedev.cn/community.html
 
-cp .env.example .env
-mkdir -p data
-python -m src.api.run --dev                # 开发模式，打开 http://localhost:3000
-```
+## 安全
 
-### 国内镜像加速 / 网络建议
+漏洞上报与 Agent 执行安全模型见 [SECURITY.md](SECURITY.md)。
 
-```bash
-# PyPI 阿里云镜像
-pip install -r requirements-local.txt -i https://mirrors.aliyun.com/pypi/simple/
+## 许可
 
-# 永久配置：
-pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
-```
-
-> git 拉取偶发 HTTP/2 / 连接超时属网络抖动，拉取路径已内置有限次自动重试（3 次退避）。
-> 仍失败可降级 HTTP/1.1：`git config --global http.version HTTP/1.1`；或按你的网络环境配置
-> 镜像/代理（如 `git config --global url."https://你的代理/https://github.com/".insteadOf "https://github.com/"`）。
-
-### 安装 Agent CLI（至少一个）
-
-```bash
-npm install -g opencode          # 基于 Node.js
-# 或
-pip install codearts-cli         # 基于 Python
-```
-
-### 环境自检（可选）
-
-```bash
-python scripts/doctor.py         # 运行安装前自检
-```
-
-> 完整「0→1 安装自检清单」（阶段化操作 + 期望结果 + 失败排查）见 [docs/0-to-1-checklist.md](docs/0-to-1-checklist.md)。
-
-### 配置 OAuth 应用凭据（必做）
-
-```bash
-cp configs/oauth-providers.example.json configs/oauth-providers.json
-# 编辑 configs/oauth-providers.json，填入 GitCode / GitHub 两个 provider 的 client_id / client_secret
-```
-
-`configs/oauth-providers.json` 是 OAuth 凭据的权威配置文件（重启时同步入库，凭据采用「首次写入」幂等模式）：
-写错文件、留空字段会导致登录入口 `/api/auth/login/{provider}` 返回 400（not_configured）。
-
-```jsonc
-{
-  "gitcode": {
-    "client_id": "你的 GitCode OAuth App Client ID",
-    "client_secret": "你的 GitCode OAuth App Client Secret",
-    "redirect_uri": "https://你的域名/api/auth/callback/gitcode",
-    "auth_url": "https://gitcode.com/oauth/authorize",
-    "token_url": "https://gitcode.com/oauth/token",
-    "user_url": "https://gitcode.com/api/v5/user",
-    "scope": "all"
-  },
-  "github": {
-    "client_id": "你的 GitHub OAuth App Client ID",
-    "client_secret": "你的 GitHub OAuth App Client Secret",
-    "redirect_uri": "https://你的域名/api/auth/callback/github",
-    "auth_url": "https://github.com/login/oauth/authorize",
-    "token_url": "https://github.com/login/oauth/access_token",
-    "user_url": "https://api.github.com/user",
-    "scope": "repo user admin:repo_hook offline_access"
-  }
-}
-```
-
-> 完整协议字段与示例见 `configs/oauth-providers.example.json`；OAuth App 的 Callback URL 必须与上表 `redirect_uri` 完全一致。
-> 旧版 `configs/global-bot-token.json` 中的 OAuth 凭据字段仍兼容（向前兼容回退），新配置请统一使用 `oauth-providers.json`。
-
-### 配置对外可访问基址（必做）
-
-```bash
-cp configs/server-config.example.json configs/server-config.json
-# 编辑 configs/server-config.json，把 server_base_url / webhook_url 改为对外可访问地址
-```
-
-```jsonc
-{
-  "server_base_url": "https://你的域名",
-  "webhook_url": "https://你的域名/webhook/gitcode"
-}
-```
-
-> 未配置 `server_base_url` 时服务会回退到 `http://localhost:3000`：OAuth 回调地址指向本机，
-> 第三方平台（GitCode/GitHub）无法回访，登录/托管不可用。启动日志与 `/api/health` 会输出明确告警
-> （`server_base_url_configured=false`）。本地纯开发可忽略，但 OAuth 登录前必须配置。
-
-首次登录用 GitCode OAuth 一键授权，即可开始托管仓库、把项目接入 AI 工作流。
-
-## 安装部署
-
-```bash
-python -m src.api.run          # 生产：主服务 3000 + Webhook 8080 双进程
-python -m src.api.run --dev    # 开发：单端口 3000，热重载
-```
-
-生产部署（nginx 反代 / systemd / Docker）示例见 `docs/DEPLOYMENT`。
-
-### 配置
-
-| 文件 | 说明 |
-|------|------|
-| `configs/global-bot-token.json` | 全局 Bot token（gitignored） |
-| `configs/oauth-providers.json` | OAuth 应用凭据（GitCode/GitHub 的 client_id/secret 等，从 `oauth-providers.example.json` 复制，gitignored） |
-| `configs/server-config.json` | 对外基址 server_base_url / webhook_url（从 `server-config.example.json` 复制；未配置时 OAuth 回调指向 localhost 不可用） |
-| `configs/agent-description.json` | Agent 类型种子（订阅事件、默认后端） |
-| `configs/skill-description.json` | 官方技能种子（由独立技能仓库 [grape-skills](https://github.com/grape-dev/grape-skills) 经 `scripts/sync_skills.sh` 同步） |
-| `configs/agent-skill-mapping.json` | 开发场景 → Agent × Skill 映射 |
-| `configs/project-templates.json` | 项目模板库 |
-| `configs/login-whitelist.json` | GitCode 登录白名单 |
-
-## 开发测试
-
-```bash
-# 安装依赖（本地开发最小集）
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
-pip install -r requirements-local.txt
-pip install -r requirements-dev.txt
-
-# 运行测试
-mkdir -p data                    # Windows: New-Item -ItemType Directory -Force data
-python -m pytest tests/ -v
-```
-
-测试覆盖：事件归一化、Prompt 构建、Agent 执行器（NDJSON 解析 / 会话重建）、飞书 handler、p2p 绑定、OAuth 白名单、Pipeline、项目模板、仓库托管、任务中心、UI 场景测试（Playwright）。
-
-## 如何贡献
-
-欢迎参与 Grape 的开发。建议的工作流：
-
-1. **提 Issue**：先到 [Issues](https://github.com/grape-dev/grape/issues) 描述你要做的事或发现的问题，确认方向
-2. **Fork & 开发**：Fork 仓库，在特性分支上开发
-3. **补充测试**：新增 / 修改功能请补充 pytest 测试
-4. **提交 PR**：描述改动内容、测试情况、关联的 Issue 编号
-
-### 分支命名
-
-| 前缀 | 用途 |
-|------|------|
-| `feat/` | 新功能 |
-| `fix/` | Bug 修复 |
-| `refactor/` | 代码重构（不改变行为） |
-| `docs/` | 文档 |
-| `chore/` | 构建、工具链调整 |
-
-### 不写代码也能贡献
-
-- **文档**：改进 README、补充设计文档、修正错别字
-- **Skills**：向独立技能仓库 [grape-skills](https://github.com/grape-dev/grape-skills) 贡献新的 Agent 技能（`skills/<agent_type>/<skill>/`，Markdown 即可，无需改后端代码）
-- **项目模板**：为 `configs/project-templates.json` 补充可一键创建的模板
-- **Bug 报告**：提供清晰的复现步骤、运行环境、相关日志
-- **测试用例**：补充覆盖边界场景的用例
-- **社区支持**：帮助解答问题、写教程
-
-每一个贡献，代码或非代码，都在让 Grape 变得更好。
-
-## 反馈问题
-
-遇到问题或想提建议，请通过以下任一渠道：
-
-- **GitHub Issues**：https://github.com/grape-dev/grape/issues
-  - Bug 请附上运行环境、复现步骤、相关日志
-  - 特性建议请描述使用场景和预期行为
-- **飞书**：接入 Grape 后可在绑定的群中直接反馈
-
-## License
-
-MIT
+MIT，见 [LICENSE](LICENSE)。
