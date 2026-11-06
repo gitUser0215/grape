@@ -2,7 +2,6 @@
 
 **安装并启动，一个命令搞定**：
 
-<!-- 前提：quickstart.py 需随上游 PR 合入 grape-dev/grape 仓根目录；未合入前这一行对读者不可用。 -->
 ```powershell
 cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
@@ -111,7 +110,7 @@ docker compose up -d
 
 - 未配置邮箱服务时，注册自动跳过邮箱验证码（邮箱栏填占位地址即可，不做格式与真实性校验），注册成功即已登录
 - 未配置 GitCode / GitHub OAuth 时，登录页提示"请使用用户名密码注册登录"，第三方登录按钮置灰，本地账号照常可用
-- 项目模板无需手工准备：`examples/` 克隆下来只有一份 README，**首次启动自动从 [grape-template](https://github.com/gitUser0215/grape-template) 拉取模板库**（启动日志 `Templates: ... verified OK` 即同步完成）
+- 项目模板无需手工准备：`examples/` 克隆下来只有一份 README，**首次启动自动从 [grape-template](https://github.com/grape-dev/grape-template) 拉取模板库**（启动日志 `Templates: ... verified OK` 即同步完成）
 
 ## 其余配置与上线部署
 

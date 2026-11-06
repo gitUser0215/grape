@@ -2,7 +2,6 @@
 
 **Install and start — one command does it all**:
 
-<!-- Prerequisite: quickstart.py must be merged into the root of grape-dev/grape; until then this line does not work for readers. -->
 ```powershell
 cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
@@ -111,7 +110,7 @@ A local start needs **no `configs/` setup at all**: clone, start, done — then 
 
 - With no email service configured, registration skips the verification code (put any placeholder in the email field — it is not validated), and you are signed in as soon as the account is created
 - With no GitCode / GitHub OAuth configured, the login page says "register and sign in with username + password"; third-party buttons are greyed out but local accounts work normally
-- Project templates take care of themselves: `examples/` ships with only a README, and **on first start the platform pulls the template library from [grape-template](https://github.com/gitUser0215/grape-template)** (watch for `Templates: ... verified OK` in the startup log)
+- Project templates take care of themselves: `examples/` ships with only a README, and **on first start the platform pulls the template library from [grape-template](https://github.com/grape-dev/grape-template)** (watch for `Templates: ... verified OK` in the startup log)
 
 ## Remaining configuration and deployment
 
