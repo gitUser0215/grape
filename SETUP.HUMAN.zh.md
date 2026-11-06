@@ -2,6 +2,7 @@
 
 **安装并启动，一个命令搞定**：
 
+<!-- 前提：quickstart.py 需随上游 PR 合入 grape-dev/grape 仓根目录；未合入前这一行对读者不可用。 -->
 ```powershell
 cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
@@ -39,6 +40,22 @@ python -m src.api.run --dev    # 开发模式，打开 http://localhost:3000
 **Windows 注意事项**
 
 - 脚本被执行策略拦截时先执行：`Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+
+**clone 报 `not found`，URL 里出现 `gh-proxy` 之类代理域名**
+
+机器上装过「GitHub 加速」类工具时，git 的 `insteadOf` 规则会把 `https://github.com/` 改写到失效地址（`github.ab.com` 这类错域名会让所有 clone 一起失败）。先自检规则及其来源：
+
+```powershell
+git config --list --show-origin | Select-String insteadOf
+```
+
+清掉失效规则，然后重跑上面的命令：
+
+```powershell
+git config --global --unset-all "url.https://gh-proxy.com/https://github.ab.com/.insteadOf"
+```
+
+规则来自 `--system` 时改用 `--system`（需管理员 PowerShell）；只写在某个仓库的 `.git/config` 时，进该仓库执行不带作用域的 `git config --unset-all`。
 
 ## macOS / Linux
 
@@ -94,7 +111,7 @@ docker compose up -d
 
 - 未配置邮箱服务时，注册自动跳过邮箱验证码（邮箱栏填占位地址即可，不做格式与真实性校验），注册成功即已登录
 - 未配置 GitCode / GitHub OAuth 时，登录页提示"请使用用户名密码注册登录"，第三方登录按钮置灰，本地账号照常可用
-- 项目模板无需手工准备：`examples/` 克隆下来只有一份 README，**首次启动自动从 [grape-template](https://github.com/grape-dev/grape-template) 拉取模板库**（启动日志 `Templates: ... verified OK` 即同步完成）
+- 项目模板无需手工准备：`examples/` 克隆下来只有一份 README，**首次启动自动从 [grape-template](https://github.com/gitUser0215/grape-template) 拉取模板库**（启动日志 `Templates: ... verified OK` 即同步完成）
 
 ## 其余配置与上线部署
 

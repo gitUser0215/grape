@@ -2,6 +2,7 @@
 
 **Install and start — one command does it all**:
 
+<!-- Prerequisite: quickstart.py must be merged into the root of grape-dev/grape; until then this line does not work for readers. -->
 ```powershell
 cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
@@ -39,6 +40,22 @@ python -m src.api.run --dev    # Dev mode, opens http://localhost:3000
 **Windows notes**
 
 - If execution policy blocks the script, run first: `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+
+**`git clone` fails with `not found`, URL shows a proxy domain like `gh-proxy`**
+
+GitHub accelerators install a git `insteadOf` rule that rewrites `https://github.com/` to a (possibly broken) proxy — a wrong host such as `github.ab.com` makes every clone fail. Inspect the rules and where they come from:
+
+```powershell
+git config --list --show-origin | Select-String insteadOf
+```
+
+Remove the broken rule and re-run the command above:
+
+```powershell
+git config --global --unset-all "url.https://gh-proxy.com/https://github.ab.com/.insteadOf"
+```
+
+If the rule lives in `--system`, use `--system` instead (elevated PowerShell); if it lives in a repo's `.git/config`, run `git config --unset-all` inside that repo without a scope.
 
 ## macOS / Linux
 
@@ -94,7 +111,7 @@ A local start needs **no `configs/` setup at all**: clone, start, done — then 
 
 - With no email service configured, registration skips the verification code (put any placeholder in the email field — it is not validated), and you are signed in as soon as the account is created
 - With no GitCode / GitHub OAuth configured, the login page says "register and sign in with username + password"; third-party buttons are greyed out but local accounts work normally
-- Project templates take care of themselves: `examples/` ships with only a README, and **on first start the platform pulls the template library from [grape-template](https://github.com/grape-dev/grape-template)** (watch for `Templates: ... verified OK` in the startup log)
+- Project templates take care of themselves: `examples/` ships with only a README, and **on first start the platform pulls the template library from [grape-template](https://github.com/gitUser0215/grape-template)** (watch for `Templates: ... verified OK` in the startup log)
 
 ## Remaining configuration and deployment
 
