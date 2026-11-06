@@ -22,7 +22,7 @@
   <p>
     <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
     <a href="#四快速开始">快速开始</a> ·
-    <a href="CONTRIBUTING.zh.md">参与贡献</a> ·
+    <a href="CONTRIBUTING.md">参与贡献</a> ·
     <a href="README.md">English</a>
   </p>
 
