@@ -84,7 +84,7 @@ These stages complete without human execution, which leaves developers as decisi
 
 ## 4. Quick Start
 
-Two install paths — pick one. First sign-in, platform-facing configuration and deployment are covered in the matching document.
+Two install paths — pick one: hand it to an agent, or do it yourself.
 
 <details open>
 <summary><strong>① Let an agent install it (recommended)</strong></summary>

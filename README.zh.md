@@ -84,7 +84,7 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 
 ## 四、快速开始
 
-两种装法，任选其一。首次登录、对外配置与上线部署这些后续步骤，写在各自文档里。
+两种装法，任选其一 —— 交给 Agent，还是自己动手。
 
 <details open>
 <summary><strong>① 让 Agent 装（推荐）</strong></summary>
