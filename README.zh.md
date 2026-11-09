@@ -102,8 +102,6 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 <details>
 <summary><strong>② 人工安装（一条命令）</strong></summary>
 
-需要 [uv](https://docs.astral.sh/uv/)（没装过：`pip install uv`）：
-
 ```bash
 uvx grape-quickstart init
 ```
@@ -115,24 +113,6 @@ uvx grape-quickstart init
 ```bash
 uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
 ```
-
-| 常用参数 | 作用 |
-| --- | --- |
-| `--check` | 只探测环境与选路，不安装 |
-| `--foreground` | 前台运行（Ctrl-C 停止） |
-| `--production` | 生产形态（3000 + 8080） |
-| `--mirror` | 依赖走国内 PyPI 镜像 |
-| `--src <目录>` | 使用已有的本地仓库，不重新拉取 |
-
-安装完成后更新源码：`uvx grape-quickstart update`。
-
-另有一条**不依赖 uv** 的源码路径（适合离线或二次开发）：
-
-```bash
-git clone https://github.com/gitUser0215/grape.git && python quickstart.py
-```
-
-Windows PowerShell 5.1 不支持 `&&`，请改用 `;`。若你的机器有应用控制策略（AppLocker / Smart App Control）拦截未签名 exe，改用 `uvx --from grape-quickstart python -m grape_quickstart init`。
 
 首次登录、平台对外配置、上线部署等其余事项，见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
 
