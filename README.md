@@ -84,7 +84,10 @@ These stages complete without human execution, which leaves developers as decisi
 
 ## 4. Quick Start
 
-### Let an agent install it
+Pick one of two paths. First sign-in, platform-facing configuration and deployment afterwards are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)** (manual) or **[SETUP.AGENT.md](SETUP.AGENT.md)** (hand it to an agent).
+
+<details open>
+<summary><strong>① Let an agent install it (recommended)</strong></summary>
 
 Hand the line below to your AI agent and let it handle everything:
 
@@ -94,7 +97,10 @@ Install and start the Grape platform for me by following https://github.com/gitU
 
 Execution engine and model configuration, hosting your first repository, the preflight check and deployment are covered in **[SETUP.AGENT.md](SETUP.AGENT.md)**.
 
-### Manual installation
+</details>
+
+<details>
+<summary><strong>② Manual installation (one command)</strong></summary>
 
 **Install and start — one command does it all**:
 
@@ -102,9 +108,11 @@ Execution engine and model configuration, hosting your first repository, the pre
 cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
 
-If `python` does not exist on your machine, use `python3`.
+If `python` does not exist on your machine, use `python3`. Once it finishes, open `http://localhost:3000` in a browser.
 
 The first sign-in, platform-facing configuration and deployment are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)**.
+
+</details>
 
 ## Community
 

@@ -84,7 +84,10 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 
 ## 四、快速开始
 
-### 让 Agent 安装
+两条路，选一条即可。装完之后首次登录、平台对外配置与上线部署见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**（人工）或 **[SETUP.AGENT.md](SETUP.AGENT.md)**（交给 Agent）。
+
+<details open>
+<summary><strong>① 让 Agent 装（推荐）</strong></summary>
 
 把下面这句丢给你的 AI Agent，让它全程搞定：
 
@@ -92,9 +95,12 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 按 https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
 ```
 
-执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
+执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项，见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
 
-### 手动安装
+</details>
+
+<details>
+<summary><strong>② 人工安装（一条命令）</strong></summary>
 
 **安装并启动，一个命令搞定**：
 
@@ -102,9 +108,11 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
 ```
 
-命令里的 `python` 若不存在请换成 `python3`。
+命令里的 `python` 若不存在请换成 `python3`。启动完成后浏览器打开 `http://localhost:3000`。
 
-首次登录、平台对外配置、上线部署等其余事项见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
+首次登录、平台对外配置、上线部署等其余事项，见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
+
+</details>
 
 ## 社群
 
