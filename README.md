@@ -102,13 +102,37 @@ Execution engine and model configuration, hosting your first repository, the pre
 <details>
 <summary><strong>② Manual installation (one command)</strong></summary>
 
-**Install and start — one command does it all**:
+Requires [uv](https://docs.astral.sh/uv/) (if missing: `pip install uv`):
 
-```powershell
-cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
+```bash
+uvx grape-quickstart init
 ```
 
-If `python` does not exist on your machine, use `python3`. Once it finishes, open `http://localhost:3000` in a browser.
+One command does it all: fetch the source into `~/.grape/src` → probe the environment → install dependencies → start in the background → wait for a health check (`http://localhost:3000/api/health` returning 200 means success).
+
+**If GitHub is slow from your network**, pull the source from the GitCode mirror:
+
+```bash
+uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
+```
+
+| Common flags | Effect |
+| --- | --- |
+| `--check` | Probe environment and path selection only, install nothing |
+| `--foreground` | Run in the foreground (Ctrl-C to stop) |
+| `--production` | Production layout (3000 + 8080) |
+| `--mirror` | Use a domestic PyPI mirror for dependencies |
+| `--src <dir>` | Use an existing local repository instead of fetching one |
+
+Update the source later with `uvx grape-quickstart update`.
+
+There is also a **uv-free** source path (useful offline or for local development):
+
+```bash
+git clone https://github.com/gitUser0215/grape.git && python quickstart.py
+```
+
+Windows PowerShell 5.1 does not support `&&` — use `;`. If your machine enforces an application-control policy (AppLocker / Smart App Control) that blocks unsigned executables, use `uvx --from grape-quickstart python -m grape_quickstart init` instead.
 
 The first sign-in, platform-facing configuration and deployment are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)**.
 

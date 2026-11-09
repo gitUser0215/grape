@@ -102,13 +102,37 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 <details>
 <summary><strong>② 人工安装（一条命令）</strong></summary>
 
-**安装并启动，一个命令搞定**：
+需要 [uv](https://docs.astral.sh/uv/)（没装过：`pip install uv`）：
 
-```powershell
-cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
+```bash
+uvx grape-quickstart init
 ```
 
-命令里的 `python` 若不存在请换成 `python3`。启动完成后浏览器打开 `http://localhost:3000`。
+一条命令完成：拉取源码到 `~/.grape/src` → 环境探测 → 安装依赖 → 后台启动 → 健康检查（`http://localhost:3000/api/health` 返回 200 即成功）。
+
+**国内网络访问 GitHub 慢**，源码改走 GitCode 镜像：
+
+```bash
+uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
+```
+
+| 常用参数 | 作用 |
+| --- | --- |
+| `--check` | 只探测环境与选路，不安装 |
+| `--foreground` | 前台运行（Ctrl-C 停止） |
+| `--production` | 生产形态（3000 + 8080） |
+| `--mirror` | 依赖走国内 PyPI 镜像 |
+| `--src <目录>` | 使用已有的本地仓库，不重新拉取 |
+
+安装完成后更新源码：`uvx grape-quickstart update`。
+
+另有一条**不依赖 uv** 的源码路径（适合离线或二次开发）：
+
+```bash
+git clone https://github.com/gitUser0215/grape.git && python quickstart.py
+```
+
+Windows PowerShell 5.1 不支持 `&&`，请改用 `;`。若你的机器有应用控制策略（AppLocker / Smart App Control）拦截未签名 exe，改用 `uvx --from grape-quickstart python -m grape_quickstart init`。
 
 首次登录、平台对外配置、上线部署等其余事项，见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
 
