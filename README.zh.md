@@ -84,7 +84,7 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 
 ## 四、快速开始
 
-两条路，选一条即可。装完之后首次登录、平台对外配置与上线部署见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**（人工）或 **[SETUP.AGENT.md](SETUP.AGENT.md)**（交给 Agent）。
+两种装法，任选其一。首次登录、对外配置与上线部署这些后续步骤，写在各自文档里。
 
 <details open>
 <summary><strong>① 让 Agent 装（推荐）</strong></summary>

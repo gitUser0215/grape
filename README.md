@@ -84,7 +84,7 @@ These stages complete without human execution, which leaves developers as decisi
 
 ## 4. Quick Start
 
-Pick one of two paths. First sign-in, platform-facing configuration and deployment afterwards are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)** (manual) or **[SETUP.AGENT.md](SETUP.AGENT.md)** (hand it to an agent).
+Two install paths — pick one. First sign-in, platform-facing configuration and deployment are covered in the matching document.
 
 <details open>
 <summary><strong>① Let an agent install it (recommended)</strong></summary>
