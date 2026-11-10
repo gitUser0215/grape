@@ -46,7 +46,40 @@ else
   echo "[entrypoint] 警告: 既未提供 SERVER_BASE_URL，也拿不到 RAILWAY_PUBLIC_DOMAIN —— 未生成 server-config.json，OAuth 回调将指向 localhost:3000" >&2
 fi
 
-# ---------- 3) 引擎模型配置 ----------
+# ---------- 3) 项目模板预同步（幂等）----------
+# Grape 的模板注册表 configs/project-templates.json 与 examples/ 不在仓库里，
+# 由 scripts/sync_templates.sh 从 grape-template 仓库同步生成。镜像内没有它 → 前端模板页为空。
+# 这里在启动时补一次：优先 svn 脚本（需 git），失败则退回 codeload tarball（不依赖 git）。
+if [ ! -s /app/configs/project-templates.json ] || [ ! -d /app/examples ] || [ -z "$(find /app/examples -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)" ]; then
+  TPL_REPO="${TEMPLATES_REPO:-https://github.com/grape-dev/grape-template.git}"
+  TPL_REF="${TEMPLATES_REF:-main}"
+  echo "[entrypoint] templates missing -> syncing from ${TPL_REPO}@${TPL_REF}"
+  if command -v git >/dev/null 2>&1 && TEMPLATES_REPO="$TPL_REPO" TEMPLATES_REF="$TPL_REF" bash /app/scripts/sync_templates.sh; then
+    echo "[entrypoint] templates synced (git)"
+  else
+    TPL_STAGE=$(mktemp -d)
+    TPL_TB="https://codeload.github.com/grape-dev/grape-template/tar.gz/refs/heads/${TPL_REF}"
+    if curl -fsSL --retry 2 --max-time 120 "$TPL_TB" -o "$TPL_STAGE/t.tgz" && tar xzf "$TPL_STAGE/t.tgz" -C "$TPL_STAGE"; then
+      TPL_SRC=$(find "$TPL_STAGE" -mindepth 1 -maxdepth 1 -type d -name 'grape-template-*' | head -1)
+      mkdir -p /app/examples /app/configs
+      for d in "$TPL_SRC"/*/; do
+        n=$(basename "$d"); [ "$n" = ".git" ] && continue
+        rm -rf "/app/examples/$n"; cp -a "$d" "/app/examples/$n"
+      done
+      if [ -f "$TPL_SRC/project-templates.json" ]; then
+        cp -a "$TPL_SRC/project-templates.json" /app/configs/project-templates.json
+      fi
+      echo "[entrypoint] templates synced (tarball)"
+    else
+      echo "[entrypoint] 警告: 模板同步失败（模板页可能为空），应用仍会启动" >&2
+    fi
+    rm -rf "$TPL_STAGE"
+  fi
+else
+  echo "[entrypoint] templates present (skip sync)"
+fi
+
+# ---------- 4) 引擎模型配置 ----------
 # 不写死任何厂商/模型：写什么由部署者提供的变量决定。
 if [ -n "${LLM_API_KEY:-}" ]; then
   CFG="$HOME/.config/opencode/opencode.json"
@@ -63,5 +96,5 @@ else
   echo "[entrypoint] LLM_API_KEY 未提供：跳过引擎配置，任务将提示「无可用引擎」" >&2
 fi
 
-# ---------- 4) 交回原启动命令 ----------
+# ---------- 5) 交回原启动命令 ----------
 exec "$@"
