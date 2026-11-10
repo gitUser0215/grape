@@ -1,14 +1,38 @@
 # Grape · Railway 一键部署镜像（与主 Dockerfile 并存，不影响自建部署）
+#
+# 层顺序按「变化频率」排：系统/引擎 → Python 依赖 → 项目模板 → 源码。
+# 只改源码时，前三层全部命中缓存，重建时间主要花在 COPY + 启动校验上。
 FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ git && \
-    rm -rf /var/lib/apt/lists/*
+# ---- 1) 系统依赖 + 执行引擎（改动极少：只有换 Node/引擎版本才会失效）----
+# git 供 scripts/sync_templates.sh 使用；curl/ca-certificates 供兜底下载与健康检查。
+# opencode-ai 是引擎的正确 npm 包名（npm 上的 `opencode` 不存在）。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ git curl ca-certificates \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && npm i -g opencode-ai \
+ && npm cache clean --force \
+ && rm -rf /var/lib/apt/lists/*
 
+# ---- 2) Python 依赖（只随 requirements.txt 变化）----
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# ---- 3) 项目模板（只随 grape-template 上游变化；约 226 KB，烘进镜像后运行时无需同步）----
+# Grape 的模板注册表不在本仓库，缺了会导致前端「项目模板」页为空。
+RUN mkdir -p /app/examples /app/configs \
+ && curl -fsSL --retry 2 --max-time 180 \
+      https://codeload.github.com/grape-dev/grape-template/tar.gz/refs/heads/main -o /tmp/tpl.tgz \
+ && tar xzf /tmp/tpl.tgz -C /tmp \
+ && SRC=$(find /tmp -mindepth 1 -maxdepth 1 -type d -name 'grape-template-*' | head -1) \
+ && for d in "$SRC"/*/; do n=$(basename "$d"); [ "$n" = ".git" ] && continue; cp -a "$d" "/app/examples/$n"; done \
+ && cp -a "$SRC/project-templates.json" /app/configs/project-templates.json \
+ && rm -rf /tmp/tpl.tgz "$SRC"
+
+# ---- 4) 源码（改动最频繁，放最后一层）----
 COPY . .
 COPY .env.example .env
 
@@ -19,15 +43,10 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 ENV GRAPE_AUTO_DETECT_URL=false
 ENV COOKIE_SECURE=true
 
-# ---- 新增：执行引擎 + 引擎家目录（必须落在持久卷上，否则重部署丢配置）----
+# 引擎家目录必须落在持久卷上，否则重部署丢模型配置
 ENV HOME=/app/data/engine-home
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    npm i -g opencode-ai && \
-    rm -rf /var/lib/apt/lists/*
 
-# ---- 新增：启动时按平台变量自动补齐配置 ----
+# ---- 5) 启动引导（按平台变量补齐 JWT / 对外基址 / 引擎配置，幂等）----
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
