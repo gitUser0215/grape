@@ -2,8 +2,6 @@
 
 > 用 Agent 驱动研发流水线的平台：任务编排、技能库、仓库托管一体化。
 
-The one-paragraph pitch goes here: Grape 把「Issue / PR / 流水线」变成 Agent 可执行的任务，内置技能库与项目模板，可在浏览器里完成全流程。
-
 ## Deploy and Host Grape
 
 Grape 是一个 AI 原生 DevOps 平台。它把研发流程（需求、任务、评审、发布）映射成可被 Agent 执行的任务，并把技能、模板、仓库托管统一到一个 WebUI 里。
