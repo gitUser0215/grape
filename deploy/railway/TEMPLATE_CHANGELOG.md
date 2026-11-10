@@ -38,3 +38,21 @@
 - 升级动作：无（首次发布）
 - 破坏性变更：无。现有 `Dockerfile` / `docker-compose.yml` / 业务代码均未改动
 - 回滚方式：删除对应 commit 后重新部署
+
+## 发布记录
+
+| 版本 | 日期 | 状态 | 入口 | 备注 |
+|---|---|---|---|---|
+| v1.0.0 | 2026-11-10 | **已发布到市场** | https://railway.com/deploy/grape-test | slug `grape-test`；分类 Automation；按钮带 `referralCode=25_MLK`；必填变量仅 1 个（`LLM_API_KEY`） |
+
+### 已发布模板的固定入口
+
+- 落地页：`https://railway.com/deploy/grape-test`
+- 按钮（Markdown）：`[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic)`
+- 服务源：GitHub `gitUser0215/grape` @ `main`（仓库基座，**保留模板更新通知**）
+
+### 发布后的更新纪律
+
+1. 只改代码 → 合入 `main` 即可，用户收到更新通知后自行 Apply（会用新 commit 重建）。
+2. 改编排（变量/卷/端口/正文/图标）→ 必须在 Composer 里改完并**重新 Publish**；已部署用户不会自动变。
+3. 每次发布前先更新本文件的「发布记录」表与上文更新说明。

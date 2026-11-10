@@ -20,6 +20,10 @@
   </p>
 
   <p>
+    <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
+  </p>
+
+  <p>
     <a href="https://www.grapedev.cn/">▶ Try it live</a> ·
     <a href="#4-quick-start">Quick start</a> ·
     <a href="CONTRIBUTING.md">Contributing</a> ·
