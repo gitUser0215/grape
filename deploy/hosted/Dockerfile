@@ -1,4 +1,5 @@
-# Grape · Railway 一键部署镜像（与主 Dockerfile 并存，不影响自建部署）
+# Grape · 托管平台一键部署镜像（与主 Dockerfile 并存，不影响自建部署）
+# 目录 deploy/hosted/ 存放所有「托管平台」相关的构建与上架材料，与具体厂商解耦。
 #
 # 层顺序按「变化频率」排：系统/引擎 → Python 依赖 → 项目模板 → 源码。
 # 只改源码时，前三层全部命中缓存，重建时间主要花在 COPY + 启动校验上。
@@ -47,7 +48,7 @@ ENV COOKIE_SECURE=true
 ENV HOME=/app/data/engine-home
 
 # ---- 5) 启动引导（按平台变量补齐 JWT / 对外基址 / 引擎配置，幂等）----
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY deploy/hosted/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 

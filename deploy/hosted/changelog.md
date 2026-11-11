@@ -56,11 +56,29 @@
 - 破坏性变更：无（旧的 `LLM_*` 变量全部继续有效；`LLM_PROVIDER_ID` 仍可用）
 - 回滚方式：重新部署上一个 commit（`9e136918` 或更早）
 
+## v1.2.0 — 2026-11-11（目录中立化）
+
+- 影响面：**仅代码**（构建入口路径变化；模板编排不变）
+- 变更：
+  - 托管平台相关材料统一收进 `deploy/hosted/`（不含任何厂商名），文件名同步中立化：
+    `Dockerfile.railway` → `deploy/hosted/Dockerfile`；
+    `docker-entrypoint.sh` → `deploy/hosted/entrypoint.sh`；
+    `TEMPLATE_README.{zh,en}.md` → `deploy/hosted/listing.{zh,en}.md`；
+    `TEMPLATE_VARIABLES.md` → `deploy/hosted/variables.md`；`TEMPLATE_CHANGELOG.md` → `deploy/hosted/changelog.md`
+  - `railway.json` 仍保留在仓库根（该平台只自动读取根目录这个固定文件名），
+    其 `build.dockerfilePath` 指向 `deploy/hosted/Dockerfile`
+  - `entrypoint.sh` 的对外基址解析新增通用 `PUBLIC_DOMAIN`（顺序：`SERVER_BASE_URL` > `PUBLIC_DOMAIN` > 平台变量），
+    便于接其它托管平台，无需改代码
+- 升级动作：无（已部署实例照旧；下次 Apply 时自动使用新路径构建）
+- 破坏性变更：无
+- 回滚方式：重新部署上一个 commit（`41f5f741`）
+
 ## 发布记录
 
 | 版本 | 日期 | 状态 | 入口 | 备注 |
 |---|---|---|---|---|
 | v1.0.0 | 2026-11-10 | **已发布到市场** | https://railway.com/deploy/grape-test | slug `grape-test`；分类 Automation；按钮带 `referralCode=25_MLK`；必填变量仅 1 个（`LLM_API_KEY`） |
+| v1.2.0 | 2026-11-11 | 代码已合入 `main` | 同上 | 托管平台材料收进 `deploy/hosted/`，文件名中立化；新增通用 `PUBLIC_DOMAIN` 兜底 |
 | v1.1.0 | 2026-11-11 | 代码已合入 `main`（待重新 Publish） | 同上 | 修复引擎模型配置格式；新增 `LLM_PROVIDER` 预设与多模型自动枚举；明确「不会自动升级」 |
 
 ### 已发布模板的固定入口

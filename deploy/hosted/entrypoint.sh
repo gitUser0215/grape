@@ -3,7 +3,7 @@
 #
 # 自动补齐三件事，全部可安全重复执行：
 #   1) JWT_SECRET      —— 未提供则生成一次并落卷（否则重部署换密钥、登录全失效）
-#   2) server base url —— 显式 SERVER_BASE_URL 优先，其次平台注入的 RAILWAY_PUBLIC_DOMAIN
+#   2) server base url —— 显式 SERVER_BASE_URL 优先，其次通用 PUBLIC_DOMAIN，再次平台注入的 RAILWAY_PUBLIC_DOMAIN
 #   3) 引擎模型配置    —— 按 LLM_* 变量组装 $HOME/.config/opencode/opencode.json
 # 之后把控制权交回原 CMD。
 set -eu
@@ -43,7 +43,7 @@ if [ -n "$BASE_URL" ]; then
   export TRUSTED_HOSTS="${TRUSTED_HOSTS:-$HOST}"
   echo "[entrypoint] server_base_url <- ${BASE_SRC} (${BASE_URL})"
 else
-  echo "[entrypoint] 警告: 既未提供 SERVER_BASE_URL，也拿不到 RAILWAY_PUBLIC_DOMAIN —— 未生成 server-config.json，OAuth 回调将指向 localhost:3000" >&2
+  echo "[entrypoint] 警告: 既未提供 SERVER_BASE_URL，也拿不到 PUBLIC_DOMAIN / RAILWAY_PUBLIC_DOMAIN —— 未生成 server-config.json，OAuth 回调将指向 localhost:3000" >&2
 fi
 
 # ---------- 3) 项目模板预同步（幂等）----------

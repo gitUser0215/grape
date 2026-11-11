@@ -1,4 +1,4 @@
-![](https://raw.githubusercontent.com/gitUser0215/grape/main/deploy/railway/icon.png)
+![](https://raw.githubusercontent.com/gitUser0215/grape/main/deploy/hosted/icon.png)
 
 # Deploy Grape
 
@@ -72,7 +72,7 @@ Railway 把 Grape 的服务、容器启动引导、公网 HTTPS 域名与持久�
 本模板**不会自动更新**。后续代码更新需要你确认才会生效：
 
 1. 模板作者合并更新后，你的 Railway 项目里会出现「有更新可用」的通知；
-2. 升级前先看 [CHANGELOG](https://github.com/gitUser0215/grape/blob/main/deploy/railway/TEMPLATE_CHANGELOG.md)，确认改了什么、是否需要手动配合；
+2. 升级前先看 [CHANGELOG](https://github.com/gitUser0215/grape/blob/main/deploy/hosted/changelog.md)，确认改了什么、是否需要手动配合；
 3. 确认后用通知里的 **Apply** 应用；不确认就一直保持当前版本，不受影响。
 
 补充说明：
