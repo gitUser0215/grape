@@ -39,11 +39,29 @@
 - 破坏性变更：无。现有 `Dockerfile` / `docker-compose.yml` / 业务代码均未改动
 - 回滚方式：删除对应 commit 后重新部署
 
+## v1.1.0 — 2026-11-11
+
+- 影响面：**仅代码**（`docker-entrypoint.sh`；模板编排只需把变量必填标记对齐，见「升级动作」）
+- 变更：
+  - **修复：引擎模型配置格式错误导致引擎无法初始化**。旧版写的 `providers` + `package` + 顶层 `baseURL`
+    不被 opencode 1.18.x 识别，容器里引擎虽被发现但模型拉不起来（报 `Provider not found` /
+    `Failed to initialize provider`）。现改为实测可用的 `provider.<id>` 形态：
+    `npm: "@ai-sdk/openai-compatible"`、`options.baseURL`、`options.apiKey: "{env:LLM_API_KEY}"`、`models` 映射。
+  - 新增 `LLM_PROVIDER` 预设（`openai` / `deepseek` / `openrouter` / `opengw`）：只填 key 即可开箱可用
+  - 启动时自动枚举端点 `/v1/models`，把**全部可用模型**写进引擎配置 → 部署后可在「Agent 配置」里切换多模型
+  - `LLM_MODEL` 允许写成 `<模型ID>` 或 `custom/<模型ID>`；留空时默认取端点第一个模型
+  - 文档：模板正文新增「模型与端点怎么填」「执行引擎只预置 1 个」「升级策略（不会自动升级）」
+- 升级动作：**建议在 Composer 里把 `LLM_API_KEY` 勾为必填、`LLM_MODEL` / `LLM_BASE_URL` 取消必填、
+  新增可选变量 `LLM_PROVIDER`**，然后重新 Publish；已部署实例点一次 `Deploy Latest Commit` 即可拿到新 entrypoint
+- 破坏性变更：无（旧的 `LLM_*` 变量全部继续有效；`LLM_PROVIDER_ID` 仍可用）
+- 回滚方式：重新部署上一个 commit（`9e136918` 或更早）
+
 ## 发布记录
 
 | 版本 | 日期 | 状态 | 入口 | 备注 |
 |---|---|---|---|---|
 | v1.0.0 | 2026-11-10 | **已发布到市场** | https://railway.com/deploy/grape-test | slug `grape-test`；分类 Automation；按钮带 `referralCode=25_MLK`；必填变量仅 1 个（`LLM_API_KEY`） |
+| v1.1.0 | 2026-11-11 | 代码已合入 `main`（待重新 Publish） | 同上 | 修复引擎模型配置格式；新增 `LLM_PROVIDER` 预设与多模型自动枚举；明确「不会自动升级」 |
 
 ### 已发布模板的固定入口
 

@@ -79,19 +79,91 @@ else
   echo "[entrypoint] templates present (skip sync)"
 fi
 
-# ---------- 4) 引擎模型配置 ----------
-# 不写死任何厂商/模型：写什么由部署者提供的变量决定。
+# ---------- 4) 引擎模型配置（实测可用的 opencode provider 形态）----------
+# 为什么不用 `providers` 顶层写法：opencode 1.18.x 只认旧式 `provider.<id>.options.baseURL`
+# 与 `npm`（不是 `package`）字段，包名必须是 @ai-sdk/openai-compatible；
+# 写成 providers + package + 顶层 baseURL 会报 "Provider not found / Failed to initialize provider"
+# （2026-11-11 本机实测：该形态可直接调通网关并返回结果）。
 if [ -n "${LLM_API_KEY:-}" ]; then
   CFG="$HOME/.config/opencode/opencode.json"
+  mkdir -p "$(dirname "$CFG")"
   PID="${LLM_PROVIDER_ID:-custom}"
-  {
-    printf '{\n  "$schema": "https://opencode.ai/config.json"'
-    if [ -n "${LLM_MODEL:-}" ]; then printf ',\n  "model": "%s"' "$LLM_MODEL"; fi
-    printf ',\n  "providers": {\n    "%s": {\n      "env": ["LLM_API_KEY"]' "$PID"
-    if [ -n "${LLM_BASE_URL:-}" ]; then printf ',\n      "baseURL": "%s"' "$LLM_BASE_URL"; fi
-    printf ',\n      "package": "@opencode/ai/providers/openai-compatible"\n    }\n  }\n}\n'
-  } > "$CFG"
-  echo "[entrypoint] engine config -> $CFG (provider=$PID model=${LLM_MODEL:-<unset>} baseURL=${LLM_BASE_URL:-<unset>})"
+  # provider 预设：只填 LLM_PROVIDER + LLM_API_KEY 即可开箱可用
+  case "${LLM_PROVIDER:-}" in
+    openai)     DEF_BASE="https://api.openai.com/v1" ;;
+    deepseek)   DEF_BASE="https://api.deepseek.com/v1" ;;
+    openrouter) DEF_BASE="https://openrouter.ai/api/v1" ;;
+    opengw)     DEF_BASE="https://opengw.clouddeveloper.club/v1" ;;
+    *)          DEF_BASE="" ;;
+  esac
+  BASE="${LLM_BASE_URL:-$DEF_BASE}"
+  if [ -z "$BASE" ]; then
+    echo "[entrypoint] 警告: 未指定 LLM_BASE_URL 也未给 LLM_PROVIDER 预设，引擎可能无法解析端点" >&2
+  fi
+  LLM_BASE_URL="$BASE" \
+  LLM_MODEL_ID="${LLM_MODEL:-}" \
+  LLM_PROVIDER_ID="$PID" \
+  OPENCODE_CFG="$CFG" \
+  python3 - <<'PY'
+import json, os, sys, urllib.request
+
+base = (os.environ.get("LLM_BASE_URL") or "").strip()
+mid = (os.environ.get("LLM_MODEL_ID") or "").strip()
+pid = (os.environ.get("LLM_PROVIDER_ID") or "custom").strip() or "custom"
+cfg_path = os.environ["OPENCODE_CFG"]
+api_key = os.environ.get("LLM_API_KEY") or ""
+
+# LLM_MODEL 允许写成 custom/<模型ID> 或裸 <模型ID>，统一取后半段作为模型 ID
+mid = mid.split("/", 1)[1] if "/" in mid else mid
+
+models = {}
+def add(m):
+    m = (m or "").strip()
+    if m and m not in models:
+        models[m] = {"name": m}
+
+add(mid)
+
+# 端点若有 /models 清单，则把全部模型注册进来 —— 这样部署者可在
+# Grape「Agent 配置」里自由切换多个大模型，而不是被钉在单一模型上。
+if base:
+    try:
+        req = urllib.request.Request(
+            base.rstrip("/") + "/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode())
+        for item in (data.get("data") or []):
+            add(item.get("id"))
+    except Exception as e:
+        print(f"[entrypoint] model discovery skipped: {type(e).__name__}: {e}", file=sys.stderr)
+
+if not models:
+    print("[entrypoint] 未提供模型且端点未返回模型清单，跳过引擎配置", file=sys.stderr)
+    sys.exit(0)
+
+default_model = f"{pid}/{mid}" if mid else f"{pid}/{sorted(models)[0]}"
+provider = {
+    "npm": "@ai-sdk/openai-compatible",
+    "options": {"apiKey": "{env:LLM_API_KEY}"},
+    "models": models,
+}
+if base:
+    provider["options"]["baseURL"] = base
+
+cfg = {
+    "$schema": "https://opencode.ai/config.json",
+    "model": default_model,
+    "provider": {pid: provider},
+}
+with open(cfg_path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+print(
+    f"[entrypoint] engine config -> {cfg_path} "
+    f"(provider={pid} default={default_model} models={len(models)} baseURL={base or '<unset>'})"
+)
+PY
 else
   echo "[entrypoint] LLM_API_KEY 未提供：跳过引擎配置，任务将提示「无可用引擎」" >&2
 fi
