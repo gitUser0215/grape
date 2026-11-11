@@ -7,7 +7,7 @@
 |---|---|
 | `Dockerfile` | 平台侧构建用镜像定义：Python 运行时 + 执行引擎（`opencode`）+ 烘入项目模板 |
 | `entrypoint.sh` | 容器启动引导（幂等）：补齐会话密钥、推导对外基址、同步资源、生成引擎模型配置 |
-| `listing.zh.md` / `listing.en.md` | 平台上架文案（概览正文，含「模型与端点怎么填」「升级策略」） |
+| `listing.md` | 平台上架文案（English only；概览正文，含 model endpoint、引擎、升级策略） |
 | `variables.md` | 变量表：哪些必填、哪些隐形预置、哪些由平台注入 |
 | `changelog.md` | 变更记录（平台用户升级前必读） |
 | `icon.png` | 平台市场图标 |
