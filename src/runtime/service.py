@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from src.session_manager import db, db_lock
 from src.config import log
 from src.api.time_utils import normalize_event_time
+from src.runtime.health import apply_runtime_state  # Issue #1496 在线态统一写入口
 from src.token_service import is_auth_401_error
 
 
@@ -56,28 +57,25 @@ def _check_pool_engines_reachable(engine_ids: list, tag: str, repo_key: str = ""
     for eid in engine_ids:
         try:
             c = db.cursor()
-            # 引擎在线 + healthy + probe 正常？
-            c.execute("SELECT status, healthy, probe_status, last_seen_at FROM agent_runtimes WHERE id=?", (eid,))
+            # 健康判定统一走 src.runtime.health.engine_health_ok（Issue #1487：认领侧与派发侧
+            # 必须同一把尺子，禁止各自复制判定——否则派发说健康、认领说失联，任务入队即判死）
+            c.execute(
+                "SELECT status, healthy, probe_status, last_seen_at, credential_id, installed "
+                "FROM agent_runtimes WHERE id=?", (eid,))
             r = c.fetchone()
-            if not r or (r[0] or "") != "online":
+            if not r:
                 continue
-            # Issue #259：心跳新鲜度检查——status=online 但 last_seen_at 过期 = 刚断线的窗口期，
-            # 引擎实际不可达（与 _health_ok / reap 同一把尺子），不算 reachable。
-            _ls = r[3] or ""
-            if _ls:
-                from src.runtime.health import parse_dt as _parse_dt
-                _ts = _parse_dt(_ls)
-                if _ts is not None and time.time() - _ts > _RUNTIME_STALE_SECONDS:
+            _cred = r[4] or 0
+            from src.runtime.health import engine_health_ok as _health_ok_fn
+            if not _health_ok_fn(_cred, r[0], r[1], r[5], r[3],
+                                 stale_seconds=_RUNTIME_STALE_SECONDS):
+                continue
+            if _cred:
+                # 认领侧对远端的附加关（比派发侧更严，既有口径，Issue #1487 未改）：
+                # probe 失败 = 引擎跑不了活，即使心跳新鲜也不认领
+                _probe = r[2] or ""
+                if _probe not in ("ok", "pending", ""):
                     continue
-            else:
-                # 从未心跳过（last_seen_at NULL/空）但 status=online 的幽灵行 → 不可达
-                continue
-            _healthy = r[1] if r[1] is not None else 0
-            _probe = r[2] or ""
-            if _healthy != 1:
-                continue
-            if _probe not in ("ok", "pending", ""):
-                continue
             # 有 tag 能力？
             c.execute(
                 "SELECT 1 FROM engine_capabilities WHERE runtime_id=? AND enabled=1 "
@@ -137,50 +135,172 @@ def _sync_event_failed(seq, reason: str, exit_code: int = 1, completed_at: str =
         log.warning(f"_sync_event_failed failed for seq={seq}: {_e}")
 
 
-def _fail_task_pool_unreachable(c, task_id: str, engine_ids: list, pool_tag: str = ""):
+def _classify_pool_unreachable_reasons(c, engine_ids: list, pool_tag: str = "", repo_key: str = "",
+                                       task_user_id: int = 0) -> dict:
+    """Issue #1487 改动D：逐引擎归类不可达原因，供失败文案分类展示。
+
+    分类（互斥，取首个命中）：
+    - offline：远端 status!=online / healthy!=1 / probe 异常；cred0 installed=0 或 healthy=0
+    - stale_heartbeat：远端 last_seen_at 过期或为空（cred0 豁免心跳，不会落此桶）
+    - no_tag：无 pool_tag 对应能力
+    - scope_mismatch：repo/user scope 不匹配
+    Lock contract：调用方已持有 db_lock。
+    """
+    from src.repo_key import from_repo_key as _frk
+    _buckets = {"offline": [], "stale_heartbeat": [], "no_tag": [], "scope_mismatch": []}
+    _repo_norm = (_frk(repo_key) or "").strip()
+    for _eid in engine_ids:
+        try:
+            c.execute(
+                "SELECT name, status, healthy, probe_status, last_seen_at, credential_id, installed "
+                "FROM agent_runtimes WHERE id=?", (int(_eid),))
+            _r = c.fetchone()
+            if not _r:
+                _buckets["offline"].append(str(_eid))
+                continue
+            _name = _r[0] or str(_eid)
+            _cred = _r[5] or 0
+            from src.runtime.health import engine_health_ok as _health_ok_fn
+            if not _health_ok_fn(_cred, _r[1], _r[2], _r[6], _r[4],
+                                 stale_seconds=_RUNTIME_STALE_SECONDS):
+                # 归因（与 _check_pool_engines_reachable 同一把尺子，仅用于文案分类）：
+                # 本机直连 / 远端不在线 / 远端 healthy=0 或 probe 异常 → 离线；
+                # 远端在线且 healthy 正常，只是心跳过期/缺失 → 心跳过期
+                if _cred == 0 or (_r[1] or "") not in ("online", "active"):
+                    _buckets["offline"].append(_name)
+                elif (_r[2] if _r[2] is not None else 0) != 1 \
+                        or (_r[3] or "") not in ("ok", "pending", ""):
+                    _buckets["offline"].append(_name)
+                else:
+                    _buckets["stale_heartbeat"].append(_name)
+                continue
+            # 有标签能力？
+            c.execute(
+                "SELECT 1 FROM engine_capabilities WHERE runtime_id=? AND enabled=1 "
+                "AND (tag=? OR tag='all') LIMIT 1", (int(_eid), pool_tag))
+            if not c.fetchone():
+                _buckets["no_tag"].append(_name)
+                continue
+            # scope 匹配？
+            c.execute(
+                "SELECT rc.scope, rc.owner_id, rc.owner_name FROM agent_runtimes r "
+                "LEFT JOIN runtime_credentials rc ON rc.id=r.credential_id WHERE r.id=?", (int(_eid),))
+            _sr = c.fetchone()
+            if _sr:
+                _scope = _sr[0] or "global"
+                _owner = _sr[1] or ""
+                _owner_name = _sr[2] or ""
+                if _scope == "repo" and _owner:
+                    _owner_norm = (_frk(_owner) or "").strip()
+                    if _repo_norm and _owner_norm != _repo_norm:
+                        _buckets["scope_mismatch"].append(_name)
+                        continue
+                elif _scope == "user" and task_user_id > 0 and _owner_name:
+                    try:
+                        c.execute("SELECT id FROM grape_accounts WHERE username=? AND id>0 LIMIT 1", (_owner_name,))
+                        _ur = c.fetchone()
+                        _engine_uid = _ur[0] if _ur else 0
+                        if _engine_uid != task_user_id:
+                            _buckets["scope_mismatch"].append(_name)
+                            continue
+                    except Exception:
+                        pass
+            # 兜底：逐项未命中 → 归 offline（不应发生，防御分类漏网）
+            _buckets["offline"].append(_name)
+        except Exception:
+            _buckets["offline"].append(str(_eid))
+    return _buckets
+
+
+def _fail_task_pool_unreachable(c, task_id: str, engine_ids: list, pool_tag: str = "",
+                                repo_key: str = "", task_user_id: int = 0, note: str = ""):
     """Issue #253 改动2：绑定引擎全部物理不可达 → 任务诚实失败（宁失败，不跑飞）。
 
     claim / claim_by_tag 认领时发现 pool_engine_ids 内引擎全部不可达（离线/心跳过期/
     无 tag/scope 不符）时调用。满槽继续排队。替代原"清空 pool_engine_ids 放行全站"的降级。
 
+    Issue #1487 改动D：文案按引擎归类四类原因（离线/心跳过期/无对应标签能力/scope 不匹配）。
+
     Lock contract：调用方必须已持有 db_lock（与 _check_pool_engines_reachable 相同）。
     c 为调用方传入的已持有锁事务的 cursor；本函数内部 commit 并同步事件终态。
     """
     from datetime import datetime, timezone
-    _names = []
-    try:
-        for _eid in engine_ids:
-            c.execute("SELECT name FROM agent_runtimes WHERE id=?", (int(_eid),))
-            _r = c.fetchone()
-            if _r and _r[0]:
-                _names.append(_r[0])
-    except Exception:
-        pass
+    _buckets = _classify_pool_unreachable_reasons(c, engine_ids, pool_tag, repo_key, task_user_id)
+    _parts = []
+    if _buckets["offline"]:
+        _parts.append(f"离线（{', '.join(_buckets['offline'])}）")
+    if _buckets["stale_heartbeat"]:
+        _parts.append(f"心跳过期（{', '.join(_buckets['stale_heartbeat'])}）")
+    if _buckets["no_tag"]:
+        _parts.append(f"无对应标签能力（{', '.join(_buckets['no_tag'])}）")
+    if _buckets["scope_mismatch"]:
+        _parts.append(f"scope 不匹配（{', '.join(_buckets['scope_mismatch'])}）")
+    _reason_detail = '；'.join(_parts) or '未知原因'
     _now = datetime.now(timezone.utc).isoformat()
-    _reason = (f"绑定的 {len(engine_ids)} 台引擎（{', '.join(_names) or ', '.join(str(x) for x in engine_ids)}）"
-               f"全部不可达（离线/失联/无对应标签/范围不匹配），任务停止派发"
-               f"{'，标签=' + pool_tag if pool_tag else ''}（Issue #253）")
+    _reason = (f"绑定的 {len(engine_ids)} 台引擎全部不可达，任务停止派发"
+               f"{'，标签=' + pool_tag if pool_tag else ''}：{_reason_detail}（Issue #253）")
+    if note:
+        _reason += f"；{note}"
+    _fail_task_with_reason(c, task_id, _reason, _now,
+                           log_msg=f"task {task_id} failed: pool engines {engine_ids} all unreachable (Issue #253)")
+
+
+def _fail_task_with_reason(c, task_id: str, reason: str, now_iso: str = "", log_msg: str = ""):
+    """把 queued 任务写成 failed + 同步事件终态（Issue #253/#1487 共用内核）。
+
+    Lock contract：调用方已持有 db_lock。
+    """
+    from datetime import datetime, timezone
+    _now = now_iso or datetime.now(timezone.utc).isoformat()
     try:
         c.execute(
             "UPDATE agent_tasks SET status='failed', result_text='', errors=?, "
             "completed_at=?, stream_ended=1, exit_code=COALESCE(exit_code, 1) "
             "WHERE id=? AND status='queued'",
-            (_reason, _now, task_id))
+            (reason, _now, task_id))
         if c.rowcount:
             db.commit()
-            log.warning(f"task {task_id} failed: pool engines {engine_ids} all unreachable (Issue #253)")
+            log.warning(log_msg or f"task {task_id} failed: {reason[:120]}")
             # 同步事件终态（模式同回收逻辑：防事件永远 running）；
             # Issue #369：走 _sync_event_failed 完整回写 result/exit_code/completed_at
             c.execute("SELECT event_seq FROM agent_tasks WHERE id=?", (task_id,))
             _es = c.fetchone()
             if _es and _es[0]:
-                _sync_event_failed(_es[0], _reason, completed_at=_now)
+                _sync_event_failed(_es[0], reason, completed_at=_now)
     except Exception as _e:
-        log.warning(f"_fail_task_pool_unreachable failed for task {task_id}: {_e}")
+        log.warning(f"_fail_task_with_reason failed for task {task_id}: {_e}")
         try:
             db.rollback()
         except Exception:
             pass
+
+
+def _fail_task_pool_unclaimed(c, task_id: str, engine_ids: list, pool_tag: str = "",
+                             waited_seconds: int = 0, note: str = ""):
+    """Issue #1487 改动C 闭环：池内引擎可达但超过硬窗口仍无人认领 → 诚实失败。
+
+    与 _fail_task_pool_unreachable 的区别：**引擎是好的**，只是没有引擎来领
+    （引擎进程没跑、被更高优先级任务占满、或本机 claimer 未覆盖该 tag）。
+    因此不能复用「全部不可达 + 四分类」文案——那会把可达引擎误报成离线。
+    """
+    from datetime import datetime, timezone
+    _names = []
+    for _eid in engine_ids:
+        try:
+            c.execute("SELECT name FROM agent_runtimes WHERE id=?", (int(_eid),))
+            _r = c.fetchone()
+            if _r and _r[0]:
+                _names.append(_r[0])
+        except Exception:
+            pass
+    _label = ', '.join(_names) or ', '.join(str(x) for x in engine_ids)
+    _reason = (f"绑定的 {len(engine_ids)} 台引擎（{_label}）在 {waited_seconds}s 内未被认领，"
+               f"任务停止派发{'，标签=' + pool_tag if pool_tag else ''}（Issue #1487 排队超时）")
+    if note:
+        _reason += f"；{note}"
+    _fail_task_with_reason(c, task_id, _reason, "",
+                           log_msg=f"task {task_id} failed: bound engines {engine_ids} never claimed "
+                                   f"within {waited_seconds}s (Issue #1487)")
 
 
 def _fail_task_pool_unhealthy(c, task_id: str, engine_ids: list, waited_seconds: int):
@@ -417,7 +537,10 @@ _TASK_COLUMNS = (
     "pool_engine_source, "
     "status, stream_ended, self_reported, pending_since, "
     "exit_code, result_text, errors, stderr, "
-    "usage_json, started_at, completed_at, created_at"
+    "usage_json, started_at, completed_at, created_at, "
+    # MR-2（2026-11-05）：W3C trace 上下文随任务行下发（worker 恢复同一 trace）；列缺失时
+    # _avail 过滤自动跳过，老库兼容。
+    "trace_context"
 )
 
 # Issue #537：任务状态机口径（集中定义，防字面量漂移）。
@@ -845,7 +968,7 @@ def verify_skill_materializable(skill: str, skill_id: int = 0, repo_key: str = "
             _full = ""
         if _full:
             from src.runtime.skill_materialize import validate_skill_dir
-            ok, missing = validate_skill_dir(os.path.dirname(_full))
+            ok, missing, _extra, _vd = validate_skill_dir(os.path.dirname(_full))
             if ok:
                 return True, "local skill dir ok", sid
             _src = (f"obs storage unavailable (key={_okey})" if _storage_unavailable else
@@ -1023,6 +1146,12 @@ def enqueue_task(*, agent_session_id, runtime_id, prompt, cwd="",
     # worker 端看门狗 + ACP 全局超时均任务级 env 优先，管理台/配置文件改后对新任务生效。
     for k, v in _runtime_timeout_env_kv().items():
         env.setdefault(k, v)
+    # Issue #887：任务 payload 携带按 agent 绑定（仓库级/场景级）解析的 skill——
+    # 执行侧一致性校验与任务日志「技能来源」标注的绑定基准值（worker 端 agent.py
+    # _skill_consistency_gate 与 env 双源互校消费；与任务行 skill 字段同源）。
+    # QA 修复：直接赋值（非 setdefault）——env_extra 不得预置覆盖绑定基准，
+    # 否则可观测标注失真且双源互校永远一致（假阴性）。
+    env["GRAPE_BOUND_SKILL"] = (skill or "").strip()
     # Issue-45 M2：签发会话级临时 token 注入 GRAPE_SESSION_TOKEN（存在即有效，删除即失效）。
     # session_key=task_id（精确失效、不误伤并发同类会话）；chat 任务绑定 USER_ID 用户身份，
     # devops 事件任务无用户概念（user_id=0，仓库身份）。
@@ -1049,6 +1178,32 @@ def enqueue_task(*, agent_session_id, runtime_id, prompt, cwd="",
             _server_url = get_worker_connect_url()
         except Exception:
             pass
+    # MR-2（2026-11-05）：任务生命周期根 span "task.enqueue" + W3C trace_context 存行。
+    # OTel 未启用/失败 → _task_trace_context="" 且无 span，业务零影响。
+    _task_span = None
+    _task_trace_context = ""
+    try:
+        from src.observability.otel import start_task_span, snapshot_trace_context
+        _pipeline_tid = ""
+        if repo_key and issue_id:
+            try:
+                from src.observability.trace import pipeline_trace_id
+                _pipeline_tid = pipeline_trace_id(repo_key, issue_id, task_id)
+            except Exception:
+                pass
+        # span 名带业务标识（task_id + agent_type）：trace 列表的 rootTraceName 从抽象的
+        # "task.enqueue" 变成可读的 "task t_xxx vod enqueue"——排查时按 SeqID/task_id 一眼定位
+        _task_span, _ = start_task_span(f"task {task_id} {agent_type or 'task'} enqueue", {
+            "task_id": task_id, "agent_type": agent_type, "skill": skill,
+            "repo_key": repo_key, "issue_id": issue_id, "runtime_id": runtime_id,
+            "pool_tag": pool_tag, "pipeline_trace_id": _pipeline_tid,
+            "event_seq": event_seq, "event_type": event_type,
+        })
+        if _task_span is not None:
+            _task_trace_context = snapshot_trace_context(_task_span)
+    except Exception:
+        _task_span = None
+        _task_trace_context = ""
     with db_lock:
         c = db.cursor()
         _avail = _table_columns("agent_tasks")
@@ -1076,6 +1231,12 @@ def enqueue_task(*, agent_session_id, runtime_id, prompt, cwd="",
             "pending_since": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+        # MR-2：trace_context 已入 _TASK_COLUMNS_LIST（_avail 过滤保老库兼容），此处仅补值。
+        try:
+            if "trace_context" in _insert_cols and "trace_context" not in _insert_vals:
+                _insert_vals["trace_context"] = _task_trace_context
+        except Exception:
+            pass
         c.execute(
             f"INSERT INTO agent_tasks ({', '.join(_insert_cols)}) VALUES ({','.join(['?'] * len(_insert_cols))})",
             [_insert_vals[x] for x in _insert_cols],
@@ -1083,7 +1244,13 @@ def enqueue_task(*, agent_session_id, runtime_id, prompt, cwd="",
         db.commit()
     from src.runtime.instances import runtime_instance_name
     _inst = runtime_instance_name(runtime_id)
-    log.info(f"Task enqueued: {task_id} session={agent_session_id} runtime={runtime_id}({_inst}) skill={skill}")
+    log.info(f"Task enqueued: {task_id} agent={agent_type} repo={repo_key} issue={issue_id or '-'} skill={skill} runtime={runtime_id}({_inst}) session={agent_session_id}")
+    # MR-2：enqueue span 收口（行已写入，trace_context 已存）
+    if _task_span is not None:
+        try:
+            _task_span.end()
+        except Exception:
+            pass
     # 可观察性埋点：任务入队
     try:
         from src.observability import record_task_enqueued
@@ -1204,7 +1371,9 @@ def claim(runtime_id, expected_task_id=None, expected_event_seq=None) -> dict | 
                 # 300s 窗口会误杀执行中长任务；600s 窗口让长命令有足够时间完成。
                 # worker 端 claim 后 task_start 置 running 可彻底规避；本窗口作为
                 # 不依赖 worker 端的兜底（真死任务 10 分钟内恢复重排）。
-                _stale = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+                from src.runtime.task_activity import CLAIM_ACTIVITY_WINDOW_SECONDS
+                _stale = (datetime.now(timezone.utc)
+                          - timedelta(seconds=CLAIM_ACTIVITY_WINDOW_SECONDS)).isoformat()
                 c.execute(
                     "SELECT id, runtime_id, event_seq, attempts FROM agent_tasks "
                     "WHERE status='dispatched' AND started_at < ? AND started_at IS NOT NULL",
@@ -1212,22 +1381,27 @@ def claim(runtime_id, expected_task_id=None, expected_event_seq=None) -> dict | 
                 _stale_rows = c.fetchall()
                 _actually_recovered = []
                 for _tid, _rid, _seq, _attempts in _stale_rows:
-                    # 活跃度检查（2026-08-21 修复）：task_start 失败时 status 留在 dispatched
-                    # 但 agent 实际在跑（有 task_messages 产出）。查最近 600s 是否有消息，
-                    # 有则跳过回收——agent 活跃说明只是 task_start 回调丢了，不该重跑。
+                    # 活跃度检查（2026-08-21 修复 / Issue #1495 改统一口径）：
+                    # task_start 失败时 status 留在 dispatched 但 agent 实际在跑
+                    # （有 task_messages 产出）。查最近 600s 是否有消息，有则跳过
+                    # 回收——agent 活跃说明只是 task_start 回调丢了，不该重跑。
                     # 600s 窗口兼容长命令（terraform apply 可达 900s 无事件产出）。
+                    # Issue #1495：判定改走 task_activity.has_recent_activity——
+                    # 旧写法 `created_at > ?` 是 TEXT 逐字节比较，表默认值行
+                    # （空格分隔，' '<'T'）与无微秒 ISO 行（同秒 '+'<'.'）会被
+                    # 系统性误判不活跃；现按 task_id 索引取行后 Python 解析为
+                    # epoch 比较（解析失败行不计活跃，保守宁可误回收）。
                     try:
-                        _active_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
-                        c.execute(
-                            "SELECT 1 FROM task_messages WHERE task_id=? AND created_at > ? LIMIT 1",
-                            (_tid, _active_cutoff))
-                        if c.fetchone():
-                            continue  # 最近 60s 有消息，agent 在跑，跳过回收
+                        from src.runtime.task_activity import has_recent_activity
+                        if has_recent_activity(c, _tid, CLAIM_ACTIVITY_WINDOW_SECONDS):
+                            continue  # 最近 600s 有消息，agent 在跑，跳过回收
                     except Exception:
                         pass  # 查询失败不阻塞回收（保守：宁可误回收也不留死任务）
                     _actually_recovered.append((_tid, _rid, _seq))
                     # 杀掉旧进程：recover 重新入队后会有新 worker claim 启动新进程，
                     # 旧进程不杀会继续执行（tf-infra7 出现过 2 个进程同时跑同一 task）
+                    # 注：pytest 环境跳过真杀（测试库任务非真实引擎进程，pgrep 扫
+                    # cwd 存量会误杀无关进程）；生产路径不受影响，仍然真杀。
                     try:
                         c.execute("SELECT cwd, runtime_id FROM agent_tasks WHERE id=?", (_tid,))
                         _old = c.fetchone()
@@ -1242,8 +1416,10 @@ def claim(runtime_id, expected_task_id=None, expected_event_seq=None) -> dict | 
                                     _backend = "codearts"
                             except Exception:
                                 pass
-                            from src.runtime.agent import _kill_stale_engine
-                            _kill_stale_engine({"cwd": _old[0], "id": _tid}, _backend)
+                            import os as _os
+                            if "PYTEST_CURRENT_TEST" not in _os.environ:
+                                from src.runtime.agent import _kill_stale_engine
+                                _kill_stale_engine({"cwd": _old[0], "id": _tid}, _backend)
                     except Exception as _ke:
                         log.warning(f"recover: kill stale engine failed for task {_tid}: {_ke}")
                     # 定向任务（pool_agent_type=''）回收归零 runtime_id 后变无主：
@@ -1417,14 +1593,20 @@ def claim(runtime_id, expected_task_id=None, expected_event_seq=None) -> dict | 
                                 pass
                             _has_capable = _check_pool_engines_reachable(_allowed, _task_tag, _task_repo, task_user_id=_task_uid)
                             if not _has_capable:
-                                # Issue #253 改动2：绑定引擎全部物理不可达 → 宁失败不跑飞（同 claim_by_tag）。
-                                # 原行为：清空 pool_engine_ids 放行任意引擎（池外全局 worker 抢任务）。
-                                # 新行为：任务置 failed + 人话原因，保留 pool_engine_ids，同步事件终态。
-                                _fail_task_pool_unreachable(c, task_id, _allowed, _task_tag)
-                                return None
-                            _skip = True
-                            # Issue #605：引擎不在广播名单被静默跳过 → 取证日志（60s 去重）
-                            _log_pool_skip_once(task_id, runtime_id, _allowed)
+                                # Issue #1487 改动C：池内全不可达只是单次瞬时快照的结论，
+                                # 不在此处直接判死（避免非宿主主控在心跳非新鲜窗口先 tick
+                                # 即把任务打死）——保持 queued，交 _check_stale_queued_tasks
+                                # 的既有阈值窗口（120s）统一裁决。
+                                log.info(f"claim: task {task_id} pool engines {_allowed} all "
+                                         f"unreachable in this snapshot, keep queued for "
+                                         f"_check_stale_queued_tasks (Issue #1487)")
+                                _skip = True
+                                # Issue #605：引擎不在广播名单被静默跳过 → 取证日志（60s 去重）
+                                _log_pool_skip_once(task_id, runtime_id, _allowed)
+                            else:
+                                _skip = True
+                                # Issue #605：引擎不在广播名单被静默跳过 → 取证日志（60s 去重）
+                                _log_pool_skip_once(task_id, runtime_id, _allowed)
                     except Exception:
                         pass
                 if not _skip:
@@ -1594,6 +1776,264 @@ def get_task(task_id) -> dict | None:
         c.execute(f"SELECT {', '.join(_cols)} FROM agent_tasks WHERE id=?", (task_id,))
         row = c.fetchone()
     return dict(zip(_cols, row)) if row else None
+
+
+class _TaskTokenLockSkipped(Exception):
+    """已存在未结束事务，无法取得 SQLite 写锁：本轮同步 fail-closed（不触碰调用方事务）。"""
+
+
+_SESSION_TOKEN_LOCK_TIMEOUT = 10  # 秒：同任务跨进程轮换锁等待上限
+
+# Issue #990 复审：GET_LOCK 是连接级锁，连接一断就释放，因此这条专用连接可以**跨次复用**。
+# 实测（MySQL 8.0.43 RDS）每次新建/关闭连接 + 加解一次锁 p50=8.4ms，复用后 p50=0.22ms；
+# 每 50 次同步省 408ms（97%）。池外的语义不变：绝不用池借出的连接持锁。
+# guard 保证「同进程内一次只有一个线程持锁」——同一连接上对同名 GET_LOCK 会重入计数，
+# 若两个线程交错加解就会漏释放，其它进程被永久卡住。
+_lock_conn_state: dict = {"conn": None, "guard": threading.Lock()}
+
+
+def _locked_connection():
+    """取复用的专用锁连接（失效则重建）。失败返回 None（调用方 fail-closed）。"""
+    conn = _lock_conn_state.get("conn")
+    if conn is not None:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            return conn
+        except Exception as e:
+            log.warning(f"sync_task_session_token: lock conn unhealthy, reconnecting: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _lock_conn_state["conn"] = None
+    factory = getattr(db, "dedicated_connection", None)
+    if factory is None:
+        log.warning("sync_task_session_token: mysql backend without dedicated_connection; "
+                    "cannot serialize cross-process token rotation")
+        return None
+    try:
+        conn = factory()
+    except Exception as e:
+        log.warning(f"sync_task_session_token: dedicated lock conn failed: {e}")
+        return None
+    _lock_conn_state["conn"] = conn
+    return conn
+
+
+def _drop_locked_connection():
+    """连接出错/断链时丢弃，下次重建（连接断开即释放其上的命名锁）。"""
+    conn = _lock_conn_state.get("conn")
+    _lock_conn_state["conn"] = None
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _session_token_lock_name(task_id: str) -> str:
+    """MySQL 命名锁名（≤64 字符）：按库名隔离，避免同一 MySQL 实例多环境互相排队。"""
+    dbname = "default"
+    try:
+        from src.mysql_compat import mysql_config
+        dbname = (mysql_config().get("database") or "default")
+    except Exception:
+        pass
+    # MySQL 锁名长度上限 64；task_id 通常 < 32，库名截断兜底。
+    return ("grape_sess_tk_%s_%s" % (task_id, dbname))[:64]
+
+
+def _acquire_task_token_lock(task_id: str):
+    """在复用的池外专用连接上获取 MySQL 服务器级命名锁（跨进程串行化）。
+
+    为什么不用 ``SELECT ... FOR UPDATE``：``src/mysql_compat.py`` 对任何 SELECT
+    执行后立即 ``commit()``，行锁随即释放，多 worker 仍可并发轮换互相作废旧 token。
+    GET_LOCK 是连接级、服务器级互斥，且锁连接独立于业务连接，可稳定覆盖读+轮换+回写
+    整个临界区（对应 QA 建议的「分布式锁」方案）。
+
+    返回 (locked_conn, lock_name)；获取失败返回 (None, "")，调用方必须 fail-closed。
+    进程内的 guard 先串行化（同一连接重入计数会漏释放），再用 GET_LOCK 跨进程互斥。
+    """
+    guard = _lock_conn_state["guard"]
+    if not guard.acquire(timeout=_SESSION_TOKEN_LOCK_TIMEOUT):
+        log.warning("sync_task_session_token: in-process token lock busy; fail closed without rotating")
+        return None, ""
+    try:
+        dconn = _locked_connection()
+        if dconn is None:
+            guard.release()
+            return None, ""
+        lock_name = _session_token_lock_name(task_id)
+        try:
+            cur = dconn.cursor()
+            cur.execute("SELECT GET_LOCK(%s, %s)", (lock_name, _SESSION_TOKEN_LOCK_TIMEOUT))
+            row = cur.fetchone()
+            if not row or row[0] != 1:
+                log.warning(f"sync_task_session_token: mysql named lock not acquired ({lock_name}); "
+                            "fail closed without rotating")
+                guard.release()
+                return None, ""
+            return dconn, lock_name
+        except Exception as e:
+            log.warning(f"sync_task_session_token: mysql named lock error ({lock_name}): {e}")
+            _drop_locked_connection()
+            guard.release()
+            return None, ""
+    except Exception:
+        guard.release()
+        raise
+
+
+def _release_task_token_lock(dconn, lock_name: str):
+    """释放命名锁并归还进程内 guard（连接保留复用；断链时下次自动重建）。"""
+    try:
+        cur = dconn.cursor()
+        cur.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
+        cur.fetchone()
+    except Exception as e:
+        log.warning(f"sync_task_session_token: release lock {lock_name} failed (conn drop will release): {e}")
+        _drop_locked_connection()
+    finally:
+        try:
+            _lock_conn_state["guard"].release()
+        except RuntimeError:
+            # 未持锁（异常路径已释放）：无需处理
+            pass
+
+
+def sync_task_session_token(task_id: str) -> str:
+    """同步任务的会话 token：保证 shell 环境快照与运行时注入值一致（Issue #990）。
+
+    `agent_tasks.env_extra` 是任务创建时的 shell 环境快照；运行时进程执行前会经
+    `GET /tasks/{id}/env` 刷新 env。若两端各自签发 token，快照会保留旧值 → Agent 用
+    旧 token 调 grape 全量 401。
+
+    规则：
+    - 快照 token 有效（session_key / repo_key / agent_type 匹配且未过期）→ 原样返回，不轮换；
+    - 失效或作用域不匹配 → 在同一事务内作废旧 token、签发新 token 并回写
+      `agent_tasks.env_extra`，使快照与运行时注入值保持一致。
+
+    跨进程原子性：SQLite 用 ``BEGIN IMMEDIATE`` 取库级写锁；MySQL 用池外专用连接上的
+    ``GET_LOCK`` 命名锁串行化（服务端多 worker 运行，线程级 ``db_lock`` 不足以覆盖跨进程
+    竞争；兼容层的 ``FOR UPDATE`` 会被 SELECT 后自动 commit 提前放锁，故不可用）。锁不可
+    获取时 fail-closed 返回空串。过期、签发、快照回写共享同一事务；任一步失败即回滚并
+    返回空串，绝不返回未落库的新 token。
+
+    返回同步后的 token；任务不存在、无仓库/agent 上下文、取锁失败或持久化失败时返回空串。
+    """
+    if not task_id:
+        return ""
+    from src.api.auth_token import verify_session_token, rotate_session_token
+    from src.session_manager import _is_mysql_backend
+    is_mysql = _is_mysql_backend()
+    lock_conn, lock_name = (None, "")
+    if is_mysql:
+        lock_conn, lock_name = _acquire_task_token_lock(task_id)
+        if lock_conn is None:
+            return ""
+    try:
+        with db_lock:
+            c = db.cursor()
+            try:
+                if is_mysql:
+                    # 已持有服务器级命名锁 → 临界区内普通 SELECT 即可（无需 FOR UPDATE）。
+                    row = c.execute(
+                        "SELECT repo_key, agent_type, user_id, env_extra FROM agent_tasks WHERE id=?",
+                        (task_id,),
+                    ).fetchone()
+                else:
+                    try:
+                        c.execute("BEGIN IMMEDIATE")
+                    except Exception as e:
+                        if "within a transaction" in str(e).lower():
+                            # 已有未结束事务：无法取得写锁，fail-closed；不回滚调用方事务。
+                            raise _TaskTokenLockSkipped(str(e))
+                        raise
+                    row = c.execute(
+                        "SELECT repo_key, agent_type, user_id, env_extra FROM agent_tasks WHERE id=?",
+                        (task_id,),
+                    ).fetchone()
+                if not row:
+                    db.commit()
+                    return ""
+                repo_key, agent_type = (row[0] or ""), (row[1] or "")
+                try:
+                    user_id = int(row[2] or 0)
+                except (TypeError, ValueError):
+                    user_id = 0
+                try:
+                    env = json.loads(row[3] or "{}")
+                except Exception:
+                    env = {}
+                if not isinstance(env, dict):
+                    env = {}
+                if not repo_key or not agent_type:
+                    db.commit()
+                    return ""
+
+                snapshot_token = str(env.get("GRAPE_SESSION_TOKEN") or "")
+                info = verify_session_token(snapshot_token) if snapshot_token else None
+                token_ok = bool(
+                    info
+                    and info.get("session_key") == task_id
+                    and info.get("repo_key") == repo_key
+                    and info.get("agent_type") == agent_type
+                )
+                if token_ok:
+                    db.commit()
+                    return snapshot_token
+
+                new_token = rotate_session_token(
+                    session_key=task_id, repo_key=repo_key,
+                    agent_type=agent_type, user_id=user_id, commit=False)
+                env["GRAPE_SESSION_TOKEN"] = new_token
+                c.execute(
+                    "UPDATE agent_tasks SET env_extra=? WHERE id=?",
+                    (json.dumps(env, ensure_ascii=False), task_id),
+                )
+                db.commit()
+                return new_token
+            except _TaskTokenLockSkipped as e:
+                log.warning(f"sync_task_session_token: sqlite write lock unavailable for {task_id}: {e}")
+                return ""
+            except Exception as e:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                log.warning(f"sync_task_session_token: sync failed for {task_id}: {e}")
+                return ""
+    finally:
+        if lock_conn is not None:
+            _release_task_token_lock(lock_conn, lock_name)
+
+
+def session_token_for_execution(task_id: str, *, session_key_fallback: str,
+                                repo_key: str, agent_type: str,
+                                user_id: int = 0) -> str:
+    """direct 执行前的 token 解析：优先复用/同步任务快照，绝不制造未落库 token。
+
+    - 有任务行：走 ``sync_task_session_token``，失败时返回空串（不另签未回写快照的 token，
+      否则运行时注入值与 shell 环境快照再次漂移，正是 #990 的症状）；
+    - 无任务行（如纯 direct 会话）：按 ``session_key_fallback`` 新签。
+    """
+    if task_id:
+        token = sync_task_session_token(task_id)
+        if token:
+            return token
+        if get_task(task_id) is not None:
+            log.warning(f"session_token_for_execution: task {task_id} snapshot sync failed; "
+                        "skip issuing an unpersisted token")
+            return ""
+        session_key = task_id
+    else:
+        session_key = session_key_fallback
+    from src.api.auth_token import issue_session_token
+    return issue_session_token(
+        session_key=session_key, repo_key=repo_key,
+        agent_type=agent_type, user_id=user_id)
 
 
 def lookup_task_by_event_seq(runtime_id: int, event_seq: int) -> dict | None:
@@ -1822,14 +2262,19 @@ def claim_by_tag(tag: str, runtime_id: int,
                                 pass
                             _has_capable = _check_pool_engines_reachable(_allowed, _task_tag, _task_repo, task_user_id=_task_uid)
                             if not _has_capable:
-                                # Issue #253 改动2：绑定引擎全部物理不可达 → 宁失败不跑飞。
-                                # 原行为：清空 pool_engine_ids 放行任意引擎（池外全局 worker 抢任务）。
-                                # 新行为：任务置 failed + 人话原因，保留 pool_engine_ids，同步事件终态。
-                                _fail_task_pool_unreachable(c, task_id, _allowed, _task_tag)
-                                return None
-                            _skip = True
-                            # Issue #605：引擎不在广播名单被静默跳过 → 取证日志（60s 去重）
-                            _log_pool_skip_once(task_id, runtime_id, _allowed)
+                                # Issue #1487 改动C：池内全不可达只是单次瞬时快照的结论，
+                                # 不在此处直接判死——保持 queued，交 _check_stale_queued_tasks
+                                # 的既有阈值窗口（120s）统一裁决（同 claim 定向分支）。
+                                log.info(f"claim_by_tag: task {task_id} pool engines {_allowed} all "
+                                         f"unreachable in this snapshot, keep queued for "
+                                         f"_check_stale_queued_tasks (Issue #1487)")
+                                _skip = True
+                                # Issue #605：引擎不在广播名单被静默跳过 → 取证日志（60s 去重）
+                                _log_pool_skip_once(task_id, runtime_id, _allowed)
+                            else:
+                                _skip = True
+                                # Issue #605：引擎不在广播名单被静默跳过 → 取证日志（60s 去重）
+                                _log_pool_skip_once(task_id, runtime_id, _allowed)
                     except Exception:
                         pass
                 if not _skip:
@@ -2037,6 +2482,78 @@ def release_busy_slot(runtime_id, cursor=None):
         _db.commit()
 
 
+# ===== Issue #1071：重启后「活着却被判死」——活性判定 · 回炉守卫 · 迟到复活 =====
+#
+# 三个根因（同一份故障链）：
+#   1) 优雅停机把 REMOTE 任务置 pending_self_report，pending_since=停机时刻；判死扫描只看
+#      pending_since，worker 仍在产出也 30 分钟后一刀切 → 活着的任务被杀。
+#   2) 自动回炉（reap/rerequeue）不看活性，回炉认领会改写 started_at，而 started_at 就是
+#      worker 的 run_token → 老 worker 的上报被 409 stale 永久拒收。
+#   3) 判死走 update_task_status，对 timeout_failed 也 revoke 会话 token → 之后连重试都 401。
+# 修复口径统一为「任务最近一次产出消息」：worker 还活着就必然在写 task_messages，
+# 这比引擎心跳更贴近任务本身（心跳断 ≠ 任务死）。
+
+# 兜底超时来源标记：sweep 写入 agent_tasks.errors 首元素，供迟到结果复活时精确识别
+# （避免把真业务失败也复活，重新打开 2026-08-24 seq#2488「失败被成功覆盖」的洞）。
+TIMEOUT_SOURCE_MARKER = "PENDING_SELF_REPORT_TIMEOUT"
+
+# 自动回炉前的活性窗口：最近 N 秒内有产出消息 → 视为仍在跑，不自动回炉
+TASK_ACTIVITY_GUARD_SECONDS = int(os.environ.get("TASK_ACTIVITY_GUARD_SECONDS", "600"))
+
+# 迟到结果复活窗口：从判死时刻（completed_at）起 N 秒内允许复活一次
+TIMEOUT_REVIVE_WINDOW_SECONDS = int(os.environ.get("TIMEOUT_REVIVE_WINDOW_SECONDS", "1800"))
+
+
+def _epoch_of(value) -> float | None:
+    """库里时间串 → epoch 秒；不可解析返回 None（复用 health.parse_dt 的双后端口径）。"""
+    if not value:
+        return None
+    try:
+        from src.runtime.health import parse_dt
+        _v = parse_dt(value)
+        return float(_v) if _v is not None else None
+    except Exception:
+        return None
+
+
+def task_last_activity(task_id) -> float | None:
+    """任务最近一次产出消息的 epoch 秒；无消息 → None。
+
+    取最近 20 条在 Python 侧取数值最大，而不是 SQL MAX(created_at)：历史行是无时区
+    '%Y-%m-%d %H:%M:%S'，新行是带时区 ISO-8601（Issue #588），字符串比较会把 ' '(0x20)
+    < 'T'(0x54) 误判（与 scheduler 判死扫描同一个坑）。
+    """
+    try:
+        with db_lock:
+            c = db.cursor()
+            rows = c.execute(
+                "SELECT created_at FROM task_messages WHERE task_id=? ORDER BY id DESC LIMIT 20",
+                (task_id,)
+            ).fetchall()
+        _best = None
+        for (_ts,) in rows or []:
+            _e = _epoch_of(_ts)
+            if _e is not None and (_best is None or _e > _best):
+                _best = _e
+        return _best
+    except Exception as e:
+        log.warning(f"task_last_activity failed for task {task_id}: {e}")
+        return None
+
+
+def task_recently_active(task_id, window_seconds: int | None = None) -> bool:
+    """最近 window_seconds 内是否有产出消息（默认 TASK_ACTIVITY_GUARD_SECONDS）。
+
+    回炉守卫的统一口径。窗口化是有意的：守卫不能永久拦住回炉，否则又回到
+    seq#622「任务悬空卡死」；超过窗口仍无产出，照旧按原逻辑回收。
+    """
+    _win = TASK_ACTIVITY_GUARD_SECONDS if window_seconds is None else int(window_seconds)
+    _ts = task_last_activity(task_id)
+    if _ts is None:
+        return False
+    return _ts >= datetime.now(timezone.utc).timestamp() - _win
+
+
 def validate_run_token(task: dict | None, run_token: str = "") -> str:
     """校验补报实例（run_token = 认领时刻 started_at，Step 4）。
 
@@ -2143,6 +2660,13 @@ def converge_event_to_task(task_id: str) -> dict:
         converged = _cascade_event_terminal(c, _seq, _task_status,
                                             exit_code=task.get("exit_code"))
         db.commit()
+    # Issue #1667：直接 SQL 收敛终态后补挂排队 drain（旁路兜底）
+    if converged:
+        try:
+            from src.api.event_store import _drain_a2a_queue_after_terminal
+            _drain_a2a_queue_after_terminal(_seq)
+        except Exception as _qe:
+            log.warning(f"converge_event_to_task: a2a queue drain failed: {_qe}")
     return {"status": "converged" if converged else "noop",
             "task_id": task_id, "task_status": _task_status, "event_seq": _seq,
             "event_status_before": before,
@@ -2190,19 +2714,33 @@ def update_task_status(task_id, status, **kw):
         # cancel_task / 直接判死路径（pool unreachable 等）此前只写 agent_tasks 不回写 events，
         # 事件长期 running → A2A 去重无限期阻断同角色新交接。complete_task/fail_task 的
         # 详写终态路径（update_event_complete 先行）在此为 no-op（事件已终态）。
+        _cascaded_seq = 0
         if status in _TERMINAL_STATUSES:
             try:
                 _evt_row = c.execute("SELECT event_seq FROM agent_tasks WHERE id=?",
                                      (task_id,)).fetchone()
                 if _evt_row and _evt_row[0]:
                     if _cascade_event_terminal(c, _evt_row[0], status):
+                        _cascaded_seq = _evt_row[0]
                         log.info(f"update_task_status: cascaded event {_evt_row[0]} -> "
                                  f"{status} for task {task_id} (Issue #587 convergence)")
             except Exception as _ce:
                 log.warning(f"update_task_status: terminal cascade failed for task {task_id}: {_ce}")
         db.commit()
-    # Issue-45 M2：任务终态（含 timeout_failed）→ 会话级临时 token 即时失效（存在即有效，删除即失效）
-    if status in TASK_TERMINAL_STATUSES:
+    # Issue #1667：任务级联写终态是「绕过 update_event_status/complete」的直接 SQL 旁路，
+    # 排队 A2A 事件不会收到终态钩子 → 在此补挂 drain，避免 queued 永久滞留。
+    if _cascaded_seq:
+        try:
+            from src.api.event_store import _drain_a2a_queue_after_terminal
+            _drain_a2a_queue_after_terminal(_cascaded_seq)
+        except Exception as _qe:
+            log.warning(f"update_task_status: a2a queue drain after cascade failed: {_qe}")
+    # Issue-45 M2：任务终态 → 会话级临时 token 即时失效（存在即有效，删除即失效）
+    # Issue #1071（P4）：timeout_failed 是「疑似误判终态」，**不**收钥匙——
+    #   判死是兜底猜测，不是任务真的结束；worker 之后 push/调平台接口全 401
+    #   （生产 16:33–16:49 有 22 次 401）会让它连交付都做不到，活就白跑了。
+    #   这类 token 靠 6 小时 TTL 自然过期，purge 会清；多活 6 小时只属于一个已判死的任务。
+    if status in TASK_TERMINAL_STATUSES and status != TASK_TIMEOUT_FAILED:
         try:
             from src.api.auth_token import revoke_session_token
             revoke_session_token(task_id)
@@ -2229,8 +2767,16 @@ def requeue_task(task_id):
     with db_lock:
         c = db.cursor()
         # 释放槽位（根因2修复）：requeue 前先查 runtime_id，requeue 后 busy_slots-1
-        c.execute("SELECT runtime_id FROM agent_tasks WHERE id=?", (task_id,))
+        c.execute("SELECT runtime_id, status FROM agent_tasks WHERE id=?", (task_id,))
         row = c.fetchone()
+        # Issue #1071（P3）：活着的任务不回炉。回炉会改写 started_at，而 started_at 就是
+        # worker 的 run_token → 老 worker 紧接着的 complete/fail 立刻被 409 stale 拒收。
+        # 只拦 running（dispatched 从未开始执行，谈不上「活着」）；窗口化见
+        # TASK_ACTIVITY_GUARD_SECONDS，超窗口仍无产出照旧回炉，不留悬空卡死。
+        if row and (row[1] or "") == "running" and task_recently_active(task_id):
+            log.info(f"requeue_task skipped: task {task_id} has recent task_messages activity "
+                     f"(guard={TASK_ACTIVITY_GUARD_SECONDS}s)")
+            return False
         c.execute("UPDATE agent_tasks SET status='queued', started_at=NULL WHERE id=? AND status IN ('dispatched','running')",
                   (task_id,))
         ret = c.rowcount > 0
@@ -2250,8 +2796,25 @@ def requeue_task(task_id):
         return ret
 
 
-def report_messages(task_id, messages):
-    """批量执行消息 → append_event_archive_log（M1 落档，脱敏）+ task_messages 结构化落库 + 实时 fanout"""
+def peek_next_seq(task_id) -> int:
+    """预读 task 下一个可用 seq（MAX+1）。Issue #975：路由层预留下列 seq 范围作回执。"""
+    with db_lock:
+        c = db.cursor()
+        c.execute("SELECT COALESCE(MAX(seq),0) FROM task_messages WHERE task_id=?", (task_id,))
+        return (c.fetchone()[0] or 0) + 1
+
+
+def report_messages(task_id, messages, seq_start: int | None = None) -> dict | None:
+    """批量执行消息 → append_event_archive_log（M1 落档，脱敏）+ task_messages 结构化落库 + 实时 fanout
+
+    seq_start（Issue #975）：路由层同步预定的批次 seq 起点（peek_next_seq 预留）。
+    不传则沿用 MAX+1。批次回执（日志 + 返回值）带 seq 范围，供 worker/master 对账。
+
+    返回（QA 复审修复，Spec #1）：**实际落库**的回执 dict
+    {"count": 落库条数, "seq_start": 首条 seq, "seq_end": 末条 seq}；
+    无可落库消息返回 None。落库异常时返回 {}（调用方不得当作成功范围）。
+    非 dict 消息不计入 seq 消耗与回执（与 insert 跳过行为一致，杜绝假回执）。
+    """
     task = get_task(task_id)
     if not task:
         return
@@ -2316,30 +2879,58 @@ def report_messages(task_id, messages):
             log.warning(f"report_messages events.agent_logs failed: {e}")
     # 结构化落库（task_messages，双后端一致；seq 服务端生成 MAX+1，UNIQUE 防重放）
     # 收集落库后的 (原始消息, seq) 对，供 fanout 透传 seq（前端按 seq 去重，跨主 DB 尾随双通道不重复渲染）
+    # QA 复审（Spec #1/#4）：只对 dict 消息消耗 seq；INSERT 命中 UNIQUE（预留 seq 与
+    # 并发落库/重放撞号）时改用 MAX+1 重试一次——防 INSERT OR IGNORE 静默丢消息
+    _persistable = [m for m in (messages or []) if isinstance(m, dict)]
     _seq_messages: list[dict] = []
-    try:
-        with db_lock:
-            c = db.cursor()
-            c.execute("SELECT COALESCE(MAX(seq),0) FROM task_messages WHERE task_id=?", (task_id,))
-            seq = (c.fetchone()[0] or 0) + 1
-            for m in (messages or []):
-                if not isinstance(m, dict):
-                    continue
-                _t = m.get("type", "log")
-                _d = m.get("data")
-                tool, content, input_json, output = _normalize_message(_t, _d)
-                # created_at 显式写 UTC ISO（时间本地化：MySQL 表默认 now() 为 CST 无时区，
-                # 双后端存储语义统一，读时 normalize_event_time 幂等）
-                c.execute(
-                    "INSERT OR IGNORE INTO task_messages (task_id, seq, type, tool, content, input_json, output, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                    (task_id, seq, _t, tool, content, input_json, output,
-                     datetime.now(timezone.utc).isoformat()))
-                # 透传 seq 给 fanout（done 终态消息 _to_payload 返回 None 不会推送，但 seq 仍记录）
-                _seq_messages.append({**m, "seq": seq})
-                seq += 1
-            db.commit()
-    except Exception as e:
-        log.warning(f"report_messages task_messages insert failed: {e}")
+    _receipt: dict | None = None
+    if _persistable:
+        try:
+            with db_lock:
+                c = db.cursor()
+                if seq_start is not None:
+                    seq = int(seq_start)
+                else:
+                    c.execute("SELECT COALESCE(MAX(seq),0) FROM task_messages WHERE task_id=?", (task_id,))
+                    seq = (c.fetchone()[0] or 0) + 1
+                _seq_first = None
+                for m in _persistable:
+                    _t = m.get("type", "log")
+                    _d = m.get("data")
+                    tool, content, input_json, output = _normalize_message(_t, _d)
+                    # created_at 显式写 UTC ISO（时间本地化：MySQL 表默认 now() 为 CST 无时区，
+                    # 双后端存储语义统一，读时 normalize_event_time 幂等）
+                    _row = (task_id, seq, _t, tool, content, input_json, output,
+                            datetime.now(timezone.utc).isoformat())
+                    try:
+                        c.execute(
+                            "INSERT INTO task_messages (task_id, seq, type, tool, content, input_json, output, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                            _row)
+                    except Exception as _ie:
+                        # seq 撞号（预留范围与异步落库/补报重放并发）：改用 MAX+1 重试一次，
+                        # 不允许 INSERT OR IGNORE 式静默丢消息（QA Spec #4 seq 重复风险）
+                        c.execute("SELECT COALESCE(MAX(seq),0) FROM task_messages WHERE task_id=?", (task_id,))
+                        seq = (c.fetchone()[0] or 0) + 1
+                        c.execute(
+                            "INSERT INTO task_messages (task_id, seq, type, tool, content, input_json, output, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (task_id, seq, _t, tool, content, input_json, output,
+                             datetime.now(timezone.utc).isoformat()))
+                        log.warning(f"report_messages: task={task_id} seq conflict, reallocated to {seq}")
+                    if _seq_first is None:
+                        _seq_first = seq
+                    # 透传 seq 给 fanout（done 终态消息 _to_payload 返回 None 不会推送，但 seq 仍记录）
+                    _seq_messages.append({**m, "seq": seq})
+                    seq += 1
+                db.commit()
+                _receipt = {"count": len(_seq_messages), "seq_start": _seq_first,
+                            "seq_end": _seq_messages[-1].get("seq")}
+                # Issue #975：批次回执日志（seq 起止 + 条数）——master 侧对账凭证
+                if _seq_messages:
+                    log.info(f"report_messages: task={task_id} persisted count={len(_seq_messages)} "
+                             f"seq_range={_seq_first}..{_seq_messages[-1].get('seq')}")
+        except Exception as e:
+            log.warning(f"report_messages task_messages insert failed: {e}")
+            _receipt = {}
     # 实时 fanout（订阅表推送，队列满丢弃保活；SSE 重连靠 since 回源）
     # 传带 seq 的消息：前端按 seq 去重，queue 快路径与 SSE DB 尾随双通道不重复渲染
     try:
@@ -2347,6 +2938,7 @@ def report_messages(task_id, messages):
         fanout(task_id, _seq_messages if _seq_messages else (messages or []))
     except Exception as e:
         log.warning(f"report_messages fanout failed: {e}")
+    return _receipt
 
 
 def _normalize_message(_t: str, _d) -> tuple[str, str, str, str]:
@@ -2401,6 +2993,120 @@ def list_task_messages(task_id, since: int = 0, limit: int = 5000) -> list[dict]
         out.append({"seq": r[0], "type": r[1], "tool": r[2] or "",
                     "content": r[3] or "", "input": inp, "output": r[5] or "",
                     "created_at": normalize_event_time(r[6] or "")})
+    return out
+
+
+def list_task_messages_recent(task_id, limit: int = 200) -> list[dict]:
+    """拉取任务**最新**的 limit 条 task_messages，按时间正序返回。
+
+    与 list_task_messages 的区别：后者从 seq=0 往后取，适合前端从头回放；
+    本函数先按 seq DESC 取尾部再反转，用于「接管」这类只关心当前进展的场景 ——
+    否则长任务的接管上下文会停在几小时前的任务开头。
+
+    返回 [{seq, type, tool, content, input, output, created_at}]，input 为解析后的 dict。
+    """
+    import json as _json
+    try:
+        with db_lock:
+            c = db.cursor()
+            c.execute(
+                "SELECT seq, type, tool, content, input_json, output, created_at FROM task_messages "
+                "WHERE task_id=? ORDER BY seq DESC LIMIT ?",
+                (task_id, limit))
+            rows = list(reversed(c.fetchall()))
+    except Exception as e:
+        log.warning(f"list_task_messages_recent failed: {e}")
+        return []
+    out = []
+    for r in rows:
+        inp = {}
+        try:
+            inp = _json.loads(r[4] or "{}")
+        except Exception:
+            pass
+        out.append({"seq": r[0], "type": r[1], "tool": r[2] or "",
+                    "content": r[3] or "", "input": inp, "output": r[5] or "",
+                    "created_at": normalize_event_time(r[6] or "")})
+    return out
+
+
+# wrote_files 派生查询认定的「写入类」工具名（含 hermes 等引擎的工具名变体，
+# 兜底按 input 含 path + content/new_string 精筛，见 list_wrote_files）
+_WRITE_TOOL_EXACT = frozenset({"write", "write_file", "patch"})
+
+# 记忆化缓存（Issue #977 性能补丁）：key=task_id → (max_seq, wrote_files)。
+# 只按「消息 seq 是否前进」判失效（新增即失效），不用纯 TTL，避免"配置/进度改了却显示旧值"。
+# 上限 512 个任务，超出按插入序淘汰最旧（单进程内小字典，替换成本可忽略）。
+_WROTE_FILES_CACHE: dict = {}
+_WROTE_FILES_CACHE_MAX = 512
+
+
+def _is_write_tool(tool: str) -> bool:
+    t = (tool or "").strip().lower()
+    return t in _WRITE_TOOL_EXACT or "write" in t or "patch" in t
+
+
+def list_wrote_files(task_id) -> list[dict]:
+    """派生查询：该任务写过的文件清单（Issue #977，/info 的 wrote_files 数据源）。
+
+    - 数据源：task_messages 中 tool_use 消息的 input_json（write/patch 的 path +
+      content/new_string 的 utf-8 字节数），不扫描工作区、不依赖 agent 自述。
+    - 过滤：SQL 侧先按工具名收窄（write/patch 变体，与 _is_write_tool 同口径）
+      + Python 侧精筛（input 含 path 与 content/new_string）。
+    - 同 path 多次写入各记一条（保留全部 seq）；first_seen_at 取该条消息 created_at。
+    - 性能（2026-11-04 压测）：原实现扫该任务全部 tool_use 行（10k 消息 36ms、
+      大写入 221ms、40k 消息 146ms），且 /info 会被前端反复拉。改为
+      「SQL 工具名预过滤」+「按 (task_id, max_seq) 记忆化」：任务消息无新增时命中缓存
+      返回 ~µs；有新增消息（seq 前进）自动失效重算，不做纯 TTL 假缓存。
+    """
+    import json as _json
+    try:
+        with db_lock:
+            c = db.cursor()
+            c.execute("SELECT COALESCE(MAX(seq), 0) FROM task_messages WHERE task_id=?",
+                      (task_id,))
+            _max_seq = int(c.fetchone()[0] or 0)
+            _hit = _WROTE_FILES_CACHE.get(str(task_id))
+            if _hit and _hit[0] == _max_seq:
+                return [dict(x) for x in _hit[1]]
+            c.execute(
+                "SELECT seq, tool, input_json, created_at FROM task_messages "
+                "WHERE task_id=? AND type='tool_use' "
+                "AND (LOWER(tool) LIKE '%write%' OR LOWER(tool) LIKE '%patch%') "
+                "ORDER BY seq",
+                (task_id,))
+            rows = c.fetchall()
+    except Exception as e:
+        log.warning(f"list_wrote_files failed: {e}")
+        return []
+    out = []
+    for seq, tool, input_json, created_at in rows:
+        if not _is_write_tool(tool):
+            continue
+        try:
+            inp = _json.loads(input_json or "{}")
+        except Exception:
+            continue
+        if not isinstance(inp, dict):
+            continue
+        path = inp.get("path")
+        if not isinstance(path, str) or not path:
+            continue
+        payload = inp.get("content")
+        if not isinstance(payload, str):
+            payload = inp.get("new_string")
+        if not isinstance(payload, str):
+            continue
+        out.append({
+            "path": path,
+            "bytes": len(payload.encode("utf-8")),
+            "tool": (tool or "").strip().lower(),
+            "seq": seq,
+            "first_seen_at": normalize_event_time(created_at or ""),
+        })
+    if len(_WROTE_FILES_CACHE) >= _WROTE_FILES_CACHE_MAX:
+        _WROTE_FILES_CACHE.pop(next(iter(_WROTE_FILES_CACHE)), None)
+    _WROTE_FILES_CACHE[str(task_id)] = (_max_seq, [dict(x) for x in out])
     return out
 
 
@@ -2507,8 +3213,27 @@ def _backfill_release_subissue_on_complete(task: dict | None, exit_code: int,
         log.warning(f"_backfill_release_subissue_on_complete failed: {_e}")
 
 
-def complete_task(task_id, result_text, exit_code=0, usage=None):
-    """完成：解析结构化 output → 业务失败检测 → finalize_event_archive → update_event_complete → 终态。"""
+def complete_task(task_id, result_text, exit_code=0, usage=None,
+                  revive_from_timeout_failed: bool = False):
+    """完成：解析结构化 output → 业务失败检测 → finalize_event_archive → update_event_complete → 终态。
+
+    revive_from_timeout_failed（Issue #1071）：由 service.revive_timeout_task 传入，
+    表示这是一次已校验过的「兜底超时判死后迟到结果」复活，允许把事件侧 failed 改判 completed。
+
+    MR-2（2026-11-05）：task.finish span——从任务行 trace_context 恢复同一 trace；
+    覆盖 complete 与 fail 两个终态（fail_task 单独埋同款）。未启用/坏数据 → 零影响。
+    """
+    try:
+        from src.observability.otel import start_task_span
+        _fin_span, _ = start_task_span(f"task {task_id} finish", {
+            "task_id": task_id, "exit_code": exit_code,
+            "result_len": len(result_text or ""),
+            "outcome": "completed",
+        }, trace_context=(get_task(task_id) or {}).get("trace_context") or "")
+        if _fin_span is not None:
+            _fin_span.end()  # 终态判定在函数体内，span 本身即时收口
+    except Exception:
+        pass
     task = get_task(task_id)
     # 可见性（P1）：引擎「疑似提前结束」（模型输出后静默、无收尾记录）时任务仍算
     # completed（exit 0），但把标记显式落到 agent_tasks.errors + 事件 result 前缀，
@@ -2580,6 +3305,9 @@ def complete_task(task_id, result_text, exit_code=0, usage=None):
             if output and output.get("conclusion"):
                 _conclusion = output["conclusion"]
             _result_show = _conclusion or (result_text or "")[:200]
+            if not _result_show:
+                # Issue #1503：conclusion 与 result_text 均空 → 兜底含状态/exit_code 默认摘要
+                _result_show = f"{status} (exit_code={exit_code})"
             if _premature:
                 # 事件列表/详情直接看到「没走到收尾」，不必翻完整 result_text
                 _result_show = f"⚠️ {_pm} 疑似提前结束（未走到收尾）：{_result_show}"
@@ -2587,7 +3315,9 @@ def complete_task(task_id, result_text, exit_code=0, usage=None):
                                   duration=duration,
                                   completed_at=datetime.now(timezone.utc).isoformat(),
                                   result=_result_show,
-                                  structured_output=output or None)
+                                  structured_output=output or None,
+                                  revive_from_timeout_failed=(
+                                      revive_from_timeout_failed and status == "completed"))
             # Issue #656: 末节点完成后 → issue 级自动结单（全部节点 completed + 无阻断
             # → stage=done / status=completed / completed_at 落库 + 联动关闭 VCS Issue；
             # failed 阻断回退 pending_review 保留人工 confirm done 路径）
@@ -2627,7 +3357,11 @@ def complete_task(task_id, result_text, exit_code=0, usage=None):
                                      session_engine=_done_engine)
         except Exception as e:
             log.warning(f"complete_task update issue session failed: {e}")
-    log.info(f"Task completed: {task_id} exit={exit_code}")
+    _t_agent = (task or {}).get("agent_type", "")
+    _t_repo = (task or {}).get("repo_key", "")
+    _t_skill = (task or {}).get("skill", "")
+    _t_issue = (task or {}).get("issue_id", "")
+    log.info(f"Task completed: {task_id} agent={_t_agent} repo={_t_repo} issue={_t_issue or '-'} skill={_t_skill} exit={exit_code} outcome={'failed' if exit_code else 'completed'}")
     # Issue #627: SRE 生产发布任务终态回填（成功/失败都要回填——deploy_failed 分支
     # 恰在 exit!=0；钩子自带 production_release 锚点判断，普通任务零影响、幂等）
     if task and (task.get("agent_type") or "") == "sre" and task.get("issue_id"):
@@ -2678,13 +3412,17 @@ def complete_task(task_id, result_text, exit_code=0, usage=None):
                     elif _token:
                         # 无 handler（无 token 配置）→ fallback 直接调 _post_result_to_issue
                         from src.api.event_pipeline import _post_result_to_issue
-                        _post_result_to_issue(_repo, _issue_num, _result_text, _token, _agent_type)
+                        _post_result_to_issue(_repo, _issue_num, _result_text, _token, _agent_type,
+                                              agent_result=True, task_id=task_id,
+                                              seq=task.get("event_seq"))
                 except Exception as _pe:
                     log.warning(f"complete_task: handler.post_issue_comment failed: {_pe}")
                     # fallback 到直接调用
                     if _token:
                         from src.api.event_pipeline import _post_result_to_issue
-                        _post_result_to_issue(_repo, _issue_num, _result_text, _token, _agent_type)
+                        _post_result_to_issue(_repo, _issue_num, _result_text, _token, _agent_type,
+                                              agent_result=True, task_id=task_id,
+                                              seq=task.get("event_seq"))
             # 2. 子任务 SRE 完成 → 登记到父 Issue
             if _agent_type == "sre" and _issue_num and _token:
                 try:
@@ -2813,7 +3551,11 @@ def finalize_by_stream_end(task_id: str, fallback_text: str = "", exit_code: int
     task = get_task(task_id)
     if not task:
         return False
-    if task.get("status") in TASK_TERMINAL_STATUSES:
+    _st = task.get("status")
+    if _st == TASK_TIMEOUT_FAILED:
+        # Issue #1071（P2）：判死之后才回来的结果——走窄口子复活，其余终态照旧幂等返回。
+        return revive_timeout_task(task_id, fallback_text or "", exit_code, usage=usage or {})
+    if _st in TASK_TERMINAL_STATUSES:
         return False
     result_text = fallback_text or ""
     if task.get("self_reported") == 1 and task.get("result_text"):
@@ -2826,6 +3568,79 @@ def finalize_by_stream_end(task_id: str, fallback_text: str = "", exit_code: int
         except Exception:
             pass
     complete_task(task_id, result_text, exit_code, usage=usage or {})
+    return True
+
+
+def _is_pending_self_report_timeout(task: dict) -> bool:
+    """判死来源是否为「兜底超时」（sweep），而不是业务失败。
+
+    Issue #1071：复活是窄口子，来源必须钉死——
+    - 新行：sweep 写 errors 首元素 {"error_code": "PENDING_SELF_REPORT_TIMEOUT"}；
+    - 存量行（改动前判死）：没有 error_code 标记，按 sweep 写死的判死文案兜底识别。
+    业务失败（failed）永远走不到这里，2026-08-24 seq#2488 的「失败被成功覆盖」竞态不重开。
+    """
+    _errs = str(task.get("errors") or "")
+    if not _errs:
+        return False
+    if TIMEOUT_SOURCE_MARKER in _errs:
+        return True
+    return ("内未自报完成/失败" in _errs) or ("pending_self_report 超时" in _errs)
+
+
+def revive_timeout_task(task_id, result_text: str = "", exit_code: int = 0,
+                        usage: dict | None = None) -> bool:
+    """Issue #1071（P2）：迟到结果回收——判死后才回来的结构化结论不再永久丢弃。
+
+    准入（全部满足才复活，任一不满足返回 False 并记原因）：
+    1. 任务态 = timeout_failed（其它终态一律不动）；
+    2. 从未复活过（revived_at 为空）——只复活一次，防反复重放刷状态；
+    3. 判死时刻在 TIMEOUT_REVIVE_WINDOW_SECONDS 内（默认 30 分钟）；
+    4. 判死来源是兜底超时（见 _is_pending_self_report_timeout），不是业务失败；
+    5. 迟到结果含完整结构化产出（actions + conclusion），与 complete_task 既有判据一致。
+
+    通过后：状态回 running（清 completed_at/exit_code，落 revived_at）→ 交给 complete_task
+    走完整收尾（事件归档/事件改判/回帖/stage），事件侧 failed→completed 由
+    update_event_complete(revive_from_timeout_failed=True) 这一个窄口子放行。
+    """
+    task = get_task(task_id)
+    if not task or task.get("status") != TASK_TIMEOUT_FAILED:
+        return False
+    if task.get("revived_at"):
+        log.info(f"revive skipped: task {task_id} already revived at {task['revived_at']}")
+        return False
+    from src.api.event_store import parse_agent_output_json
+    _out = parse_agent_output_json(result_text or "")
+    if not (_out and _out.get("actions") and _out.get("conclusion")):
+        log.info(f"revive skipped: task {task_id} late result has no complete structured output")
+        return False
+    if not _is_pending_self_report_timeout(task):
+        log.info(f"revive skipped: task {task_id} was not failed by the timeout sweep "
+                 f"(business failure stays failed)")
+        return False
+    _dead_at = _epoch_of(task.get("completed_at"))
+    if _dead_at is not None:
+        _age = datetime.now(timezone.utc).timestamp() - _dead_at
+        if _age > TIMEOUT_REVIVE_WINDOW_SECONDS:
+            log.info(f"revive skipped: task {task_id} judged {_age:.0f}s ago "
+                     f"(window={TIMEOUT_REVIVE_WINDOW_SECONDS}s)")
+            return False
+    with db_lock:
+        c = db.cursor()
+        c.execute(
+            "UPDATE agent_tasks SET status='running', completed_at=NULL, exit_code=NULL, "
+            "revived_at=? WHERE id=? AND status='timeout_failed' "
+            "AND (revived_at IS NULL OR revived_at='')",
+            (datetime.now(timezone.utc).isoformat(), task_id)
+        )
+        _ok = c.rowcount > 0
+        db.commit()
+    if not _ok:
+        log.info(f"revive skipped: task {task_id} changed state concurrently")
+        return False
+    log.info(f"timeout revive: task {task_id} timeout_failed -> running "
+             f"(late structured result, re-finalizing)")
+    complete_task(task_id, result_text or "", 0 if exit_code is None else exit_code,
+                  usage=usage or {}, revive_from_timeout_failed=True)
     return True
 
 
@@ -3154,6 +3969,19 @@ def fail_task(task_id, error, exit_code=-1):
             return
     except Exception as _e:
         log.warning(f"fail_task: transient retry check failed for {task_id}: {_e}")
+    # MR-2（2026-11-05）：task.finish span（fail 终态，与 complete_task 同款串联）。
+    # 架构审查 P2-6：放在全部幂等判定（completed / failed / timeout_failed / 过期上报 /
+    # 瞬时重试）之后——被跳过的重放调用不再产生误导性的 finish FAIL span。
+    try:
+        from src.observability.otel import start_task_span
+        _fin_span, _ = start_task_span(f"task {task_id} finish FAIL", {
+            "task_id": task_id, "exit_code": exit_code,
+            "outcome": "failed", "error_head": str(error or "")[:200],
+        }, trace_context=(task or {}).get("trace_context") or "")
+        if _fin_span is not None:
+            _fin_span.end()
+    except Exception:
+        pass
     _result_show = None  # Issue #403：耗尽判死 → 分类失败摘要（无 event_seq 时保持 None）
     if task and task.get("event_seq"):
         try:
@@ -3178,9 +4006,13 @@ def fail_task(task_id, error, exit_code=-1):
                                    exit_code, None, None,
                                    tokens=[_get_task_token(task)],
                                    issue_num_hint=task.get("issue_id") or "")
+            # Issue #1503：_result_show 与 error 均为空时兜底含状态/exit_code 的默认摘要，
+            # 不依赖 store 层兜底（fail_task 第一优先来源仍为分类失败摘要/原始错误）。
+            _default_fail_summary = f"failed (exit_code={exit_code})"
             update_event_complete(task["event_seq"], "failed", exit_code=exit_code,
                                   completed_at=datetime.now(timezone.utc).isoformat(),
-                                  result=(_result_show or (error or ""))[:200])
+                                  result=(_result_show or (error or "")
+                                          or _default_fail_summary)[:200])
         except Exception as e:
             log.warning(f"fail_task finalize failed: {e}")
     # Issue #403：耗尽判死时 errors 合并而非覆盖——上方 retry 检查已把
@@ -3204,7 +4036,8 @@ def fail_task(task_id, error, exit_code=-1):
     # chat 远端轮询只读 result_text → 用户只见光秃秃「查询失败」。此处同步写入可读原因，
     # errors 仍保留原始排障详情（可能含结构化诊断 dict，如 TRANSIENT_RETRY_*）。
     _result_text_write = (_result_show if _result_show is not None else "") \
-        or str(error or "")[:500]
+        or str(error or "")[:500] \
+        or f"failed (exit_code={exit_code})"  # Issue #1503：空诊断兜底
     update_task_status(task_id, "failed", exit_code=exit_code,
                        result_text=_result_text_write,
                        errors=_fail_errors)
@@ -3384,6 +4217,8 @@ def fail_task(task_id, error, exit_code=-1):
                                         _post_result_to_issue(
                                             _repo, _issue_num, _msg, _comment_token,
                                             task.get("agent_type") or "", _rk,
+                                            agent_result=False, task_id=task_id,
+                                            seq=task.get("event_seq"),
                                         )
                                 except Exception as _pe:
                                     log.warning(f"fail_task: R10 issue comment post failed: {_pe}")
@@ -3479,7 +4314,8 @@ def fail_task(task_id, error, exit_code=-1):
                     log.info(f"fail_task: dead session detected (consecutive failures), cleared runtime_session_id for {_isid}")
         except Exception as e:
             log.warning(f"fail_task session check failed: {e}")
-    log.warning(f"Task failed: {task_id} exit={exit_code} err={str(error)[:120]}")
+    _ft = get_task(task_id) or {}
+    log.warning(f"Task failed: {task_id} agent={_ft.get('agent_type', '')} repo={_ft.get('repo_key', '')} issue={_ft.get('issue_id', '') or '-'} skill={_ft.get('skill', '')} exit={exit_code} outcome=failed err={str(error)[:120]}")
     # 可观察性埋点：任务失败
     try:
         from src.observability import record_task_terminal, record_task_failed
@@ -3588,10 +4424,10 @@ async def _ingestion_loop():
                 except asyncio.TimeoutError:
                     break
             with db_lock:
-                for kind, tid, payload in batch:
+                for kind, tid, payload, seq_start in batch:
                     try:
                         if kind == "messages":
-                            report_messages(tid, payload)
+                            report_messages(tid, payload, seq_start=seq_start)
                         elif kind == "progress":
                             report_progress(tid, payload)
                     except Exception as e:
@@ -3610,24 +4446,31 @@ async def _ingestion_loop():
 _ASYNC_REPORT_QUEUE = None
 
 
-def enqueue_async_report(kind: str, task_id: str, payload):
-    """异步回报入队（队列满降级同步，不丢数据）。"""
+def enqueue_async_report(kind: str, task_id: str, payload, seq_start: int | None = None) -> dict | None:
+    """异步回报入队（队列满降级同步，不丢数据）。seq_start：Issue #975 批次 seq 预留起点。
+
+    返回（QA 复审，Spec #1）：同步兜底路径返回 report_messages 的实际落库回执
+    （dict）；走异步队列时返回 None（实际回执以服务端 report_messages 日志为准）。
+    """
     q = _ASYNC_REPORT_QUEUE
     if q is None:
         # 队列未启动 → 同步兜底
         if kind == "messages":
-            report_messages(task_id, payload)
+            return report_messages(task_id, payload, seq_start=seq_start)
         elif kind == "progress":
             report_progress(task_id, payload)
-        return
+            return None
+        return None
     try:
-        q.put_nowait((kind, task_id, payload))
+        q.put_nowait((kind, task_id, payload, seq_start))
+        return None
     except Exception:
         # 队列满：同步降级
         if kind == "messages":
-            report_messages(task_id, payload)
+            return report_messages(task_id, payload, seq_start=seq_start)
         elif kind == "progress":
             report_progress(task_id, payload)
+        return None
 
 
 async def wait_task_terminal(task_id: str, timeout: float = 1800.0, poll_interval: float = 1.0) -> dict:
@@ -3715,11 +4558,16 @@ def heartbeat_consolidated(credential_id: int, runtime_ids: list[int], client_ip
         )
         # Update all runtimes for this credential
         if runtime_ids:
+            # Issue #1496：在线态统一写入口（status+last_seen_at 同事务，含遗留
+            # health 列派生同步）；本机直连行（credential_id=0）不在此路径
+            # （worker 心跳只上报自己凭据名下的 runtime，归属由下面 UPDATE 的
+            # credential_id 条件兜底——先筛出归属行再逐个走统一入口）。
             ph = ",".join("?" for _ in runtime_ids)
             c.execute(
-                f"UPDATE agent_runtimes SET status='online', last_seen_at=? WHERE id IN ({ph}) AND credential_id=?",
-                [now] + runtime_ids + [credential_id]
-            )
+                f"SELECT id FROM agent_runtimes WHERE id IN ({ph}) AND credential_id=?",
+                [*runtime_ids, credential_id])
+            for (_rid,) in c.fetchall():
+                apply_runtime_state(c, _rid, "online", now)
         db.commit()
 
     # Opportunistic stale recovery (every call, but batch is cheap)
@@ -3760,11 +4608,9 @@ def reap_stale_runtimes() -> dict:
             stale = c.fetchall()
             for row in stale:
                 rid, rname, cid = row[0], row[1], row[2]
-                # 标记 offline
-                c.execute(
-                    "UPDATE agent_runtimes SET status='offline' WHERE id=?",
-                    (rid,)
-                )
+                # 标记 offline（Issue #1496：走统一写入口，status+last_seen_at 同事务，
+                # 遗留 health 列同步为派生值——回收后的行不再残留 health='online'）
+                apply_runtime_state(c, rid, "offline", "")
                 # 回收该 runtime 上的 dispatched 任务 → queued（从未开始，零双跑风险，100s）
                 # runtime_id 置 0（NOT NULL 列不能置 NULL；0 = 无主池任务，可被任意引擎 claim）
                 c.execute(
@@ -3803,6 +4649,17 @@ def reap_stale_runtimes() -> dict:
                     _cut = _recover_cutoff_for_agent(_agent_t or "")
                     if _started_at and _cut and _started_at >= _cut:
                         continue  # 该 agent 超时更宽（如 coding 7200s），未到其回收点
+                    # Issue #1071（P3）：回炉前查活性。引擎心跳断 ≠ 任务死——worker 还在
+                    # 写 task_messages 就说明它活着。不回炉的理由同上：回炉会把 started_at
+                    # 改写成新的认领时刻，老 worker 的 run_token 立刻失效 → 409 stale 永败。
+                    try:
+                        if task_recently_active(_task_id):
+                            log.info(f"reap_stale_runtimes: skip requeue task {_task_id} "
+                                     f"(recent task_messages activity, runtime offline)")
+                            continue
+                    except Exception as _ae:
+                        log.warning(f"reap_stale_runtimes: activity guard failed for "
+                                    f"task {_task_id}: {_ae}")
                     c.execute(
                         "UPDATE agent_tasks SET status='queued', started_at=NULL, runtime_id=0,"
                         " attempts=attempts+1 WHERE id=? AND status='running'",
@@ -3846,6 +4703,9 @@ def reap_stale_runtimes() -> dict:
 
 
 _STALE_QUEUED_THRESHOLD = int(os.environ.get("HEALTH_STALE_QUEUED_THRESHOLD", "120"))
+# Issue #1487 改动C 闭环：queued 任务超过硬窗口仍无引擎认领 → 诚实失败，防「健康分健康但
+# 物理不可达」的池把任务永久挂住（实测：claim 不再判死后该池永不裁决）。
+_STALE_QUEUED_HARD_THRESHOLD = int(os.environ.get("HEALTH_STALE_QUEUED_HARD_THRESHOLD", "900"))
 
 
 def _check_stale_queued_tasks():
@@ -3853,7 +4713,10 @@ def _check_stale_queued_tasks():
 
     当任务 queued 超过 _STALE_QUEUED_THRESHOLD（默认 120 秒）且 pool_engine_ids 非空时，
     按 issue #253 硬约束语义收敛（方案 A：低健康分限时等待，超时失败）：
-    - 池中有健康引擎 → 等待（引擎可能马上认领）
+    - 池中有健康引擎且物理可达 → 等待（引擎可能马上认领）；超过
+      _STALE_QUEUED_HARD_THRESHOLD（默认 900 秒）仍未被认领 → 诚实失败（防永久挂单）
+    - 池中健康分达标但物理不可达（无标签能力/scope 不符/心跳过期）→ 两把尺子矛盾，
+      以物理可达性为准，立即按原因分类失败（Issue #1487 改动C 闭环）
     - 引擎不健康但物理可达 → 有界等待：超时后按来源分流（local-claimer 设计 §3.3）：
         * pool_engine_source='auto'（系统自动选择的绑定）→ 降级：清空白名单重新入队
           （放行全站认领，含本机 direct 引擎），置 source='degraded' 防反复，result 记录审计
@@ -3868,7 +4731,8 @@ def _check_stale_queued_tasks():
             c = db.cursor()
             # 查询超时的 queued 任务（带 pool_engine_ids 限定）
             c.execute(
-                "SELECT id, pool_engine_ids, pool_tag, repo_key, user_id FROM agent_tasks "
+                "SELECT id, pool_engine_ids, pool_tag, repo_key, user_id, created_at "
+                "FROM agent_tasks "
                 "WHERE status='queued' AND pool_engine_ids!='' AND pool_engine_ids IS NOT NULL "
                 "AND created_at <= ?",
                 (cutoff,))
@@ -3876,14 +4740,37 @@ def _check_stale_queued_tasks():
             if not stale_tasks:
                 return
             import json as _json
-            for tid, peids, task_tag, task_repo, task_uid in stale_tasks:
-                # 先检查 pool 中是否有健康引擎——有则等待（正常路径，引擎马上会领）
+            hard_cutoff = (datetime.now(timezone.utc)
+                           - timedelta(seconds=_STALE_QUEUED_HARD_THRESHOLD)).isoformat()
+            for tid, peids, task_tag, task_repo, task_uid, task_created in stale_tasks:
                 try:
                     _engine_ids = _json.loads(peids) if peids else []
                 except Exception:
                     _engine_ids = []
-                if _engine_ids and _check_pool_has_healthy(_engine_ids):
-                    continue  # 池中有健康引擎，继续等待
+                if not _engine_ids:
+                    continue
+                # Issue #1487 改动C 闭环：claim 侧不再当场判死，本函数必须真能裁决。
+                # 「健康分」与「物理可达性」是两把尺子，分别算，矛盾时以物理为准。
+                _reachable = _check_pool_engines_reachable(
+                    _engine_ids, task_tag or "", task_repo or "", task_user_id=task_uid or 0)
+                _has_healthy = _check_pool_has_healthy(_engine_ids)
+                _hard_expired = (task_created or "") <= hard_cutoff
+                if _has_healthy:
+                    if not _reachable:
+                        log.warning(f"_check_stale_queued_tasks: engine(s) {_engine_ids} healthy by score "
+                                    f"but physically unreachable -> fail task {tid} (Issue #1487)")
+                        _fail_task_pool_unreachable(c, tid, _engine_ids, task_tag or "",
+                                                    repo_key=task_repo or "",
+                                                    task_user_id=task_uid or 0,
+                                                    note="健康分达标但物理不可达")
+                        continue
+                    if not _hard_expired:
+                        continue  # 正常等待：健康且可达，等引擎领取
+                    log.warning(f"_check_stale_queued_tasks: task {tid} queued past hard window "
+                                f"({_STALE_QUEUED_HARD_THRESHOLD}s) with reachable pool -> fail (Issue #1487)")
+                    _fail_task_pool_unclaimed(c, tid, _engine_ids, task_tag or "",
+                                              waited_seconds=_STALE_QUEUED_HARD_THRESHOLD)
+                    continue
                 # local-claimer 设计 §3.3：白名单全灭时按来源分流（显式绑定不降级，自动绑定放行）
                 _source = ""
                 try:
@@ -3908,12 +4795,13 @@ def _check_stale_queued_tasks():
                 # 健康分不达标 → 再检查物理可达性（在线 + 有 tag 能力 + scope 匹配 + 有并发槽）
                 # Issue #253 方案 A：物理可达但低分 → 限时等待已到点（120s），诚实失败；
                 # 物理不可达 → 直接失败（不撕证放行全站）
-                if _engine_ids and _check_pool_engines_reachable(
-                    _engine_ids, task_tag or "", task_repo or "", task_user_id=task_uid or 0):
+                if _reachable:
                     log.info(f"_check_stale_queued_tasks: engine(s) {_engine_ids} unhealthy but reachable, "
                              f"wait window elapsed -> fail task {tid} (Issue #253)")
                     _fail_task_pool_unhealthy(c, tid, _engine_ids, _STALE_QUEUED_THRESHOLD)
                 else:
-                    _fail_task_pool_unreachable(c, tid, _engine_ids, task_tag or "")
+                    # Issue #1487 改动D：带上 repo/user 上下文，文案分类更准确（scope 不匹配可归因）
+                    _fail_task_pool_unreachable(c, tid, _engine_ids, task_tag or "",
+                                                repo_key=task_repo or "", task_user_id=task_uid or 0)
     except Exception as e:
         log.warning(f"_check_stale_queued_tasks failed: {e}")

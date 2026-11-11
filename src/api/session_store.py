@@ -91,6 +91,32 @@ def get_issue_stage(repo_key: str, issue_id: str) -> dict | None:
     return None
 
 
+def get_issue_status(repo_key: str, issue_id: str) -> str:
+    """读 Issue 当前 status（只读 helper）。无记录或异常返回 ""。
+
+    与 `get_issue_stage` 分离：其返回结构不含 status，需要判 status 的路径
+    （如 PR merged 视同审核通过）单独读取，避免改动既有返回契约。
+    """
+    try:
+        _num = int(str(issue_id or "").lstrip("#"))
+    except Exception:
+        return ""
+    if not _num:
+        return ""
+    try:
+        with db_lock:
+            c = db.cursor()
+            c.execute(
+                "SELECT status FROM issue WHERE repo_key=? AND issue_number=?",
+                (repo_key, _num))
+            row = c.fetchone()
+        return (row[0] if row and row[0] else "") or ""
+    except Exception as _e:
+        from src.config import log as _log3
+        _log3.warning(f"get_issue_status failed for {repo_key} #{_num}: {_e}")
+        return ""
+
+
 def _sync_issue_fields(repo_key: str, issue_id: str, fields: dict, touch_updated_at: bool = True,
                        ensure_row: bool = False, assignee: str = ""):
     """Phase B2.5/C3：将收编字段写回 `issue` 卡片行（按 issue_number）。
@@ -133,10 +159,10 @@ def _sync_issue_fields(repo_key: str, issue_id: str, fields: dict, touch_updated
                     _usr_expr = "0"
                     _usr_pre = ()
                 c.execute(
-                    "INSERT INTO issue (user_id, assignee, repo_key, issue_number, status) "
-                    "SELECT " + _usr_expr + ", ?, ?, ?, 'active' WHERE NOT EXISTS "
+                    "INSERT INTO issue (user_id, assignee, repo_key, issue_number, status, created_by) "
+                    "SELECT " + _usr_expr + ", ?, ?, ?, 'active', ? WHERE NOT EXISTS "
                     "(SELECT 1 FROM issue WHERE repo_key=? AND issue_number=?)",
-                    (*_usr_pre, _assignee, repo_key, _num, repo_key, _num))
+                    (*_usr_pre, _assignee, repo_key, _num, _assignee, repo_key, _num))
                 c.execute(f"UPDATE issue SET {sets} WHERE repo_key=? AND issue_number=?", params)
             else:
                 c.execute(f"UPDATE issue SET {sets} WHERE repo_key=? AND issue_number=?", params)
@@ -154,22 +180,43 @@ def set_issue_stage(repo_key: str, issue_id: str, stage: str, owner_agent: str,
     建档由 `_sync_issue_fields` 的 ensure_row 保证（无卡片行建最小行）。
     scene_id 初始为空，由 Task Center set_issue_scene 或智能推荐写入。
     """
+    from src.config import log
+    # Issue #1599 修复（2026-11-09）：同 stage 重写不得抹掉人工审核点。
+    # 旧实现无条件写 status，重派/重试等幂等重写（set_issue_stage('sre','sre')）会把
+    # pending_review 清成 processing，随后 auto_finalize 绕过「待审核不自动结单」直接 auto_done。
+    # 故**写前**先取旧 stage（必须在 _sync_issue_fields 之前，否则读到的是已更新的新值）。
+    _prev_stage, _prev_known = "", False
+    try:
+        _num_prev = int(str(issue_id).lstrip("#"))
+        with db_lock:
+            _row_prev = db.cursor().execute(
+                "SELECT stage FROM issue WHERE repo_key=? AND issue_number=?",
+                (repo_key, _num_prev)).fetchone()
+        _prev_stage = ((_row_prev[0] if _row_prev else "") or "").strip()
+        _prev_known = True
+    except Exception as _e_prev:
+        log.warning(f"set_issue_stage: read previous stage failed ({repo_key} #{issue_id}): {_e_prev}")
+
     # Phase C3：写 issue 单表（无卡片行则建档最小行）
     _sync_issue_fields(repo_key, issue_id, {
         "stage": stage, "owner_agent": owner_agent, "assignee": assignee or "",
         "a2a_seq": a2a_seq,
     }, ensure_row=True, assignee=assignee)
-    from src.config import log
     log.info(f"IssueState: repo={repo_key} issue={issue_id} stage={stage} owner={owner_agent} assignee={assignee}")
 
-    # Issue #85: stage 推进时同步 task.status（不覆盖 awaiting_input/completed/cancelled/pending_review）
+    # Issue #85: stage 推进时同步 task.status（仅终态不覆盖）
+    # Issue #1599（审核态漂移收敛）：不再把 pending_review 排除在同步之外——阶段已推进却将
+    # status 留在 pending_review 会形成幽灵审核点（展示态与 issue.status 矛盾）。
+    # 终态 completed/cancelled 保留，避免被阶段写入翻活；awaiting_input（等用户澄清）
+    # 是明确的「等人」态而非阶段漂移，仍不覆盖（修复：此前后台推进会把等答提示吞掉）。
     _STAGE_TO_TASK_STATUS = {
         "vod": "processing", "issue": "processing", "coding": "processing",
         "qa": "processing", "sre": "processing",
         "pending_review": "pending_review", "done": "completed",
     }
     _task_status = _STAGE_TO_TASK_STATUS.get(stage)
-    if _task_status:
+    _stage_changed = _prev_known and (stage or "").strip() != _prev_stage
+    if _task_status and _stage_changed:
         try:
             _issue_num = int(issue_id.lstrip("#"))
             with db_lock:
@@ -177,7 +224,7 @@ def set_issue_stage(repo_key: str, issue_id: str, stage: str, owner_agent: str,
                 _c.execute(
                     "UPDATE issue SET status=? "
                     "WHERE repo_key=? AND issue_number=? "
-                    "AND status NOT IN ('completed','cancelled','awaiting_input','pending_review')",
+                    "AND status NOT IN ('completed','cancelled','awaiting_input')",
                     (_task_status, repo_key, _issue_num))
                 db.commit()
         except Exception as _e:
@@ -491,9 +538,7 @@ def get_or_create_agent_session(repo_key: str, agent_type: str,
 def upsert_agent_session(*, repo_key: str, agent_type: str,
                          runtime_id: int = 0, skill: str = "", skill_id: int = 0,
                          repo_gitcode_token: str | None = None, status: str = "idle",
-                         enable: int | None = None, subscribe_events: str | None = None,
-                         im_app_id: str | None = None, im_app_secret: str | None = None,
-                         im_provider: str | None = None) -> str:
+                         enable: int | None = None, subscribe_events: str | None = None) -> str:
     """创建或更新 Agent 会话，保留既有主键 id。
 
     背景（2026-08 事故）：id 是 TEXT 主键 + UNIQUE(repo_key, agent_type)。旧实现每次用
@@ -501,8 +546,9 @@ def upsert_agent_session(*, repo_key: str, agent_type: str,
     导致 vod_conversations.agent_session_id 悬空（"agent_session_id not found, auto-rebind"）。
     修复：已存在 → UPDATE 保留 id；不存在 → INSERT。
 
-    enable/subscribe_events/im_*/repo_gitcode_token 传 None = 保留既有值（UPDATE 不改；INSERT 用默认）；
-    传具体值 = 覆盖（im 三字段仅显式传值才写，防 apply_scene/ensure_default 误清飞书绑定）。
+    enable/subscribe_events/repo_gitcode_token 传 None = 保留既有值（UPDATE 不改；INSERT 用默认）；
+    传具体值 = 覆盖。
+    A2 收尾：IM 凭证不再落 devops_agent_session（im_* 三列改读 grape_t_channel_installation）。
     repo_gitcode_token 同样 None=保留（R25.9 回声治理：session 行只允许存用户显式配置的
     agent 专属 token，低级别 token 永不回填；清空走 unbind 的专门 SQL 路径）。
     返回会话 id。
@@ -526,11 +572,6 @@ def upsert_agent_session(*, repo_key: str, agent_type: str,
             if subscribe_events is not None:
                 sets.append("subscribe_events=?")
                 params.append(subscribe_events)
-            for col, val in (("im_app_id", im_app_id), ("im_app_secret", im_app_secret),
-                             ("im_provider", im_provider)):
-                if val is not None:
-                    sets.append(f"{col}=?")
-                    params.append(val)
             params.append(sid)
             c.execute(f"UPDATE devops_agent_session SET {', '.join(sets)} WHERE id=?", params)
             db.commit()
@@ -539,9 +580,9 @@ def upsert_agent_session(*, repo_key: str, agent_type: str,
         _enable = enable if enable is not None else get_agent_type_enable(agent_type)
         _sub = subscribe_events if subscribe_events is not None else "[]"
         c.execute(
-            "INSERT INTO devops_agent_session (id, repo_key, agent_type, runtime_id, skill, skill_id, repo_gitcode_token, status, enable, subscribe_events, im_app_id, im_app_secret, im_provider, last_active_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+            "INSERT INTO devops_agent_session (id, repo_key, agent_type, runtime_id, skill, skill_id, repo_gitcode_token, status, enable, subscribe_events, last_active_at) VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))",
             (sid, repo_key, agent_type, runtime_id, skill, skill_id, repo_gitcode_token or "",
-             status, _enable, _sub, im_app_id or "", im_app_secret or "", im_provider or ""))
+             status, _enable, _sub))
         db.commit()
         return sid
 
@@ -663,7 +704,6 @@ def ensure_default_agent_sessions(repo_key: str):
                     runtime_id=_rid, skill=_sk, skill_id=_skill_id,
                     repo_gitcode_token=None, status="idle",
                     enable=None, subscribe_events=None,
-                    im_app_id=None, im_app_secret=None, im_provider=None,
                 )
             except Exception as e:
                 log.warning(f"Failed to create session for {_at}: {e}")

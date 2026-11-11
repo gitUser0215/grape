@@ -13,6 +13,8 @@ from src.config import log
 from src.api.time_utils import normalize_event_time
 from src.session_manager import db, db_lock
 from src.runtime import service
+from src.runtime.health import apply_runtime_state, parse_dt  # Issue #1496 统一写入口 + 心跳解析
+from src.runtime import health as _health_mod  # noqa: F401  (_STALE_SECONDS 经 _RUNTIME_STALE 下发)
 
 router = APIRouter(prefix="/api/runtime", tags=["runtime"])
 
@@ -58,6 +60,7 @@ class RuntimeInfo(BaseModel):
     version: str = ""
     healthy: bool = True
     role_tags: list[str] = []  # Issue #658：引擎显式角色声明（如 ["coding","issue"]；空=按引擎类型默认映射）
+    model: str = ""  # Issue #865：配置模型名（worker 本机配置解析上报；空=未上报/解析失败，不影响注册）
 
 
 class LogLineBody(BaseModel):
@@ -293,16 +296,35 @@ def runtime_register(body: RuntimeRegBody, request: Request, credential_id: int 
                     _role_tags_json = json.dumps([str(t).strip().lower() for t in _rt if str(t).strip()], ensure_ascii=False)
             except Exception:
                 _role_tags_json = ""
+            # Issue #865：配置模型（worker 上报本机配置解析结果；空=未上报，
+            # 不覆盖既有值——未升级 worker 重注册不会抹掉历史/兜底值，同 #658 模式）
+            _model_name = str(rt.get("model") or "").strip()[:120]
             if row:
                 rid = row[0]
                 # Issue #700：降级守卫——已 healthy 且探活新鲜的行不被 worker
                 # 瞬时 ACP 握手超时打回 0（UPDATE 的 1→0 方向过守卫）
                 # （健康值经 _register_healthy_guard，其余字段保留 #654 role_tags/凭据同步）
-                c.execute("UPDATE agent_runtimes SET version=?, healthy=?, installed=1, status='online', last_seen_at=?, cli_path=?, local_skills=?, worker_version=?"
-                          + (", role_tags=?" if _role_tags_json else "") + " WHERE id=?",
-                          (rt.get("version", ""), _register_healthy_guard(c, rid, bool(rt.get("healthy", True))),
-                           datetime.now(timezone.utc).isoformat(), rt.get("cli_path", ""), _ls_json, body.cli_version, rid)
-                          + ((_role_tags_json,) if _role_tags_json else ()))
+                # Issue #1496：status+last_seen_at 改走统一写入口 apply_runtime_state
+                # （同事务写，含遗留 health 列派生同步），消除在线态二次写窗口。
+                apply_runtime_state(c, rid, "online", datetime.now(timezone.utc).isoformat())
+                _upd_sql = ("UPDATE agent_runtimes SET version=?, healthy=?, installed=1, cli_path=?, local_skills=?, worker_version=?"
+                            + (", role_tags=?" if _role_tags_json else "")
+                            + (", model_name=?, model_source='worker_report', model_reported_at=?" if _model_name else "")
+                            + " WHERE id=?")
+                # 参数顺序 bug 修复（#865 基线缺陷，2026-11-10 真机实证）：rid 必须是
+                # 最后一个参数（对应 WHERE id=?）——旧实现把 rid 固定在元组第 6 位再
+                # 追加 role_tags/model 值，一旦带上 model 分支占位符与参数错位，
+                # sqlite binding 异常 → 该引擎行整个 UPDATE 失败（表现为「检测到
+                # 模型的引擎 worker_version 卡旧版且 model_name 恒空」；INSERT 新行
+                # 路径参数固定无误，故首台远程 Worker 首注册侥幸成功）。
+                _upd_args = [rt.get("version", ""), _register_healthy_guard(c, rid, bool(rt.get("healthy", True))),
+                             rt.get("cli_path", ""), _ls_json, body.cli_version]
+                if _role_tags_json:
+                    _upd_args.append(_role_tags_json)
+                if _model_name:
+                    _upd_args += [_model_name, datetime.now(timezone.utc).isoformat()]
+                _upd_args.append(rid)
+                c.execute(_upd_sql, _upd_args)
                 # Issue #654：凭据派生属性原地同步（纵深防御：即使 scope 切换路径
                 # 漏改，注册也会把引擎行拉回与凭据一致），变化时输出结构化事件。
                 if ((row[1] or "") != cred_scope or (row[2] or "") != owner_id
@@ -319,10 +341,11 @@ def runtime_register(body: RuntimeRegBody, request: Request, credential_id: int 
                     log.info("engine_change_event: " + json.dumps(_ev, ensure_ascii=False))
             else:
                 c.execute(
-                    "INSERT INTO agent_runtimes (credential_id, name, display_name, `binary`, version, healthy, installed, status, last_seen_at, cli_path, scope, owner_id, local_skills, repo_key, worker_version, org_id, role_tags) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO agent_runtimes (credential_id, name, display_name, `binary`, version, healthy, installed, status, last_seen_at, cli_path, scope, owner_id, local_skills, repo_key, worker_version, org_id, role_tags, model_name, model_source, model_reported_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (credential_id, name, rt.get("display_name", name), name, rt.get("version", ""),
                      1 if rt.get("healthy", True) else 0, 1, "online",
-                     datetime.now(timezone.utc).isoformat(), rt.get("cli_path", ""), cred_scope, owner_id, _ls_json, cred_repo_key, body.cli_version, cred_org_id, _role_tags_json))
+                     datetime.now(timezone.utc).isoformat(), rt.get("cli_path", ""), cred_scope, owner_id, _ls_json, cred_repo_key, body.cli_version, cred_org_id, _role_tags_json,
+                     _model_name, "worker_report" if _model_name else "", datetime.now(timezone.utc).isoformat() if _model_name else ""))
                 rid = c.lastrowid
             # 自动写入默认 "all" 标签——新引擎默认可认领任意角色任务。
             # 若已有 capabilities 行则跳过（用户手动配置过标签的不覆盖）。
@@ -393,8 +416,26 @@ def runtime_heartbeat(body: HeartbeatBody, request: Request, credential_id: int 
                       (now, client_ip, body.cpu_percent, body.memory_percent, body.disk_percent, body.tmp_percent, body.bandwidth_percent, body.bandwidth_mbps, body.load_avg, credential_id))
         if body.runtime_ids:
             ph = ",".join("?" for _ in body.runtime_ids)
-            c.execute(f"UPDATE agent_runtimes SET status='online', last_seen_at=? WHERE id IN ({ph}) AND credential_id=?",
-                      [now] + body.runtime_ids + [credential_id])
+            # Issue #1496：在线态统一写入口（status+last_seen_at 同事务，含遗留
+            # health 列派生同步）。本机直连引擎（credential_id=0）不受远端心跳
+            # 管辖（不做在线判定，active/online 视图另有口径），只同步其
+            # last_seen_at 观测时间，不翻转 status（保住 #1487 的认领侧豁免语义）。
+            # 远端引擎：仅 status='online' 的行刷新心跳；status≠online（已被
+            # reap/revoke 置 offline）不得被旧 worker 兜底路径"复活"——对齐
+            # derive_runtime_health / engine_select._health_ok 的唯一真源口径。
+            c.execute(f"SELECT id, status, credential_id FROM agent_runtimes WHERE id IN ({ph})",
+                      body.runtime_ids)
+            _stale_cut = datetime.now(timezone.utc).timestamp() - _health_mod._STALE_SECONDS
+            for _rid, _st, _cid in c.fetchall():
+                if _cid != credential_id:
+                    continue  # 归属校验：只允许刷新当前凭据名下 runtime
+                _fresh = False
+                _cur = c.execute("SELECT last_seen_at FROM agent_runtimes WHERE id=?", (_rid,)).fetchone()
+                if _cur and _cur[0]:
+                    _ts = parse_dt(_cur[0])
+                    _fresh = _ts is not None and _ts >= _stale_cut
+                if (_st or "") == "online" or _fresh:
+                    apply_runtime_state(c, _rid, "online", now)
             # worker 上报的引擎探测结果写入 DB（probe_* 列已由 db_setup.py 自动迁移添加）
             # Issue #490：按 last_probe 幂等去重——同一观测（相同 last_probe）重放只刷新状态，
             # 不递增/重置 probe_fail_count、不动 healthy，避免心跳重放导致计数虚增与 Runtime 误摘除。
@@ -556,7 +597,17 @@ def machine_health_overview(user: dict = Depends(require_no_session_token)):
 
 @router.get("/admin/machine-health/{runtime_id}", operation_id="runtime_machine_health_detail", summary="Single runtime health detail", description="Health detail for a single engine. Issue #498: includes health_abnormal/health_reason (unified verdict), failed_tasks_effective (decayed-window failures) and last_failure_at for self-heal observability.")
 def machine_health_detail(runtime_id: int, user: dict = Depends(require_no_session_token)):
-    """获取单个引擎的健康度详情。"""
+    """获取单个引擎的健康度详情。
+
+    Issue #1104（契约 AT-RNT-52）：详情语义——不存在的 runtime_id 返回 404
+    （统一错误结构），不再回退 get_health_score 现算通路返回 200 全量结构。
+    """
+    with db_lock:
+        c = db.cursor()
+        c.execute("SELECT 1 FROM agent_runtimes WHERE id=?", (runtime_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail={
+                "code": 404, "message": "runtime not found"})
     from src.runtime.health_scorer import get_health_score
     from src.runtime.instances import runtime_instance_name
     data = get_health_score(runtime_id, force_refresh=True)
@@ -730,17 +781,43 @@ def runtime_task_env(task_id: str, credential_id: int = Depends(_require_credent
 
     Workers call this before executing to get fresh credentials,
     instead of relying on the env_extra snapshot from task creation time.
+
+    Issue #990: this endpoint is idempotent for a valid snapshot token, but may
+    rotate the session token and persist it back to ``agent_tasks.env_extra``
+    when the snapshot token is expired or out of scope. The returned env and
+    the persisted snapshot are committed atomically by ``sync_task_session_token``.
     """
     from src.session_manager import db, db_lock
-    from src.runtime.service import _collect_server_env
+    from src.runtime.service import _collect_server_env, sync_task_session_token
     with db_lock:
         c = db.cursor()
-        c.execute("SELECT user_id, account FROM agent_tasks WHERE id=?", (task_id,))
+        c.execute("SELECT user_id, account, runtime_id FROM agent_tasks WHERE id=?", (task_id,))
         row = c.fetchone()
     if not row:
         return {"env": {}}
-    user_id, account = row[0] or 0, row[1] or ""
+    user_id, account, runtime_id = row[0] or 0, row[1] or "", row[2] or 0
     env = _collect_server_env(user_id, account)
+    # Issue #1858：worker 执行前重拉任务 env 时，按任务 runtime 下发三面基址，
+    # 覆盖历史任务/旧快照（此前只下发凭据，旁路路径仍可能缺 GRAPE_A2A_BASE_URL）。
+    try:
+        from src.prompt_builder import resolve_task_server_env
+        env.update(resolve_task_server_env(runtime_id))
+    except Exception as _base_e:
+        log.warning(f"runtime_task_env service base resolve failed for task={task_id}: {_base_e}")
+    # Issue #990：会话 token 与 shell 环境快照同步——valid 时复用快照 token，
+    # 失效/轮换时签发新 token 并回写 agent_tasks.env_extra，随后返回给 worker。
+    # Issue #990：只同步 GRAPE_SESSION_TOKEN，不覆盖任务快照中的其它显式 env
+    # （如 GRAPE_CLI_MODE），避免超出 Spec 范围改变 CLI 作用域语义。
+    session_token = sync_task_session_token(task_id)
+    if session_token:
+        env["GRAPE_SESSION_TOKEN"] = session_token
+    # Issue #1745：跨场景转交后，任务快照中的 GRAPE_SCENE_ID 可能仍是源场景；
+    # 执行前按 Issue 当前归属场景（issues detail.scene_id 同源）校正，PR 订阅任务保留订阅语义。
+    try:
+        from src.api.event_pipeline import reconcile_task_scene_env
+        reconcile_task_scene_env(task_id, env)
+    except Exception as _scene_e:
+        log.warning(f"runtime_task_env scene reconcile failed for task={task_id}: {_scene_e}")
     return {"env": env}
 
 
@@ -959,8 +1036,16 @@ def runtime_task_messages(task_id: str, body: MessagesBody, credential_id: int =
             log.info(f"auto-fix: task {task_id} status {task.get('status')} -> running (messages reported)")
         except Exception as e:
             log.warning(f"auto-fix: failed to update task {task_id} to running: {e}")
-    service.enqueue_async_report("messages", task_id, body.messages)
-    return {"status": "ok"}
+    # Issue #975（QA 复审 Spec #1）：批次回执带 seq 范围——只对 dict 消息预留/计数
+    # （service.report_messages 跳过非 dict，不消耗 seq，计入即假回执）；同步兜底路径
+    # 直接采用实际落库回执，异步路径返回预约范围（实际范围以服务端落库日志为准）
+    _count = sum(1 for m in (body.messages or []) if isinstance(m, dict))
+    _seq_start = service.peek_next_seq(task_id)
+    _receipt = service.enqueue_async_report("messages", task_id, body.messages, seq_start=_seq_start)
+    if isinstance(_receipt, dict) and _receipt.get("count"):
+        return {"status": "ok", **_receipt}
+    return {"status": "ok", "count": _count, "seq_start": _seq_start,
+            "seq_end": _seq_start + _count - 1 if _count > 0 else _seq_start - 1}
 
 
 @router.post("/tasks/{task_id}/usage")
@@ -1073,11 +1158,16 @@ def runtime_recover_orphans(runtime_id: int, credential_id: int = Depends(_requi
     （NULL 兜底 created_at）距 now 不足 RECOVER_GRACE_SECONDS（默认 300s，
     覆盖队列出队+引擎冷启动上界）直接 skipped，attempts 不变、不回炉。
     """
-    RECOVER_ACTIVITY_WINDOW = int(os.environ.get("RECOVER_ACTIVITY_WINDOW", "1200"))
     RECOVER_MAX_ATTEMPTS = int(os.environ.get("RECOVER_MAX_ATTEMPTS", "3"))
     RECOVER_GRACE_SECONDS = int(os.environ.get("RECOVER_GRACE_SECONDS", "300"))
+    # Issue #1495：活跃窗口单点收敛到 task_activity 具名常量（数值沿用 1200s 不变，
+    # 原 RECOVER_ACTIVITY_WINDOW 环境变量口除名——「一处定义」硬约束）；
+    # 判定改走 has_recent_activity（Python 侧解析 epoch 比较），消除 TEXT 列逐字节
+    # 比较对 created_at 写入格式的隐含依赖（表默认值空格格式行 / 无微秒 ISO 行）。
+    from src.runtime.task_activity import (RECOVER_ORPHANS_ACTIVITY_WINDOW_SECONDS,
+                                           has_recent_activity)
+    RECOVER_ACTIVITY_WINDOW = RECOVER_ORPHANS_ACTIVITY_WINDOW_SECONDS
     _now = datetime.now(timezone.utc)
-    _active_cutoff = (_now - timedelta(seconds=RECOVER_ACTIVITY_WINDOW)).isoformat()
     _grace_cutoff_dt = _now - timedelta(seconds=RECOVER_GRACE_SECONDS)
     recovered, skipped_active, force_failed, skipped_young = [], [], [], []
     with db_lock:
@@ -1106,11 +1196,11 @@ def runtime_recover_orphans(runtime_id: int, credential_id: int = Depends(_requi
                 except Exception:
                     pass
             # 活跃度检查：近期有 task_messages → 任务在跑，不是孤儿
+            # Issue #1495：改走 task_activity.has_recent_activity（按 task_id 索引
+            # 取行 + Python 解析 epoch 比较），替代 `created_at > ?` 逐字节比较；
+            # 解析失败行不计活跃（保守：宁可误回收也不留死任务）。
             try:
-                c.execute(
-                    "SELECT 1 FROM task_messages WHERE task_id=? AND created_at > ? LIMIT 1",
-                    (tid, _active_cutoff))
-                if c.fetchone():
+                if has_recent_activity(c, tid, RECOVER_ACTIVITY_WINDOW):
                     skipped_active.append(tid)
                     continue
             except Exception:
@@ -1209,6 +1299,72 @@ def get_task_status(task_id: str, user: dict = Depends(require_no_session_token)
         "created_at": task.get("created_at"),
         "started_at": task.get("started_at"),
         "completed_at": task.get("completed_at"),
+    }
+
+
+@router.get("/issues/takeover-context", operation_id="runtime_takeover_context", summary="Takeover context for an issue", description="Returns the running task's full context (prompt, env_extra, messages) for interactive takeover in dsh-web.")
+def takeover_context(repo_key: str = Query(..., description="Repository key (e.g. gitcode:owner/repo)"),
+                     issue_number: str = Query(..., description="Issue number (without #)"),
+                     user: dict = Depends(require_no_session_token)):
+    """接管上下文：按 Issue 号查正在运行的任务，返回完整字段 + 最近 200 条消息。
+
+    一次调用拿到全部续接所需数据：
+    - prompt / env_extra / skill / cwd → 重建执行环境
+    - messages（最近 200 条）→ agent 的思考和操作历史
+    - task_id → 用于后续 cancel
+    """
+    from src.session_manager import db, db_lock
+    _issue_id = f"#{issue_number.lstrip('#')}"
+    # ① 查 running/dispatched 的 task（跨所有 worker，不限 runtime_id）
+    with db_lock:
+        c = db.cursor()
+        c.execute(
+            "SELECT id, status, agent_type, skill, prompt, env_extra, cwd, runtime_id, repo_key, issue_id "
+            "FROM agent_tasks "
+            "WHERE repo_key=? AND issue_id=? AND status IN ('running','dispatched') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (repo_key, _issue_id))
+        row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail={"code": 404, "message": f"没有找到 Issue #{issue_number} 正在运行的任务"})
+    task_id, status, agent_type, skill, prompt, env_extra, cwd, runtime_id, task_repo_key, task_issue_id = row
+    # ② 查最近 200 条消息（必须取"最新"而非"最早"，否则长任务接管时看到的
+    #    是几小时前的任务开头，而不是当前进展。先按 seq DESC 取，再反转为正序阅读）
+    messages = service.list_task_messages_recent(task_id, limit=200)
+    return {
+        "task_id": task_id,
+        "status": status,
+        "agent_type": agent_type or "",
+        "skill": skill or "",
+        "prompt": prompt or "",
+        "env_extra": env_extra or "{}",
+        "cwd": cwd or "",
+        "runtime_id": runtime_id or 0,
+        "repo_key": task_repo_key or "",
+        "issue_id": task_issue_id or "",
+        "messages": messages,
+    }
+
+
+@router.get("/tasks/{task_id}/detail", operation_id="runtime_task_detail", summary="Task detail (takeover)", description="Returns full task fields for interactive takeover: prompt, env_extra, skill, cwd, etc.")
+def get_task_detail(task_id: str, user: dict = Depends(require_no_session_token)):
+    """任务详情（接管用）：返回完整字段供 dsh-web 创建交互式 session。"""
+    task = service.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"code": 404, "message": "任务不存在"})
+    return {
+        "id": task["id"],
+        "status": task["status"],
+        "agent_type": task.get("agent_type") or "",
+        "skill": task.get("skill") or "",
+        "prompt": task.get("prompt") or "",
+        "env_extra": task.get("env_extra") or "{}",
+        "cwd": task.get("cwd") or "",
+        "repo_key": task.get("repo_key") or "",
+        "issue_id": task.get("issue_id") or "",
+        "runtime_id": task.get("runtime_id") or 0,
+        "event_seq": task.get("event_seq") or 0,
+        "server_url": task.get("server_url") or "",
     }
 
 
@@ -2012,3 +2168,75 @@ def set_runtime_alias(runtime_id: int, body: AliasBody,
     return {"alias": alias}
 
 
+# ===== MR-2b（2026-11-05）：worker trace 中继（LGTM 不对 worker 开放，经主控 C 进程转发）=====
+# 设计：docs/weekly-10/worker-trace-relay-layer2-design.md
+# - worker 的 OTLP/HTTP exporter 指向 {RUNTIME_SERVER_URL}/api/runtime/traces（既有通道+Bearer）
+# - 本端点透传 body（protobuf/json/gzip 原样，零解析）→ OTLP_RELAY_TARGET/v1/traces
+# - 鉴权复用 _require_credential（与 claim 同款）；失败透传状态码，业务零影响
+OTLP_RELAY_TARGET = os.environ.get("OTLP_RELAY_TARGET", "").strip()
+
+from fastapi.responses import Response as _RelayResponse
+
+_relay_total = None
+try:
+    from prometheus_client import Counter as _PC
+    from src.observability import registry as _obs_registry
+    _relay_total = _PC("grape_trace_relay_requests_total",
+                       "Trace relay requests forwarded to LGTM",
+                       ["status"], registry=_obs_registry)
+except Exception:
+    _relay_total = None
+
+
+@router.post("/traces", operation_id="runtime_traces_relay",
+             summary="Relay worker OTLP traces to LGTM",
+             description="Transparently forwards worker OTLP/HTTP trace exports to the LGTM "
+                         "OTLP endpoint (env OTLP_RELAY_TARGET). Workers authenticate with "
+                         "their existing runtime token. Failures pass through the upstream "
+                         "status; LGTM unreachability returns 502 (worker exporters retry/drop "
+                         "asynchronously, zero business impact).")
+async def runtime_traces_relay(request: Request,
+                               credential_id: int = Depends(_require_credential)):
+    if not OTLP_RELAY_TARGET:
+        return _RelayResponse(status_code=503,
+                              content='{"detail":"trace relay disabled"}',
+                              media_type="application/json")
+    # 公开端点（虽要求 runtime token）仍需限体：OTLP 批量包通常 <512KB。
+    # 架构守护 Medium-1：先按 content-length 拒绝，避免超大包整块读入内存造成尖峰。
+    _max_body = int(os.environ.get("GRAPE_TRACE_RELAY_MAX_BODY", str(2 * 1024 * 1024)))
+    if int(request.headers.get("content-length") or 0) > _max_body:
+        return _RelayResponse(status_code=413,
+                              content='{"detail":"payload too large"}',
+                              media_type="application/json")
+    body = await request.body()
+    if len(body) > _max_body:
+        return _RelayResponse(status_code=413,
+                              content='{"detail":"payload too large"}',
+                              media_type="application/json")
+    ctype = request.headers.get("content-type", "application/x-protobuf")
+    cenc = request.headers.get("content-encoding", "")
+    fwd_headers = {"Content-Type": ctype}
+    if cenc:
+        fwd_headers["Content-Encoding"] = cenc
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as hc:
+            r = await hc.post(OTLP_RELAY_TARGET.rstrip("/") + "/v1/traces",
+                              content=body, headers=fwd_headers)
+        if _relay_total is not None:
+            try:
+                _relay_total.labels(status=str(r.status_code)).inc()
+            except Exception:
+                pass
+        return _RelayResponse(status_code=r.status_code, content=r.content,
+                              media_type=r.headers.get("content-type", "application/x-protobuf"))
+    except Exception as e:
+        if _relay_total is not None:
+            try:
+                _relay_total.labels(status="relay_unreachable").inc()
+            except Exception:
+                pass
+        log.warning(f"trace relay unreachable: {type(e).__name__}")
+        return _RelayResponse(status_code=502,
+                              content='{"detail":"lgtm unreachable"}',
+                              media_type="application/json")

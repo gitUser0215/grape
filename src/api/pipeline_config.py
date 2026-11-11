@@ -42,15 +42,24 @@ _SCENE_COLUMNS_LOCK = threading.Lock()
 
 
 def _get_scene_columns() -> set[str]:
-    """Return column names of devops_pipeline_scene (cached once per process)."""
+    """Return column names of devops_pipeline_scene (cached once per process).
+
+    Lock order fix (deadlock 2026-11-03): previously acquired _SCENE_COLUMNS_LOCK
+    first and then db_lock while holding it, which inverted against callers that
+    already hold db_lock (e.g. dashboard sync paths) -> ABBA deadlock. Now the DB
+    query runs with db_lock ONLY, and _SCENE_COLUMNS_LOCK guards just the cache
+    write, so the two locks are never held simultaneously.
+    """
     global _SCENE_COLUMNS_CACHE
     if _SCENE_COLUMNS_CACHE is not None:
         return _SCENE_COLUMNS_CACHE
-    with _SCENE_COLUMNS_LOCK:
-        if _SCENE_COLUMNS_CACHE is not None:
-            return _SCENE_COLUMNS_CACHE
-        db, lock = _db()
-        with lock:
+
+    # 1) DB query guarded by db_lock only (never nested with _SCENE_COLUMNS_LOCK).
+    cols: set[str] = set()
+    db, lock = _db()
+    acquired = lock.acquire(timeout=30)
+    try:
+        if acquired:
             c = db.cursor()
             try:
                 try:
@@ -60,8 +69,17 @@ def _get_scene_columns() -> set[str]:
                     cols = {r[1] for r in c.execute("PRAGMA table_info(devops_pipeline_scene)").fetchall()}
             except Exception:
                 cols = set()
-        _SCENE_COLUMNS_CACHE = cols
-        return cols
+        else:
+            log.warning("_get_scene_columns: db_lock acquire timed out (30s), returning empty column set")
+    finally:
+        if acquired:
+            lock.release()
+
+    # 2) Publish to cache under the columns lock (no DB / no db_lock inside).
+    with _SCENE_COLUMNS_LOCK:
+        if _SCENE_COLUMNS_CACHE is None:
+            _SCENE_COLUMNS_CACHE = cols
+        return _SCENE_COLUMNS_CACHE
 
 
 def _cache_get(scene_id: str, repo_key: str):
@@ -219,6 +237,8 @@ def _query_scenes_from_db(repo_key: str = "", limit: int = None, offset: int = 0
     _has_pr_sub = False
     _has_linked_repos = False
     _has_ca = False
+    _has_pin = False
+    _has_pinat = False
     with lock:
         c = db.cursor()
         try:
@@ -237,6 +257,8 @@ def _query_scenes_from_db(repo_key: str = "", limit: int = None, offset: int = 0
                 _has_pr_sub = "pr_subscription_enabled" in _cols
                 _has_linked_repos = "linked_repos" in _cols
                 _has_ca = "created_at" in _cols
+                _has_pin = "is_pinned" in _cols
+                _has_pinat = "pinned_at" in _cols
                 _extra = ""
                 if _has_dn: _extra += ", display_name"
                 if _has_ao: _extra += ", advanced_options"
@@ -245,11 +267,21 @@ def _query_scenes_from_db(repo_key: str = "", limit: int = None, offset: int = 0
                 if _has_st: _extra += ", scene_type"
                 if _has_pr_sub: _extra += ", pr_subscription_enabled"
                 if _has_linked_repos: _extra += ", linked_repos"
+                if _has_pin: _extra += ", is_pinned"
+                if _has_pinat: _extra += ", pinned_at"
                 if _has_ca and sort == "latest": _extra += ", created_at"
                 # 检索 WHERE：共享构建器（与 _count_scenes_from_db 单一来源）
                 _where_extra, _q_params = _scene_search_where(q, _cols)
                 _params = [repo_key] + _q_params
-                _order = "ORDER BY id" if sort != "latest" else "ORDER BY created_at DESC, id DESC"
+                if _has_pin:
+                    if _has_pinat:
+                        _order = ("ORDER BY is_pinned DESC, pinned_at DESC, created_at DESC, id DESC"
+                                  if sort == "latest" else "ORDER BY is_pinned DESC, pinned_at DESC, id")
+                    else:
+                        _order = ("ORDER BY is_pinned DESC, created_at DESC, id DESC"
+                                  if sort == "latest" else "ORDER BY is_pinned DESC, id")
+                else:
+                    _order = "ORDER BY id" if sort != "latest" else "ORDER BY created_at DESC, id DESC"
                 # LIMIT/OFFSET 走占位符（评审遗留提醒2：与同函数参数化风格一致；
                 # int() 强转保留为双保险）
                 _limit_sql = " LIMIT ? OFFSET ?" if limit is not None else ""
@@ -310,6 +342,15 @@ def _query_scenes_from_db(repo_key: str = "", limit: int = None, offset: int = 0
                 linked_repos = json.loads(r[col_offset] or "[]") if r[col_offset] else []
             except Exception:
                 linked_repos = []
+            col_offset += 1
+        is_pinned = 0
+        if _has_pin and len(r) > col_offset:
+            is_pinned = int(r[col_offset] or 0)
+            col_offset += 1
+        pinned_at = ""
+        if _has_pinat and len(r) > col_offset:
+            pinned_at = r[col_offset] or ""
+            col_offset += 1
         result.append({
             "scene_id": scene_id, "name": r[1], "description": r[2],
             "display_name": (r[5] if _has_dn and len(r) > 5 else "") or r[1],
@@ -318,6 +359,8 @@ def _query_scenes_from_db(repo_key: str = "", limit: int = None, offset: int = 0
             "icon": icon, "scene_type": scene_type,
             "pr_subscription_enabled": pr_subscription_enabled,
             "linked_repos": linked_repos,
+            "is_pinned": is_pinned,
+            "pinned_at": pinned_at,
         })
     return result
 
@@ -427,7 +470,9 @@ def get_scenes(repo_key: str = "", limit: int = None, offset: int = 0,
              "onboarding": s.get("onboarding") or "repo-onboarding",
              "scene_type": s.get("scene_type") or "standard",
              "pr_subscription_enabled": s.get("pr_subscription_enabled", 0),
-             "linked_repos": s.get("linked_repos") or []} for s in db_scenes]
+             "linked_repos": s.get("linked_repos") or [],
+             "is_pinned": int(s.get("is_pinned") or 0),
+             "pinned_at": s.get("pinned_at") or ""} for s in db_scenes]
 
 
 def get_pipeline_config(scene_id: str = "default", repo_key: str = "") -> Optional[dict]:
@@ -504,15 +549,61 @@ def get_pipeline_config(scene_id: str = "default", repo_key: str = "") -> Option
     return result
 
 
-def get_node_by_tag(scene_id: str, tag: str, repo_key: str = "", user_id: int = 0) -> Optional[dict]:
-    """Find a node by tag in a scene's pipeline."""
-    cfg = get_pipeline_config(scene_id, repo_key=repo_key)
-    if not cfg:
+def _query_user_market_scene_nodes(scene_id: str, user_id: int) -> Optional[list]:
+    """Issue #979: 查用户个人场景（scene_market scope='user'）的 nodes。
+
+    个人场景不落 devops_pipeline_scene（仅 repo/global 行），标准解析链路
+    （repo 副本 → 全局行 → 官方市场模板 → pipelines.json）查不到；命中返回
+    nodes 列表，未命中/异常返回 None（调用方继续按未解析处理）。
+    """
+    if not scene_id or not user_id:
         return None
-    for node in cfg.get("nodes", []):
-        if node.get("tag") == tag:
-            return node
+    db, lock = _db()
+    with lock:
+        c = db.cursor()
+        try:
+            c.execute(
+                "SELECT nodes_json FROM scene_market "
+                "WHERE name=? AND scope='user' AND source='user' "
+                "AND source_user_id=? AND is_active=1 LIMIT 1",
+                (scene_id, user_id))
+            row = c.fetchone()
+            if row and row[0]:
+                return json.loads(row[0])
+        except Exception as e:
+            log.warning(f"_query_user_market_scene_nodes failed: {e}")
     return None
+
+
+def get_node_by_tag(scene_id: str, tag: str, repo_key: str = "", user_id: int = 0) -> Optional[dict]:
+    """Find a node by tag in a scene's pipeline.
+
+    Issue #955：id 优先、tag 兜底——节点 id 即角色名（agent_type），
+    tag 为展示用阶段名（可为中文等任意值）；存量非标准 tag 场景按 id 匹配。
+
+    Issue #979: user_id>0 时，标准解析未命中 tag 节点（或仅命中 pipelines.json
+    default 兜底）后补查用户个人场景（scene_market scope='user'），避免个人
+    场景节点查不到而静默走名字降级（user_id 此前为死参数）。
+    """
+    from src.runtime.engine_select import node_matches_agent_role
+    cfg = get_pipeline_config(scene_id, repo_key=repo_key)
+    node = None
+    if cfg:
+        for _n in cfg.get("nodes", []):
+            if node_matches_agent_role(_n, tag):
+                node = _n
+                break
+    # 真实命中（非 pipelines.json default 兜底）→ 直接返回
+    if node and cfg and not (cfg.get("fallback") or cfg.get("fallback_source")):
+        return node
+    # 用户个人场景（scene_market scope='user'）优先于 default 兜底节点
+    if user_id and scene_id:
+        nodes = _query_user_market_scene_nodes(scene_id, user_id)
+        if nodes is not None:
+            for _n in nodes:
+                if isinstance(_n, dict) and node_matches_agent_role(_n, tag):
+                    return _n
+    return node
 
 
 def get_first_node(scene_id: str = "default", repo_key: str = "") -> Optional[dict]:
@@ -702,6 +793,34 @@ def update_custom_scene(scene_id: str, repo_key: str,
     invalidate_scene_cache(scene_id, repo_key)
 
 
+def set_scene_pinned(scene_id: str, repo_key: str, pinned: bool) -> int:
+    """设置仓库场景置顶状态（仓库共享；重复置顶不刷新 pinned_at）。
+
+    返回受影响行数。MySQL 未启用 CLIENT_FOUND_ROWS 时，匹配但值未变的 UPDATE
+    会返回 0（如重复置顶/重复取消），因此调用方必须先做存在性校验，不能把
+    rowcount==0 当作「场景不存在」。
+    """
+    db, lock = _db()
+    from datetime import datetime, timezone
+    with lock:
+        c = db.cursor()
+        if pinned:
+            now = datetime.now(timezone.utc).isoformat()
+            c.execute(
+                "UPDATE devops_pipeline_scene SET "
+                "pinned_at=CASE WHEN is_pinned=1 THEN pinned_at ELSE ? END, "
+                "is_pinned=1 WHERE scene_id=? AND repo_key=? AND is_active=1",
+                (now, scene_id, repo_key))
+        else:
+            c.execute(
+                "UPDATE devops_pipeline_scene SET is_pinned=0, pinned_at=NULL "
+                "WHERE scene_id=? AND repo_key=? AND is_active=1",
+                (scene_id, repo_key))
+        rowcount = c.rowcount
+        db.commit()
+    return int(rowcount or 0)
+
+
 def delete_custom_scene(scene_id: str, repo_key: str):
     """Hard-delete a repo-scoped custom scene. 精确匹配 scene_id + repo_key，不影响其他仓库。"""
     db, lock = _db()
@@ -836,8 +955,11 @@ def get_scene_engine_binding(scene_id: str, agent_type: str, repo_key: str = "",
     if cfg.get("fallback"):
         return {"status": "no_scene", "engine_ids": []}
     node = None
+    # Issue #955：id 优先、tag 兜底——节点 id 即角色名（agent_type），tag 为展示
+    # 阶段名；非标准 tag（如中文阶段名）的存量场景按 id 匹配恢复引擎绑定
+    from src.runtime.engine_select import node_matches_agent_role
     for n in cfg.get("nodes") or []:
-        if n.get("tag") == agent_type:
+        if node_matches_agent_role(n, agent_type):
             node = n
             break
     if node is None:

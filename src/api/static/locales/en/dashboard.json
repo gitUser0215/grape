@@ -54,6 +54,7 @@
   "save_engine": "Save Engine",
   "engine_config_saved": "Engine config saved",
   "save_failed": "Save failed: {{msg}}",
+  "skill_scope_mismatch": "Skill scope mismatch. Please fix the highlighted nodes.",
   "refresh_failed": "Refresh failed: {{msg}}",
   "please_input_scene_name": "Please enter a scene name",
   "scene_saved": "Scene saved",
@@ -171,5 +172,9 @@
   "sre_aksk_required": "Please enter Access Key and Secret Key",
   "sre_add_device_title": "Add device",
   "scene_detail": "Scene Detail",
-  "scene_engine_ctx_missing": "Scene context not ready, open scene edit first"
+  "scene_engine_ctx_missing": "Scene context not ready, open scene edit first",
+  "scene_pin": "Pin",
+  "scene_pinned": "Pinned",
+  "scene_unpin": "Unpin",
+  "scene_pin_failed": "Pin failed: {{msg}}"
 }

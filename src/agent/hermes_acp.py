@@ -77,7 +77,7 @@ PREMATURE_END_MARKER = "[PREMATURE_END_TURN]"
 
 
 def _text_incomplete_timeout_for() -> float:
-    """text 静默且无收尾记录时的等待上限（默认 300s，与 tool 静默窗口对齐）。
+    """text 静默且无收尾记录时的等待上限（默认 300s，独立于 tool 静默窗口）。
 
     语义：模型输出 text 后 60s 无事件只说明「暂时没输出」，不代表干完了——可能正在
     生成一个大 tool call（补丁/大文件），这期间 hermes 不会发任何 ACP 事件。
@@ -95,18 +95,18 @@ def _text_incomplete_timeout_for() -> float:
 
 
 def _silent_timeout_for(env: dict | None = None) -> float:
-    """hermes ACP 工具静默超时（HERMES_SILENT_TIMEOUT env 可调，默认 300s）。
+    """hermes ACP 工具静默超时（HERMES_SILENT_TIMEOUT env 可调，默认 600s）。
 
     与 hwcloud_acp RUNTIME_TOOL_SILENT_TIMEOUT 同模式——任务级 env 注入
     （src/runtime/agent.py _execute_task 按 agent_type setdefault，coding/qa=1200s）。
-    env 优先（任务级），os.environ 次之（手动调参/测试），默认 300s。
+    env 优先（任务级），os.environ 次之（手动调参/测试），默认 600s。
     """
     _silent_src = (env or {}).get("HERMES_SILENT_TIMEOUT") or \
-        os.environ.get("HERMES_SILENT_TIMEOUT", "300")
+        os.environ.get("HERMES_SILENT_TIMEOUT", "600")
     try:
         return max(float(_silent_src), 0.0)
     except Exception:
-        return 300.0
+        return 600.0
 
 
 def _init_timeout_for(env: dict | None = None) -> float:
@@ -561,7 +561,7 @@ class HermesACPBackend:
             # ── 4. 内循环：从队列消费事件 + 等 prompt 完成 ──
             _last_activity = time.time()
             _global_start = time.time()
-            # 工具静默超时（HERMES_SILENT_TIMEOUT env 可调，默认 300s）：
+            # 工具静默超时（HERMES_SILENT_TIMEOUT env 可调，默认 600s）：
             # 与 hwcloud_acp RUNTIME_TOOL_SILENT_TIMEOUT 同模式——任务级 env 注入
             # （src/runtime/agent.py _execute_task 按 agent_type setdefault，coding/qa=1200s）。
             _SILENT_TIMEOUT = _silent_timeout_for(env)
@@ -607,7 +607,7 @@ class HermesACPBackend:
                 # text 后静默：不再直接判完成——静默只决定「还要不要等」，
                 #   「算不算完成」必须由证据决定（见 _has_completion_record / PromptResponse）。
                 #   ① 累计输出里已有收尾记录（actions + conclusion）→ 判完成（response 丢失）；
-                #   ② 无证据 → 继续等到 _TEXT_INCOMPLETE_TIMEOUT（默认 300s，与 tool 静默对齐），
+                #   ② 无证据 → 继续等到 _TEXT_INCOMPLETE_TIMEOUT（默认 300s，独立于 tool 静默窗口），
                 #      到点按「疑似提前结束」收尾（exit 0 + 标记，不冒充干净完成）。
                 #   非 text 事件（tool/reasoning）后的静默维持原语义：超时终止（exit -1）。
                 elapsed_silent = time.time() - _last_activity
@@ -979,10 +979,20 @@ class _ACPSimpleClient:
             tool_call_id = update.get("toolCallId", "")
             name = update.get("name", "")
             title = update.get("title", "")
-            raw_input = update.get("rawInput") or update.get("input") or update.get("parameters") or {}
+            # issue #976：按 ACP 语义读取工具入参（rawInput → input → parameters →
+            # content 文本/diff 块），hermes 0.9-0.20 的 acp_adapter 对 write_file/patch
+            # 等 polished tools 只发 content diff 块不发 rawInput，落库恒为空即此因。
+            raw_input = _extract_tool_call_input(update)
             tool_name = _tool_name_from_title(title) or name
             if tool_name:
-                self.on_message("tool_use", {"tool": tool_name, "input": raw_input})
+                self.on_message("tool_use", {"tool": tool_name, "input": raw_input,
+                                             "tool_call_id": tool_call_id})
+            else:
+                # issue #976：name/title 皆解析不到时不静默丢弃，产出占位 tool_use 事件，
+                # 消费方（任务日志 /api/task-logs/{id}/messages）可感知缺口。
+                self.on_message("tool_use", {"tool": "unknown", "input": raw_input,
+                                             "title": title or "",
+                                             "tool_call_id": tool_call_id})
         elif update_type_norm == "tool_call_update":
             status = update.get("status", "")
             title = update.get("title", update.get("name", ""))
@@ -1017,6 +1027,86 @@ _UPDATE_TYPE_MAP = {
 def _normalize_update_type(t: str) -> str:
     key = t.lower().replace("_", "").replace("-", "")
     return _UPDATE_TYPE_MAP.get(key, "")
+
+_TOOL_INPUT_MAX_BYTES = int(os.environ.get("HERMES_TOOL_INPUT_MAX_BYTES") or 262144)
+
+
+def _extract_tool_call_input(update: dict) -> dict:
+    """issue #976：按 ACP 语义提取 tool_call 入参。
+
+    优先级：rawInput → input → parameters → content 文本/diff 块。
+    hermes acp_adapter 对 write_file/patch 等工具（_POLISHED_TOOLS）不携带
+    rawInput，但会把完整 diff（path/oldText/newText）放进 content 块，这里
+    统一还原为 {path, content}（write）/ {path, old, new}（patch）。
+    超限裁剪走 _clip_tool_input（带 truncated/original_bytes/sha256 前缀）。
+    """
+    for key in ("rawInput", "input", "parameters"):
+        val = update.get(key)
+        if isinstance(val, dict) and val:
+            return _clip_tool_input(val)
+        if isinstance(val, str) and val.strip():
+            try:
+                parsed = json.loads(val)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed:
+                return _clip_tool_input(parsed)
+    return _clip_tool_input(_input_from_content_blocks(update.get("content")))
+
+
+def _input_from_content_blocks(content) -> dict:
+    """从 ACP tool_call 的 content 块（diff / text）还原入参。"""
+    if not isinstance(content, list):
+        return {}
+    edits: list[dict] = []
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type", "")
+        if btype == "diff":
+            edit = {"path": str(block.get("path") or "")}
+            if block.get("oldText") is not None:
+                edit["old"] = block.get("oldText")
+            edit["new"] = block.get("newText") or ""
+            edits.append(edit)
+        elif btype == "text" and block.get("text"):
+            texts.append(str(block["text"]))
+    if len(edits) == 1:
+        edit = edits[0]
+        if "old" in edit:
+            return {"path": edit["path"], "old": edit["old"], "new": edit["new"]}
+        return {"path": edit["path"], "content": edit["new"]}
+    if len(edits) > 1:
+        return {"edits": edits}
+    if texts:
+        return {"text": "\n".join(texts)}
+    return {}
+
+
+def _clip_tool_input(inp: dict) -> dict:
+    """issue #976 裁剪契约：超限入参不静默截断，带可校验元数据。
+
+    输出 {truncated: true, original_bytes: <原始字节数>, sha256_prefix: <sha256 前
+    16 hex>, preview: <前 2KB>}。上限 HERMES_TOOL_INPUT_MAX_BYTES（默认 256KB，
+    Issue 验收的 57KB content 在保真区间内全量透传）。
+    """
+    import hashlib as _hashlib
+    try:
+        payload = json.dumps(inp, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = str(inp)
+    raw = payload.encode("utf-8", errors="replace")
+    if len(raw) <= _TOOL_INPUT_MAX_BYTES:
+        return inp
+    digest = _hashlib.sha256(raw).hexdigest()[:16]
+    return {
+        "truncated": True,
+        "original_bytes": len(raw),
+        "sha256_prefix": digest,
+        "preview": payload[:2048],
+    }
+
 
 def _tool_name_from_title(title: str) -> str:
     if not title:

@@ -32,6 +32,11 @@ MANIFEST = [
     "src/config.py",
     "src/repo_key.py",
     "src/prompt_builder.py",
+    # 架构守护 F1（2026-11-10）：prompt_builder 顶层 import src.service_diagnostics
+    # （#1858 三面基址的候选地址诊断），漏列会让 worker 包内 prompt_builder 导入即
+    # ModuleNotFoundError —— executor 的两处 try/except 静默降级、scheduler 的
+    # resolve_task_server_env 直接抛错。纯 stdlib 单文件，随包下发无副作用。
+    "src/service_diagnostics.py",
     "src/session_manager.py",
     "src/mysql_compat.py",
     "src/token_service.py",
@@ -47,11 +52,24 @@ MANIFEST = [
     # 服务端 read 兼容（历史存档回退）保留在服务端代码库，不进 worker 包。
     "src/api/session_store.py",
     "src/api/knowledge.py",
+    # Issue #752: worktree_guard（src/runtime/ 整目录入包）在 fallback 扫描路径里
+    # lazily import merge_gate.scan_text；漏列会让 unmerged/旧 git 路径静默失效
+    # （守卫 fail-open 成空结果），故 merge_gate 必须随包下发。
+    "src/api/merge_gate.py",
     "src/agent/",
     "src/runtime/",
+    # 架构守护 BLOCKED-1（2026-11-09）：worker 侧 task/engine span 与 trace relay
+    # 依赖 src.observability.otel；漏列会让 worker 上所有埋点静默失效
+    # （executor/agent 的 import 在 try/except 内，不会有任何告警）。
+    # 只带包入口 + otel 客户端，不带 metrics/rollup 等服务端专属模块（依赖 prometheus/DB）。
+    "src/observability/__init__.py",
+    "src/observability/otel.py",
     # grape CLI 已拆为独立项目 grape-cli（gitcode.com/grape-dev/grape-cli），
     # 由 install-worker.sh 以 pip git 方式安装（2026-09-08 起不再随包内置）
     "requirements-worker.txt",
+    # Issue #666 (M4): 随包下发 codegraph 离线安装脚本（降级/离线环境的预装入口；
+    # 在线首选 npm install -g @colbymchenry/codegraph，见 install-worker.sh 5.9 步）
+    "scripts/install-codegraph.sh",
 ]
 
 _build_lock = threading.Lock()
@@ -104,12 +122,24 @@ def _git_retry(args: list[str], retries: int = 3, base_delay: float = 1.0) -> No
 def _ensure_grape_cli_wheel(whl_dir: str) -> str:
     """把 grape-cli 构建成 wheel 放入 wheels/（离线随包安装）。
 
-    - wheels/ 已含 `grape-*.whl` → 跳过；
-    - 否则懒拉 grape-cli 源码（浅克隆到 CACHE_DIR），`pip wheel` 产出到 wheels/；
+    - 每次构建前先清除 wheels/ 中的旧 `grape-*.whl`（#896）：wheel 文件名含版本号，
+      缓存过旧 wheel 后 `pip wheel` 重建同名报错、`pip install` 对同版本不重新
+      解压——陈旧 wheel 永不自愈（曾致升级包内 CLI 缺 GRAPE_AUTH_FILE 读文件
+      逻辑，dsh 令牌穿透静默失效）。先清后建，保证 wheels 里永远是当前
+      grape-cli main 快照；
+    - 随后懒拉 grape-cli 源码（浅克隆到 CACHE_DIR，已有则 ff-only 更新），
+      `pip wheel` 强制产出到 wheels/；
     - 失败仅告警：安装侧回退在线（现状兜底，不影响包构建）。
     """
-    if any(f.startswith("grape-") and f.endswith(".whl") for f in os.listdir(whl_dir)):
-        return whl_dir
+    for _old in os.listdir(whl_dir):
+        if _old.startswith("grape-") and _old.endswith(".whl"):
+            try:
+                os.remove(os.path.join(whl_dir, _old))
+                log.info(f"worker_package: removed stale grape wheel {_old} (rebuild from current main)")
+            except Exception as e:
+                log.warning(f"worker_package: failed to remove stale grape wheel {_old}: {e}")
+    # 清空后不再做「已有 wheel 即跳过」的短路：wheels/ 里若仍残留 grape-*.whl（如清理失败），
+    # 也不能当缓存命中——否则又退回到陈旧 wheel 永不自愈的老问题。
     src = os.path.join(CACHE_DIR, "grape-cli-src")
     try:
         if not os.path.isdir(os.path.join(src, ".git")):

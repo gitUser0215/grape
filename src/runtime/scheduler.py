@@ -29,8 +29,16 @@ _RUNNING_TASKS: set[int] = set()  # 内存互斥锁：正在执行的 task_id �
 
 # Issue #537：pending_self_report 超时（worker 未自报）→ timeout_failed 兜底阈值；
 # zombie 判死离线宽限（停双主/重启 master 的短暂离线不误判 failed）。
-PENDING_SELF_REPORT_TIMEOUT_SECONDS = int(os.environ.get("PENDING_SELF_REPORT_TIMEOUT_SECONDS", "1800"))
+# Issue #1071：默认 1800→5400——部署类任务（打包+生产部署全流程约 40-50 分钟）按设计
+# 在执行中重启主控，重启瞬间 pending_since 重置，1800s 窗口实际退化为「重启后 30 分钟」，
+# 剩余工序经常超 30 分钟被误判 timeout_failed；配合判死前活跃流豁免（见 sweep）双保险。
+PENDING_SELF_REPORT_TIMEOUT_SECONDS = int(os.environ.get("PENDING_SELF_REPORT_TIMEOUT_SECONDS", "5400"))
 ZOMBIE_OFFLINE_GRACE_SECONDS = int(os.environ.get("ZOMBIE_OFFLINE_GRACE_SECONDS", "300"))
+# Issue #1546：派发协程尚未 enqueue_task 落库时回收器已开跑，年轻执行（<120s）本轮跳过回收，
+# 避免「回收器抢在真任务落库前判定终态」的竞态；时区解析规则同 _get_exec_agent_task。
+# 窗口来源：Issue #1546 中派发链路（pick_engine → enqueue_task → 回写 execution）的落库时延，
+# 120s 为留足余量的默认值；不同部署的派发链耗时差异用 env 覆盖，与相邻两个宽限常量口径一致。
+ZOMBIE_YOUNG_GRACE_SECONDS = int(os.environ.get("ZOMBIE_YOUNG_GRACE_SECONDS", "120"))
 
 # agent_type 固定为 'issue'，不再由用户选择
 _FIXED_AGENT_TYPE = "issue"
@@ -108,6 +116,52 @@ def _heal_findings_marker(text: str) -> str:
     return text
 
 
+# ====== Issue #697：dedup 判定级别枚举 + 门禁判定（代码级强制，单一事实源） ======
+# prompt_builder / routes/autopilot.py 均从这里取常量与判定函数，禁止各自复制规则文本。
+
+DEDUP_LEVEL_EXACT = "exact_duplicate"
+DEDUP_LEVEL_SUSPECTED = "suspected_duplicate"
+DEDUP_LEVEL_NOT = "not_duplicate"
+DEDUP_LEVELS = (DEDUP_LEVEL_EXACT, DEDUP_LEVEL_SUSPECTED, DEDUP_LEVEL_NOT)
+
+# 写入公开 Issue 描述 / 确认人字段的限长（防 LLM 长文注入公开面）
+DEDUP_NOTE_MAX_CHARS = 200
+DEDUP_CONFIRMED_BY_MAX_CHARS = 64
+
+# 注：判重规则的 prompt 文本已按运维决定移除（不再改自动化任务的 prompt）；
+# 这里只保留代码侧门禁所需的级别枚举与判定函数。
+
+
+def normalize_dedup_level(raw) -> str:
+    """判定级别归一（fail-closed）。
+
+    合法枚举原样返回；空串=LLM 未分类（保持既有放行行为）；
+    非法/拼错的非空级别一律降级为 suspected_duplicate，杜绝漏发/拼错绕过 409 门禁。
+    """
+    level = str(raw or "").strip().lower()
+    if not level:
+        return ""
+    return level if level in DEDUP_LEVELS else DEDUP_LEVEL_SUSPECTED
+
+
+def sanitize_dedup_note(raw) -> str:
+    """dedup_note 压平换行 + 限长（写入公开 Issue 描述前调用）。"""
+    return " ".join(str(raw or "").split())[:DEDUP_NOTE_MAX_CHARS]
+
+
+def sanitize_dedup_confirmed_by(raw) -> str:
+    """dedup_confirmed_by 压平 + 限长（确认人身份字段，非自由文本）。"""
+    return " ".join(str(raw or "").split())[:DEDUP_CONFIRMED_BY_MAX_CHARS]
+
+
+def dedup_auto_merge_allowed(dedup_level, dedup_confirmed: bool = False) -> bool:
+    """并入挂靠门禁：exact 允许；未分类（空）保持既有行为允许；疑似/未知需 owner 确认。"""
+    level = normalize_dedup_level(dedup_level)
+    if level in ("", DEDUP_LEVEL_NOT, DEDUP_LEVEL_EXACT):
+        return True
+    return bool(dedup_confirmed)
+
+
 def parse_findings(agent_output: str) -> dict:
     """从 agent 产出中解析问题列表。
 
@@ -160,6 +214,10 @@ def parse_findings(agent_output: str) -> dict:
             f.setdefault("severity", "medium")
             f.setdefault("suggested_assignee", "coding")
             f.setdefault("suggested_skill", "implementation")
+            # Issue #697：判定级别与差异说明透传（exact_duplicate/suspected_duplicate/not_duplicate）；
+            # 级别在解析层即归一 fail-closed（漏发/拼错的非空级别按疑似重复处理，杜绝绕过 409 门禁）
+            f["dedup_level"] = normalize_dedup_level(f.get("dedup_level"))
+            f["dedup_note"] = sanitize_dedup_note(f.get("dedup_note"))
             valid.append(f)
         return {
             "result": data.get("result", ""),
@@ -293,13 +351,23 @@ def _execute_autopilot_agent(repo_key: str, task: dict, exec_id: int):
     #    glob 搜到 /home/{user} 副本自救，不可依赖。
     evt = {"repo_key": repo_key, "issue_id": "", "payload": {}}
     if _is_direct:
-        prompt = _materialize_direct_workdir(ws, repo_key, agent_type, skill_name, evt, "", prompt)
+        prompt = _materialize_direct_workdir(ws, repo_key, agent_type, skill_name, evt, "",
+                                             prompt, engine_name=inst_name or backend or "")
 
     # 6. 环境变量（定时任务不需要场景/issue相关变量）
     agent_display_name = get_agent_display_name(agent_type)
+    from src.prompt_builder import resolve_task_server_env
+    # Issue #1660：REPO_OWNER/REPO_NAME 由 REPO_FULL_NAME 派生（缺失回退 repo_key）。
+    from src.repo_key import derive_repo_identity
+    _full_name, _repo_owner, _repo_name = derive_repo_identity(repository, repo_key)
     env_extra = {
-        "REPO_FULL_NAME": repository,
+        "REPO_FULL_NAME": _full_name or repository,
+        "REPO_OWNER": _repo_owner,
+        "REPO_NAME": _repo_name,
         "ACCOUNT": repository,
+        # Issue #1577：与事件/chat 同源注入两项服务基址，远端 autopilot worker
+        # 的业务命令免 --base-url 可用（direct 模式注入本机回环同样正确）。
+        **resolve_task_server_env(engine_id),
     }
     # 注入 custom_fields（自定义环境变量）和 work_branch
     _task_custom_fields = task.get("custom_fields") or ""
@@ -319,12 +387,23 @@ def _execute_autopilot_agent(repo_key: str, task: dict, exec_id: int):
     if _task_work_branch:
         env_extra["GRAPE_WORK_BRANCH"] = _task_work_branch
 
+    # Issue #1811：定时调度与 event_pipeline 同源注入 bot 身份，单点覆盖 DIRECT/REMOTE。
+    # 函数内延迟 import，避免 scheduler ↔ event_pipeline 模块级循环依赖。
+    from src.api.event_pipeline import _inject_bot_agent_env
+    _inject_bot_agent_env(env_extra, repo_key, agent_type)
+    if not env_extra.get("BOT_USERNAME"):
+        log.warning(
+            f"Autopilot exec {exec_id}: BOT_USERNAME unresolved for repo={repository}; "
+            "skill author filtering will degrade"
+        )
+
     # 7. 分流执行
     if _is_direct:
         # DIRECT 模式：本机执行
         _execute_autopilot_direct(repo_key, task, exec_id, agent_type, skill_name,
                                   engine_id, backend, inst_name, ws, prompt,
-                                  repo_token, agent_display_name, env_extra, repository)
+                                  repo_token, agent_display_name, env_extra, repository,
+                                  evt)
     else:
         # REMOTE / 广播模式：入队让远端 worker 认领
         _execute_autopilot_remote(repo_key, task, exec_id, agent_type, skill_name,
@@ -334,7 +413,8 @@ def _execute_autopilot_agent(repo_key: str, task: dict, exec_id: int):
 
 def _execute_autopilot_direct(repo_key, task, exec_id, agent_type, skill_name,
                               engine_id, backend, inst_name, ws, prompt,
-                              repo_token, agent_display_name, env_extra, repository):
+                              repo_token, agent_display_name, env_extra, repository,
+                              evt=None):
     """DIRECT 模式：本机 stream_devops_agent 执行。"""
     from src.api.event_pipeline import _create_direct_task
 
@@ -350,6 +430,36 @@ def _execute_autopilot_direct(repo_key, task, exec_id, agent_type, skill_name,
         return
 
     log.info(f"Autopilot exec {exec_id}: starting direct agent={agent_type} engine={inst_name}")
+
+    # Issue #887（QA 修复）：direct 端执行前技能一致性硬校验——复用 _materialize_direct_workdir
+    # 物化后写入 evt 的判定结果（SKILL_CONSISTENCY_KEY），与 event_pipeline._execute_agent_inner
+    # 口径一致（物化后校验，残留缓存+绑定未物化才拒绝），不再在物化前另起一套 verify
+    # （旧实现与物化时序/口径不一致，存在误拒）；拒绝消息经 skill_mismatch_error 单一实现。
+    try:
+        from src.runtime.skill_materialize import (SKILL_CONSISTENCY_KEY,
+                                                   skill_mismatch_error)
+        from src.runtime.task_log_stream import build_skill_source_message
+        _sv = (evt or {}).get(SKILL_CONSISTENCY_KEY) or {}
+        _sk_mat = (evt or {}).get("_skill_materialize") or {}
+        if not _sv:
+            # 判定缺失（物化异常等）→ 显式降级放行 + 告警，不静默当作通过
+            log.warning(f"Autopilot exec {exec_id}: skill consistency verdict missing "
+                        f"(materialize degraded); degraded pass")
+        else:
+            _src_line = build_skill_source_message(
+                _sv.get("bound", ""), _sv.get("actual", ""), _sv.get("source", ""),
+                ok=_sv.get("ok", True), reason=_sv.get("reason", ""),
+                source_info=_sk_mat.get("source") or None,
+                drift=_sk_mat.get("drift") or None)["data"]["text"]
+            log.info(f"Autopilot exec {exec_id}: skill source {_src_line}")
+            if _sv.get("ok") is False:
+                _sv_err = skill_mismatch_error(_sv)
+                log.error(f"Autopilot exec {exec_id}: skill consistency refused: {_sv_err}")
+                _finalize_autopilot_task(task_id, exec_id, 1, _sv_err)
+                _update_execution_result(exec_id, "failed", error=_sv_err)
+                return
+    except Exception as _sc_e:
+        log.warning(f"Autopilot exec {exec_id}: skill consistency verify failed: {_sc_e}")
 
     exit_code = -1
     final_text = ""
@@ -505,6 +615,18 @@ def _execute_autopilot_remote(repo_key, task, exec_id, agent_type, skill_name,
             log.warning(f"Autopilot exec {exec_id}: enqueue_task failed")
             _update_execution_result(exec_id, "failed", error="入队失败")
             return
+
+        # Issue #1546：执行记录直接持有 agent_tasks.id，反查不再依赖 event_seq 撞号。
+        # 回写失败只告警，不影响派发主流程（历史空值行走受约束兜底）。
+        try:
+            with db_lock:
+                _c = db.cursor()
+                _c.execute(
+                    "UPDATE autopilot_executions SET agent_task_id=? WHERE id=?",
+                    (str(task_id), exec_id))
+                db.commit()
+        except Exception as _at_e:
+            log.warning(f"Autopilot exec {exec_id}: persist agent_task_id failed: {_at_e}")
 
         log.info(f"Autopilot exec {exec_id}: enqueued task_id={task_id}, waiting for worker...")
 
@@ -752,14 +874,14 @@ def _notify_subscribers(task_id: int, exec_id: int, status: str,
                                result_summary, findings_result, _web_url)
         # 触达链：本人 bot + open_id（复用 issues_center 既有函数，不回落他人 bot）
         from src.api.issues_center import _get_feishu_open_id_by_user_id, _resolve_user_chat_bot
-        from src.api import main as api_main
-        bm = getattr(api_main, "bot_manager", None)
+        from src.im.engine_wiring import feishu_api
         _loop = asyncio.get_event_loop()
         for user_id, _, _ in rows:
             try:
                 open_id = _get_feishu_open_id_by_user_id(user_id) or ""
-                ctx = _resolve_user_chat_bot(bm, user_id) if bm else None
-                api = bm.api if bm else None
+                ctx = _resolve_user_chat_bot(None, user_id)
+                # 旧 IM 下线 A2 M2：api 不再来自 BotManager，按本人 bot 的 app_id 取共享客户端
+                api = feishu_api(ctx.app_id) if ctx is not None else None
                 _loop.create_task(_run_autopilot_notify(ctx, api, user_id, open_id,
                                                         card, task_id, exec_id))
             except Exception as e:
@@ -903,11 +1025,85 @@ def _update_task_run_info(task_id: int, next_run: str):
         db.commit()
 
 
+def _parse_iso_aware(value):
+    """解析 ISO 时间串为 aware datetime（无时区按 UTC 补齐），失败返回 None。"""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace(" ", "T"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+_AGENT_TASK_SELECT = "id, status, result_text, exit_code, skill, env_extra, runtime_id"
+
+
+def _agent_task_view(row):
+    """将 agent_tasks 行（`_AGENT_TASK_SELECT` 列序）映射为 evidence 校验用 dict。"""
+    return {
+        "status": row[1] or "",
+        "result_text": row[2] or "",
+        "skill": row[4] or "",
+        "env_extra": row[5] or "",
+        "runtime_id": row[6] or 0,
+    }
+
+
+def _get_exec_agent_task(c, exec_id, agent_task_id="", started_at="", created_at=""):
+    """按执行记录解析对应 agent_tasks 行（Issue #1546）。
+
+    入参为执行记录的显式字段（调用方按列名取值后传入，避免行内魔数下标契约）：
+    `exec_id`（= events 序列旁路关联键）、`agent_task_id`、`started_at`、`created_at`。
+
+    - `agent_task_id` 非空：按任务主键 `id` 直查（唯一权威关联）；
+    - 为空（历史行）：受约束兜底 `event_seq=? AND event_type='autopilot_event'
+      AND created_at >= exec.started_at`（started_at 空则用 created_at，aware
+      比较；started_at/created_at 为空或解析失败均视为不匹配）；
+    - 两路皆无 → 返回 None（调用方跳过，禁止退回裸 event_seq）。
+
+    返回列序：id, status, result_text, exit_code, skill, env_extra, runtime_id。
+    """
+    _atid = str(agent_task_id or "").strip()
+    if _atid:
+        try:
+            return c.execute(
+                f"SELECT {_AGENT_TASK_SELECT} FROM agent_tasks WHERE id=? LIMIT 1",
+                (_atid,)).fetchone()
+        except Exception as e:
+            log.warning(f"Autopilot: lookup agent_task {_atid} failed: {e}")
+            return None
+
+    if started_at:
+        _since = _parse_iso_aware(started_at)
+    else:
+        _since = _parse_iso_aware(created_at)
+    if _since is None:
+        return None
+    try:
+        _rows = c.execute(
+            f"SELECT {_AGENT_TASK_SELECT}, created_at FROM agent_tasks "
+            "WHERE event_seq=? AND event_type='autopilot_event' "
+            "ORDER BY created_at DESC LIMIT 5",
+            (exec_id,)).fetchall()
+    except Exception as e:
+        log.warning(f"Autopilot: legacy agent_task fallback failed for exec {exec_id}: {e}")
+        return None
+    for _r in _rows:
+        _seen = _parse_iso_aware(_r[7])
+        if _seen is not None and _seen >= _since:
+            return _r
+    return None
+
+
 async def _poll_dispatched_completion(exec_id: int, timeout: int = 3600,
                                      poll_interval: float = 10.0) -> str:
     """轮询 dispatched 状态的 exec 等待 worker 完成执行。
 
-    通过查 agent_tasks（event_seq=exec_id）的状态推断 autopilot_executions 终态：
+    通过 agent_task_id 直连优先、历史空值按 event_type+started_at 兜底解析任务，
+    据其状态推断 autopilot_executions 终态：
     - agent_tasks status=completed/success → exec success（部署类任务先过 evidence 校验）
     - agent_tasks status=failed → exec failed
     - agent_tasks status=timeout_failed → exec failed（带超时说明，不等自身 3600s）
@@ -922,24 +1118,22 @@ async def _poll_dispatched_completion(exec_id: int, timeout: int = 3600,
         try:
             with db_lock:
                 c = db.cursor()
-                # 查 agent_tasks 按 event_seq=exec_id（含 skill/env_extra/runtime_id 供 evidence 校验）
-                row = c.execute(
-                    "SELECT status, result_text, exit_code, skill, env_extra, runtime_id "
-                    "FROM agent_tasks WHERE event_seq=? ORDER BY created_at DESC LIMIT 1",
-                    (exec_id,)
-                ).fetchone()
+                _erow = c.execute(
+                    "SELECT agent_task_id, started_at, created_at "
+                    "FROM autopilot_executions WHERE id=?",
+                    (exec_id,)).fetchone()
+                if _erow is None:
+                    row = None
+                else:
+                    _atid, _started, _created = _erow
+                    # Issue #1546：优先按 agent_task_id 直连，历史行受约束兜底；无命中跳过
+                    row = _get_exec_agent_task(c, exec_id, _atid, _started, _created)
             if not row:
                 continue
-            _at_status = row[0] or ""
-            _result_text = row[1] or ""
-            _exit_code = row[2]
-            _at_task = {
-                "status": _at_status,
-                "result_text": _result_text,
-                "skill": row[3] or "",
-                "env_extra": row[4] or "",
-                "runtime_id": row[5] or 0,
-            }
+            _at_status = row[1] or ""
+            _result_text = row[2] or ""
+            _exit_code = row[3]
+            _at_task = _agent_task_view(row)
 
             if _at_status in ("completed", "success"):
                 # 部署类任务收口前证据校验（Issue #537 P1-1 纵深防御）
@@ -1092,19 +1286,58 @@ def _offline_duration_seconds(last_seen_at: str):
         return None
 
 
+# Issue #1071：活跃流豁免窗口——pending 任务 task_messages 最新写入距 now < 600s 视为
+# 「执行中」（worker 还在产出执行流），跳过本轮判死。600s 与调度扫描周期（60s）量级
+# 匹配，避免无限豁免；真沉默任务最多延迟一轮（60s 扫描 + 600s 静默窗）被回收。
+_PENDING_STREAM_ACTIVE_WINDOW_SECONDS = 600
+
+
+def _pending_self_report_stream_active(cursor, task_id: str) -> bool:
+    """活跃流豁免判据（Issue #1071）：task_messages 最新一条写入距 now < 600s → True。
+
+    返回 False（回退原判死逻辑，Spec：数据缺失不豁免，宁可误回收不留死任务）：
+    - 该任务在 task_messages 无任何记录（执行流从未产出，无法证明在跑）；
+    - created_at 缺失/无法解析（parse_dt 失败）；
+    - 查询异常（表缺失等）。
+    """
+    try:
+        row = cursor.execute(
+            "SELECT created_at FROM task_messages WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,)).fetchone()
+        if not row or not (row[0] or "").strip():
+            return False
+        from src.runtime.health import parse_dt
+        _ts = parse_dt(row[0])
+        if _ts is None:
+            return False
+        _age = datetime.now(timezone.utc).timestamp() - float(_ts)
+        return _age < _PENDING_STREAM_ACTIVE_WINDOW_SECONDS
+    except Exception as _e:
+        log.warning(f"pending stream activity check failed for task {task_id}: {_e}")
+        return False
+
+
 def _sweep_pending_self_report_timeouts() -> int:
     """pending_self_report 超时兜底（Issue #537 P0-1）：worker 未在阈值内自报 → timeout_failed。
 
     主控停机时 REMOTE 任务被置 pending_self_report；正常路径是 worker 继续执行并
     complete_task/fail_task 自报。若 worker 失联/永远不自报，超过
-    PENDING_SELF_REPORT_TIMEOUT_SECONDS（默认 30min）→ 判 timeout_failed
-    （带说明的终态，区别于 plain failed），并同步 events=failed + autopilot_executions=failed。
+    PENDING_SELF_REPORT_TIMEOUT_SECONDS（默认 90min，Issue #1071 放宽）→ 判
+    timeout_failed（带说明的终态，区别于 plain failed），并同步 events=failed +
+    autopilot_executions=failed。
+
+    Issue #1071 活跃流豁免：部署类长任务（打包+生产部署约 40-50 分钟）按设计在执行中
+    重启主控，重启瞬间 pending_since 重置；判死前先查 task_messages 最新一条写入时间，
+    距 now < 600s 说明 worker 仍在执行（执行流持续产出），跳过本轮判死、下轮再评估；
+    无消息/解析失败回退原判死逻辑（数据缺失不豁免）。
     """
     from src.runtime.service import update_task_status
     from src.api.event_store import update_event_complete
     _cutoff_ts = datetime.now(timezone.utc).timestamp() - PENDING_SELF_REPORT_TIMEOUT_SECONDS
     _now = datetime.now(timezone.utc).isoformat()
-    _reason = (f"worker 在 {PENDING_SELF_REPORT_TIMEOUT_SECONDS}s 内未自报完成/失败"
+    _reason = (f"[PENDING_SELF_REPORT_TIMEOUT] worker 在 {PENDING_SELF_REPORT_TIMEOUT_SECONDS}s 内未自报完成/失败"
+               f"且执行流静默超 {_PENDING_STREAM_ACTIVE_WINDOW_SECONDS}s"
                f"（pending_self_report 超时），判 timeout_failed")
     marked = 0
     try:
@@ -1128,6 +1361,10 @@ def _sweep_pending_self_report_timeouts() -> int:
                 except Exception:
                     _ts = None
                 if _ts and float(_ts) <= _cutoff_ts:
+                    # 活跃流豁免（Issue #1071）：执行流 <600s 内仍在写入 → 任务在跑，
+                    # 跳过判死等下轮（同一事务内查询，不加额外锁、每候选一条主键查询开销小）。
+                    if _pending_self_report_stream_active(c, _r[0]):
+                        continue
                     _pending_rows.append(_r)
             rows = _pending_rows
         for tid, evt_seq, _rt_id, _ps in rows:
@@ -1170,33 +1407,37 @@ def _reap_zombie_executions() -> None:
         with db_lock:
             c = db.cursor()
             c.execute(
-                "SELECT id FROM autopilot_executions "
+                "SELECT id, agent_task_id, started_at, created_at "
+                "FROM autopilot_executions "
                 "WHERE status IN ('running', 'dispatched') "
                 "ORDER BY id DESC LIMIT 20"
             )
             stuck = c.fetchall()
         for row in stuck:
-            _exec_id = row[0]
+            _exec_id, _exec_atid, _exec_started, _exec_created = row
+            # Issue #1546 D1：年轻度保护——派发协程尚未 enqueue 落库时回收器已开跑，
+            # started_at/created_at 距今 < 120s 的执行本轮跳过，避免误判历史同号行。
+            # 时区解析规则同 C1：started_at 空则用 created_at，为空或解析失败均跳过。
+            if _exec_started:
+                _ref_ts = _parse_iso_aware(_exec_started)
+            else:
+                _ref_ts = _parse_iso_aware(_exec_created)
+            if _ref_ts is None:
+                continue
+            _age = datetime.now(timezone.utc).timestamp() - _ref_ts.timestamp()
+            if _age < ZOMBIE_YOUNG_GRACE_SECONDS:
+                continue
             with db_lock:
                 c2 = db.cursor()
-                c2.execute(
-                    "SELECT id, status, result_text, exit_code, skill, env_extra, runtime_id "
-                    "FROM agent_tasks WHERE event_seq=? ORDER BY created_at DESC LIMIT 1",
-                    (_exec_id,)
-                )
-                at_row = c2.fetchone()
+                # Issue #1546：agent_task_id 直连优先，历史空值受约束兜底；无命中跳过
+                at_row = _get_exec_agent_task(
+                    c2, _exec_id, _exec_atid, _exec_started, _exec_created)
             if not at_row:
                 continue
             _at_id = at_row[0]
             _at_status = at_row[1] or ""
             _result_text = at_row[2] or ""
-            _at_task = {
-                "status": _at_status,
-                "result_text": _result_text,
-                "skill": at_row[4] or "",
-                "env_extra": at_row[5] or "",
-                "runtime_id": at_row[6] or 0,
-            }
+            _at_task = _agent_task_view(at_row)
             if _at_status in ("completed", "success"):
                 # 部署类任务收口前证据校验（Issue #537 P1-1）
                 # QA R1 三表终态一致性取舍：同 finalize——evidence 判失败仅 exec 侧 failed，
@@ -1247,8 +1488,8 @@ def _reap_zombie_executions() -> None:
                         c3.execute(
                             "SELECT t.runtime_id, ar.status, ar.last_seen_at FROM agent_tasks t "
                             "LEFT JOIN agent_runtimes ar ON ar.id = t.runtime_id "
-                            "WHERE t.event_seq=? ORDER BY t.created_at DESC LIMIT 1",
-                            (_exec_id,)
+                            "WHERE t.id=? LIMIT 1",
+                            (_at_id,)
                         )
                         _rt_row = c3.fetchone()
                     _rt_id = (_rt_row[0] or 0) if _rt_row else 0

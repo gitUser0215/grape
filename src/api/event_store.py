@@ -4,6 +4,8 @@ from datetime import datetime
 from src.session_manager import db, db_lock
 from src.config import log
 from src.api.time_utils import normalize_event_time
+from src.api.event_payload_view import payload_view_from_json
+from src.api.a2a_context import a2a_event_context_key
 
 # ====== Per-repo 锁（从旧 event_processor 迁移）======
 # 2026-08-16 事故修复：由 threading.Lock 改为 asyncio.Lock。
@@ -35,6 +37,17 @@ def _extract_issue_id_from_text(text: str) -> str:
     return ""
 
 
+def _extract_issue_id_from_link(text: str) -> str:
+    """仅从 Issue/PR 链接中提取编号（Issue #1312：裸 #N 不作为归属来源）。"""
+    if not text:
+        return ""
+    import re
+    m = re.search(r'/(?:issues|pulls|merge_requests)/(\d+)', text)
+    if m and m.group(1) != "0":
+        return f"#{m.group(1)}"
+    return ""
+
+
 def _extract_entity_type_from_text(text: str) -> str:
     """从文本中提取实体类型（issue vs pull_request）。
 
@@ -53,16 +66,67 @@ def _extract_entity_type_from_text(text: str) -> str:
     return ""
 
 
+def _insert_event_row(c, repo_key: str, event_type: str, title: str, issue_id: str,
+                      agent_type: str, source: str, actor: str, summary: str,
+                      payload: dict, status: str, result: str, scene_id: str,
+                      entity_type: str, idempotency_key: str,
+                      completed_at: str) -> int:
+    """在调用方已持 db_lock/事务内 INSERT 一条事件，返回 seq（失败返回 0）。
+
+    不 commit：由调用方统一提交，便于排队幂等「查重 + 插入」在同一事务内原子完成
+    （Issue #1667 审查修复②）。
+    """
+    from src.user.org_db import get_org_id_by_repo_key
+    _org_id = get_org_id_by_repo_key(repo_key)
+    _payload_json = json.dumps(payload or {})
+    if idempotency_key:
+        c.execute(
+            "INSERT INTO events (repo_key, issue_id, event_type, source, agent_type, title, actor, summary, payload, status, result, scene_id, entity_type, org_id, idempotency_key, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (repo_key, issue_id, event_type, source, agent_type, title, actor, summary,
+             _payload_json, status, result, scene_id, entity_type, _org_id,
+             idempotency_key, completed_at))
+    else:
+        c.execute(
+            "INSERT INTO events (repo_key, issue_id, event_type, source, agent_type, title, actor, summary, payload, status, result, scene_id, entity_type, org_id, completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (repo_key, issue_id, event_type, source, agent_type, title, actor, summary,
+             _payload_json, status, result, scene_id, entity_type, _org_id,
+             completed_at))
+    _seq = c.lastrowid
+    # 验证行确实写入（防止 WAL 并发写入冲突时 lastrowid 返回旧值）
+    c.execute("SELECT seq FROM events WHERE seq=?", (_seq,))
+    if not c.fetchone():
+        log.warning(f"Event store FAILED: INSERT returned lastrowid={_seq} but row not found "
+                    f"(WAL conflict?), repo={repo_key}, type={event_type}")
+        return 0
+    return _seq
+
+
+def _existing_seq_for_idempotency(repo_key: str, idempotency_key: str) -> int:
+    """幂等键撞唯一索引 → 返回已存在事件 seq 的负值；否则 0。"""
+    if not idempotency_key:
+        return 0
+    _existing = find_event_by_idempotency_key(repo_key, idempotency_key)
+    if _existing:
+        return -int(_existing["seq"])
+    return 0
+
+
 def append_event(repo_key: str, event_type: str, title: str = "",
                  issue_id: str = "", agent_type: str = "", source: str = "gitcode",
                  actor: str = "", summary: str = "",
                  payload: dict = None, status: str = "completed",
                  result: str = "", scene_id: str = "",
-                 entity_type: str = "", idempotency_key: str = "") -> int:
+                 entity_type: str = "", idempotency_key: str = "",
+                 completed_at: str = "") -> int:
     """写入事件到 events 表，返回 seq。result 为 Agent 答复结论（纯文本）。
 
-    issue_id 保证非空：传入为空时按 payload → result → title/summary 顺序兜底解析，
-    仍无法解析则用 #0 表示"无关联"。
+    Issue #1497：终态 status（completed/failed/cancelled/timeout）INSERT 时
+    同事务写 completed_at（终态⇔completed_at 非空不变量）——本函数是 a2a 派发、
+    跨流水线交接、订阅、admin 审计、技能解析失败等直写终态入口的统一收口点；
+    调用方显式传入 completed_at 时优先使用。非终态 status 不写。
+
+    issue_id：传入为空时仅信任结构化来源（payload 的 issue_number / issue 对象 /
+    链接），裸 #N 不再解析；无法解析时写空串表示"无关联"（Issue #1312）。
     scene_id: PR 订阅等场景级事件持久化场景ID，空字符串表示无关联场景。
     entity_type: 实体类型（"issue" / "pull_request"），区分编号相同的 issue 与 PR。
     idempotency_key: A2A 幂等键（Issue #544 L2）。非空时写入列并受
@@ -82,39 +146,29 @@ def append_event(repo_key: str, event_type: str, title: str = "",
                         if num:
                             break
             if num:
-                issue_id = f"#{num}"
+                _num = str(num).lstrip("#")
+                if _num.isdigit() and _num != "0":
+                    issue_id = f"#{_num}"
         if not issue_id:
-            issue_id = _extract_issue_id_from_text(result) or _extract_issue_id_from_text(summary) \
-                or _extract_issue_id_from_text(title)
-        if not issue_id:
-            issue_id = "#0"
+            issue_id = _extract_issue_id_from_link(result) or _extract_issue_id_from_link(summary) \
+                or _extract_issue_id_from_link(title)
     _seq = 0
+    # Issue #1497：终态 INSERT 同事务写 completed_at（已有非空值由调用方显式传入保留）
+    if status in ("completed", "failed", "cancelled", "timeout") and not completed_at:
+        from datetime import datetime, timezone as _tz
+        completed_at = datetime.now(_tz.utc).isoformat()
     with db_lock:
         c = db.cursor()
         try:
-            # 解析 org_id（从 managed_repos.org_id 获取）
-            from src.user.org_db import get_org_id_by_repo_key
-            _org_id = get_org_id_by_repo_key(repo_key)
-            if idempotency_key:
-                c.execute(
-                    "INSERT INTO events (repo_key, issue_id, event_type, source, agent_type, title, actor, summary, payload, status, result, scene_id, entity_type, org_id, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (repo_key, issue_id, event_type, source, agent_type, title, actor, summary,
-                     json.dumps(payload or {}), status, result, scene_id, entity_type, _org_id,
-                     idempotency_key))
-            else:
-                c.execute(
-                    "INSERT INTO events (repo_key, issue_id, event_type, source, agent_type, title, actor, summary, payload, status, result, scene_id, entity_type, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (repo_key, issue_id, event_type, source, agent_type, title, actor, summary,
-                     json.dumps(payload or {}), status, result, scene_id, entity_type, _org_id)
-                )
-            db.commit()
-            _seq = c.lastrowid
-            # 验证行确实写入（防止 WAL 并发写入冲突时 lastrowid 返回旧值）
-            c.execute("SELECT seq FROM events WHERE seq=?", (_seq,))
-            if not c.fetchone():
+            _seq = _insert_event_row(
+                c, repo_key, event_type, title, issue_id, agent_type, source, actor,
+                summary, payload, status, result, scene_id, entity_type,
+                idempotency_key, completed_at)
+            if not _seq:
                 db.rollback()
-                log.warning(f"Event store FAILED: INSERT returned lastrowid={_seq} but row not found (WAL conflict?), repo={repo_key}, type={event_type}")
-                return 0
+                _seq = _existing_seq_for_idempotency(repo_key, idempotency_key)
+                return _seq
+            db.commit()
             payload_keys = list((payload or {}).keys())
             log.info(f"Event stored: seq={_seq}, repo={repo_key}, type={event_type}, "
                      f"agent={agent_type}, issue={issue_id}, actor={actor}, source={source}, "
@@ -122,10 +176,9 @@ def append_event(repo_key: str, event_type: str, title: str = "",
         except Exception as e:
             log.warning(f"Failed to store event: {e}")
             # Issue #544 L2：幂等键撞唯一索引 → 返回已存在事件 seq 的负值（调用方转"返回已有事件"）
-            if idempotency_key:
-                _existing = find_event_by_idempotency_key(repo_key, idempotency_key)
-                if _existing:
-                    return -int(_existing["seq"])
+            _existing = _existing_seq_for_idempotency(repo_key, idempotency_key)
+            if _existing:
+                return _existing
             return 0
     # WAL checkpoint 在 db_lock 释放后执行（避免阻塞其他需要 db_lock 的操作）
     try:
@@ -133,6 +186,68 @@ def append_event(repo_key: str, event_type: str, title: str = "",
     except Exception:
         pass
     return _seq
+
+
+def append_queued_a2a_event(repo_key: str, *, issue_id: str, agent_type: str,
+                            title: str, summary: str, payload: dict,
+                            context_key: str, idempotency_key: str = "") -> int:
+    """原子写入排队 A2A 事件（Issue #1667 审查修复②：queue 幂等原子化）。
+
+    在**同一 db_lock/事务**内完成「同上下文已排队 → 复用」与「插入新排队行」：
+    - 返回 >0：新插入的排队事件 seq；
+    - 返回 <0：同上下文已有排队事件，值为 `-existing_seq`（调用方复用，不重复派发）；
+    - 返回 0：写入失败。
+
+    并发同一 context_key 的 queue 请求只会插入一行（先前查后写在锁内串行化）；
+    显式 idempotency_key 撞唯一索引时同样回落为已存在 seq 的负值。
+    """
+    _payload = dict(payload or {})
+    _qmeta = _payload.get("_a2a_queue")
+    if not isinstance(_qmeta, dict):
+        _qmeta = {}
+    _qmeta["context_key"] = context_key
+    _payload["_a2a_queue"] = _qmeta
+    with db_lock:
+        c = db.cursor()
+        try:
+            c.execute(
+                "SELECT seq, idempotency_key, payload FROM events "
+                "WHERE repo_key=? AND issue_id=? AND agent_type=? "
+                "AND event_type='a2a_event' AND status='queued' ORDER BY seq ASC",
+                (repo_key, issue_id, agent_type))
+            for _seq, _ik, _raw in (c.fetchall() or []):
+                _row_key = ""
+                try:
+                    _p = json.loads(_raw or "{}")
+                    if isinstance(_p, dict):
+                        _qm = _p.get("_a2a_queue") or {}
+                        if isinstance(_qm, dict):
+                            _row_key = str(_qm.get("context_key") or "")
+                except Exception:
+                    _row_key = ""
+                if not _row_key:
+                    _row_key = a2a_event_context_key(_ik or "", _raw or "")
+                if not context_key or _row_key == context_key:
+                    return -int(_seq)
+            _seq = _insert_event_row(
+                c, repo_key, "a2a_event", title, issue_id, agent_type, "a2a", "",
+                summary, _payload, "queued", "", "", "", idempotency_key, "")
+            if not _seq:
+                db.rollback()
+                return 0
+            db.commit()
+            return _seq
+        except Exception as e:
+            log.warning(f"append_queued_a2a_event failed repo={repo_key} issue={issue_id} "
+                        f"agent={agent_type}: {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _existing = _existing_seq_for_idempotency(repo_key, idempotency_key)
+            if _existing:
+                return _existing
+            return 0
 
 
 def find_event_by_idempotency_key(repo_key: str, idempotency_key: str) -> dict | None:
@@ -157,6 +272,27 @@ def find_event_by_idempotency_key(repo_key: str, idempotency_key: str) -> dict |
     except Exception as e:
         log.warning(f"find_event_by_idempotency_key failed: {e}")
         return None
+
+
+def find_recent_same_event(repo_key: str, issue_id: str, agent_type: str,
+                           event_type: str, window_seconds: int = 60) -> int:
+    """同 (repo,issue,agent,event_type) 在近窗内是否已有事件，返回其 seq（无则 0）。
+
+    时间口径：cutoff 由 db_now_str 按存储层口径生成（MySQL=CST 墙钟 / SQLite=UTC），
+    与 events.created_at 的写入口径一致。**不可**改用 _utc_now_str()——那是 Python
+    UTC 字符串，与 MySQL 下的 created_at 差 8 小时，会把窗口放大成 8 小时（Issue #1487
+    衍生：PR 评论 note_hook_pr 被静默判重吞掉）。
+    """
+    from src.api.time_utils import db_now_str
+    cutoff = db_now_str(-window_seconds)
+    with db_lock:
+        c = db.cursor()
+        c.execute(
+            "SELECT seq FROM events WHERE repo_key=? AND issue_id=? AND agent_type=? "
+            "AND event_type=? AND created_at >= ? ORDER BY seq DESC LIMIT 1",
+            (repo_key, issue_id or "#0", agent_type, event_type, cutoff))
+        row = c.fetchone()
+        return row[0] if row else 0
 
 
 def claim_event_guard(repo_key: str, issue_id: str, agent_type: str) -> bool:
@@ -527,6 +663,12 @@ def evaluate_agent_output(agent_type: str, tool_uses: list, final_text: str) -> 
     return has_output, result
 
 
+
+def _status_label(status: str) -> str:
+    """终态状态的人类可读标签（#1503 后到原因合并用）。"""
+    return {"completed": "已完成", "failed": "失败", "cancelled": "已终止"}.get(status, status)
+
+
 def update_event_status(seq: int, status: str, result: str = "", exit_code: int = None):
     """更新事件状态（含终态保护）。
 
@@ -551,10 +693,28 @@ def update_event_status(seq: int, status: str, result: str = "", exit_code: int 
         try:
             c = db.cursor()
             if status in _TERMINAL:
-                c.execute("SELECT status FROM events WHERE seq=?", (seq,))
+                c.execute("SELECT status, result FROM events WHERE seq=?", (seq,))
                 row = c.fetchone()
                 if row and row[0] in _TERMINAL and row[0] != status:
-                    log.info(f"Event {seq} already {row[0]}, skip {status} overwrite (terminal state protection)")
+                    if (result or "").strip():
+                        # Issue #1503：后到写入携带非空原因 → 合并进 result，状态保持不变。
+                        # 终态保护只挡「状态翻转」，不吞诊断信息：原因（如 worker 后到的
+                        # 失败报告）对排障有价值，静默丢弃会造成 result 空的不可解释终态。
+                        _cur = (row[1] or "").strip()
+                        _late = result.strip()
+                        if _late in _cur:
+                            _merged = _cur
+                        elif _cur:
+                            _merged = f"{_cur} | 后到补充({_status_label(status)}): {_late}"
+                        else:
+                            _merged = _late
+                        c.execute("UPDATE events SET result=? WHERE seq=?", (_merged[:200], seq))
+                        db.commit()
+                        log.info(f"Event {seq}: late {status} write with reason merged into "
+                                 f"result, status stays {row[0]} (#1503)")
+                    else:
+                        log.info(f"Event {seq} already {row[0]}, skip {status} overwrite "
+                                 f"(terminal state protection, bare flip)")
                     return
             if status == "failed":
                 c.execute("SELECT result, exit_code, completed_at FROM events WHERE seq=?", (seq,))
@@ -571,14 +731,51 @@ def update_event_status(seq: int, status: str, result: str = "", exit_code: int 
                 if _need_fallback:
                     log.warning(f"Event {seq}: bare failed update, backfilled diagnostic result (#476)")
             else:
-                c.execute("UPDATE events SET status=? WHERE seq=?", (status, seq))
+                if status in _TERMINAL:
+                    # Issue #1105：completed/cancelled 终态同样强制落 completed_at
+                    #（终态⇔completed_at 非空不变量）；已有非空值不覆盖。
+                    _now = datetime.now(_tz.utc).isoformat()
+                    c.execute(
+                        "UPDATE events SET status=?, "
+                        "completed_at=CASE WHEN completed_at IS NULL OR completed_at='' "
+                        "THEN ? ELSE completed_at END WHERE seq=?",
+                        (status, _now, seq))
+                else:
+                    c.execute("UPDATE events SET status=? WHERE seq=?", (status, seq))
             db.commit()
         except Exception as e:
             log.warning(f"Failed to update event {seq}: {e}")
     if status in _TERMINAL:
         # 释放活跃守卫（独立 db_lock；避免在临界区内嵌套获取非可重入锁）
         _release_guard_by_seq(seq)
+        # Issue #1667：终态 → 自动派发排队在其后的 A2A handoff
+        _drain_a2a_queue_after_terminal(seq)
 
+
+
+
+def _drain_a2a_queue_after_terminal(seq: int) -> None:
+    """Issue #1667：事件终态后触发 A2A 排队派发（失败不影响终态写入）。
+
+    审查修复④（阻塞/递归）：
+    - 有运行中的事件循环（FastAPI 异步路径）→ 卸载到线程池执行，终态写入不再
+      被网络派发阻塞，也不在异步上下文里新建事件循环；
+    - 无事件循环（脚本/同步 worker/测试）→ 同步执行，保持确定性；
+    - 派发本身带重入锁（event_pipeline._A2A_DRAIN_LOCK），由 _fail_event 触发的
+      二次终态钩子在 drain 期间直接短路，不形成递归链。
+    """
+    try:
+        from src.api.event_pipeline import drain_queued_a2a
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _loop = None
+        if _loop is not None:
+            _loop.create_task(asyncio.to_thread(drain_queued_a2a, seq))
+        else:
+            drain_queued_a2a(seq)
+    except Exception as e:
+        log.warning(f"A2A queue drain hook failed seq={seq}: {e}")
 
 def _release_guard_by_seq(seq: int) -> None:
     """事件终态 → 按事件的 (repo,issue,agent) 释放对应守卫（仅当前 seq）。"""
@@ -649,7 +846,8 @@ def update_event_config(seq: int, runtime: str, skill: str, started_at: str):
 def update_event_complete(seq: int, status: str, exit_code: int = None,
                           duration: float = None, agent_logs: list = None,
                           completed_at: str = "", result: str = "",
-                          structured_output: dict = None):
+                          structured_output: dict = None,
+                          revive_from_timeout_failed: bool = False):
     """写入执行结果（status, exit_code, duration, agent_logs, completed_at, result, structured_output）
 
     幂等保护：终态事件不允许被其他终态覆盖。
@@ -658,7 +856,20 @@ def update_event_complete(seq: int, status: str, exit_code: int = None,
       调 complete 把 failed 覆盖成 completed，2026-08-24 seq#2488 实例）。
     - structured_output：完整结构化产出（actions/conclusion/artifacts/next_step/issue_summary），
       weekly-05 起落库替代 event.json seg.output；None 不覆盖旧值。
+    - revive_from_timeout_failed（Issue #1071）：**唯一的窄口子**——只允许「兜底超时判死的
+      failed 事件」被迟到结果改判 completed。调用方必须是 service.revive_timeout_task，
+      它已校验：任务态 timeout_failed、未复活过、在复活窗口内、errors 带兜底超时来源标记、
+      结果含完整结构化产出。不传此参数时终态保护与 seq#2488 之后的行为完全一致。
+    Issue #1105：completed_at 为空时兜底赋当前时间（终态⇔completed_at 非空不变量）；
+    调用方显式传入非空值仍优先使用。
+    Issue #1503：终态写入 result 为空时兜底赋「状态默认摘要（含 exit_code）」
+    （终态⇔result 非空不变量，消除 seq=55067 类 exit_code=1 但 result 空的静默失败）；
+    调用方显式传入非空 result 仍优先使用。与 completed_at 兜底同层收口。
     """
+    if not completed_at:
+        from datetime import datetime, timezone as _tz
+        completed_at = datetime.now(_tz.utc).isoformat()
+    _is_terminal = status in ("completed", "failed", "cancelled")
     with db_lock:
         try:
             c = db.cursor()
@@ -666,8 +877,20 @@ def update_event_complete(seq: int, status: str, exit_code: int = None,
             c.execute("SELECT status FROM events WHERE seq=?", (seq,))
             row = c.fetchone()
             if row and row[0] in ("completed", "failed", "cancelled") and status in ("completed", "failed", "cancelled"):
-                log.info(f"Event {seq} already {row[0]}, skip {status} overwrite (result={result[:60]})")
-                return
+                _revive_ok = (revive_from_timeout_failed
+                              and row[0] == "failed" and status == "completed")
+                if not _revive_ok:
+                    log.info(f"Event {seq} already {row[0]}, skip {status} overwrite (result={result[:60]})")
+                    return
+                log.info(f"Event {seq}: failed -> completed via timeout revive "
+                         f"(Issue #1071 narrow gate)")
+            # Issue #1503：终态写入 result 兜底（与 completed_at 兜底同层）。
+            # 放在终态保护之后：被 skip 的覆盖写入不产生兜底。
+            if _is_terminal and not (result or "").strip():
+                _ec = exit_code if exit_code is not None else "?"
+                result = f"{status} (exit_code={_ec})"
+                log.info(f"Event {seq}: terminal write with empty result, "
+                         f"backfilled default summary (#1503)")
             _structured = json.dumps(structured_output, ensure_ascii=False) if structured_output is not None else None
             cols = [r[1] for r in c.execute(f"PRAGMA table_info(events)").fetchall()]
             if "structured_output" in cols and _structured is not None:
@@ -688,6 +911,8 @@ def update_event_complete(seq: int, status: str, exit_code: int = None,
     # 事件进入终态 → 释放活跃守卫（允许同 (issue,agent) 开启新事件）
     if status in ("completed", "failed", "cancelled"):
         _release_guard_by_seq(seq)
+        # Issue #1667：前序 A2A 事件终态 → 自动派发排队在其后的 handoff（仅一次）
+        _drain_a2a_queue_after_terminal(seq)
     # WAL checkpoint 在 db_lock 释放后执行
     try:
         db.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -696,8 +921,13 @@ def update_event_complete(seq: int, status: str, exit_code: int = None,
 
 
 def get_events(repo_key: str, agent_type: str = "", issue_id: str = "",
-               status: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
-    """查询事件列表，支持按 agent/issue/status 过滤"""
+               status: str = "", limit: int = 50, offset: int = 0,
+               include_payload: bool = False) -> list[dict]:
+    """查询事件列表，支持按 agent/issue/status 过滤。
+
+    include_payload=True 时附带解析后的 payload（仅取 files/guard_impact 视图，
+    避免大 payload 全量返回；Issue #996 展示需求）。
+    """
     clauses = ["repo_key=?"]
     params = [repo_key]
 
@@ -715,19 +945,26 @@ def get_events(repo_key: str, agent_type: str = "", issue_id: str = "",
     with db_lock:
         c = db.cursor()
         try:
+            _payload_col = ", payload" if include_payload else ""
             c.execute(
-                f"SELECT seq, issue_id, event_type, agent_type, title, actor, summary, status, created_at, runtime, skill, exit_code, duration, started_at, completed_at FROM events WHERE {where} ORDER BY seq DESC LIMIT ? OFFSET ?",
+                f"SELECT seq, issue_id, event_type, agent_type, title, actor, summary, status, created_at, runtime, skill, exit_code, duration, started_at, completed_at{_payload_col} FROM events WHERE {where} ORDER BY seq DESC LIMIT ? OFFSET ?",
                 params + [limit, offset]
             )
-            return [
-                {"seq": r[0], "issue_id": r[1], "event_type": r[2], "agent_type": r[3] or "",
-                 "title": r[4] or r[2], "actor": r[5] or "", "summary": r[6] or r[4] or r[2],
-                 "status": r[7], "created_at": normalize_event_time(r[8]),
-                 "runtime": r[9] or "", "skill": r[10] or "",
-                 "exit_code": r[11], "duration": r[12],
-                 "started_at": normalize_event_time(r[13] or ""), "completed_at": normalize_event_time(r[14] or "")}
-                for r in c.fetchall()
-            ]
+            out = []
+            for r in c.fetchall():
+                item = {
+                    "seq": r[0], "issue_id": r[1], "event_type": r[2], "agent_type": r[3] or "",
+                    "title": r[4] or r[2], "actor": r[5] or "", "summary": r[6] or r[4] or r[2],
+                    "status": r[7], "created_at": normalize_event_time(r[8]),
+                    "runtime": r[9] or "", "skill": r[10] or "",
+                    "exit_code": r[11], "duration": r[12],
+                    "started_at": normalize_event_time(r[13] or ""),
+                    "completed_at": normalize_event_time(r[14] or ""),
+                }
+                if include_payload:
+                    item.update(payload_view_from_json(r[15], seq=r[0]))
+                out.append(item)
+            return out
         except Exception:
             return []
 

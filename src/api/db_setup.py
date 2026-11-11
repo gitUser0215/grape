@@ -60,9 +60,6 @@ CREATE TABLE IF NOT EXISTS devops_agent_session (
     backend_session_id TEXT DEFAULT '',
     repo_gitcode_token TEXT DEFAULT '',
     status TEXT DEFAULT 'idle',
-    im_provider TEXT DEFAULT '',
-    im_app_id TEXT DEFAULT '',
-    im_app_secret TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
     last_active_at TEXT DEFAULT (datetime('now')),
     UNIQUE(repo_key, agent_type)
@@ -160,6 +157,21 @@ CREATE TABLE IF NOT EXISTS grape_t_patrol_findings (
 )
 """
 
+# Issue #752: 合入流程冲突标记扫描门禁日志（docs/issue-752/plan.md §3）。
+# 只增新表不改既有表；主键 UUID（新表硬性要求）；每次门禁决策一行
+# （phase: pre_merge/post_merge；decision: blocked/warned/alarmed/passed/error）。
+_MERGE_GATE_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS grape_t_merge_gate_log (
+    id         TEXT PRIMARY KEY,
+    repo_key   TEXT NOT NULL DEFAULT '',
+    pr_number  INTEGER NOT NULL DEFAULT 0,
+    phase      TEXT NOT NULL DEFAULT '',
+    decision   TEXT NOT NULL DEFAULT '',
+    hits_json  TEXT DEFAULT '',
+    created_at TEXT DEFAULT ''
+)
+"""
+
 # ===== Issue #536: 迁移版本表（迁移只跑一遍的地基）=====
 # 设计：docs/weekly-09/migration-versioning-and-ddl-safety-design.md §D1
 # - version 主键（'202611010001' 日期+序号）；kind: safe/backfill/cleanup/legacy-stamp；
@@ -223,6 +235,9 @@ CREATE TABLE IF NOT EXISTS agent_runtimes (
     host_name VARCHAR(191) DEFAULT '',   -- 本机直连引擎归属主控机 hostname（credential_id=0 时区分多台主控）
     detached_from_scenes_at TEXT DEFAULT '',  -- 引擎离线超阈值被系统从场景绑定移除的时间（空=未处理，引擎绑定真实性同步方案）
     role_tags TEXT DEFAULT '',           -- Issue #658：引擎角色标签（JSON 数组，如 ["coding","issue"]；空=按引擎类型默认映射兜底）
+    model_name TEXT DEFAULT '',          -- Issue #865：配置模型（worker 注册上报的本机配置模型名）
+    model_source TEXT DEFAULT '',        -- Issue #865：配置模型来源（worker_report=worker 上报 / local_config=服务端本机解析）
+    model_reported_at TEXT DEFAULT '',   -- Issue #865：配置模型上报时间（UTC ISO）
     updated_at TEXT DEFAULT (datetime('now')),
     UNIQUE (credential_id, name, scope, owner_id, host_name)
 )
@@ -254,22 +269,6 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     task_id TEXT,
     generate_status INTEGER DEFAULT NULL,
     deleted INTEGER DEFAULT 0
-)
-"""
-
-_GLOBAL_IM_BOT_CONFIG_DDL = """
-CREATE TABLE IF NOT EXISTS global_im_bot_config (
-    bot_app_id        VARCHAR(191) PRIMARY KEY,
-    bot_type          VARCHAR(32) NOT NULL,
-    im_provider       VARCHAR(32) DEFAULT 'feishu',
-    is_active         INTEGER DEFAULT 1,
-    bot_name          VARCHAR(128) DEFAULT '',
-    lease_token       VARCHAR(128) DEFAULT NULL,
-    lease_expires_at  DATETIME DEFAULT NULL,
-    lease_owner       VARCHAR(128) DEFAULT NULL,
-    lease_acquired_at DATETIME DEFAULT NULL,
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 """
 
@@ -336,6 +335,8 @@ CREATE TABLE IF NOT EXISTS issue (
     status           TEXT DEFAULT 'active',
     completed_reason TEXT DEFAULT '',
     created_by       TEXT DEFAULT '',
+    vcs_exists       INTEGER NOT NULL DEFAULT 1,
+    vcs_checked_at   TEXT DEFAULT NULL,
     created_at       TEXT DEFAULT (datetime('now')),
     completed_at     TEXT DEFAULT NULL
 )
@@ -624,6 +625,8 @@ CREATE TABLE IF NOT EXISTS devops_pipeline_scene (
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now')),
     scene_type  TEXT DEFAULT 'standard',  -- standard | pr_subscription
+    is_pinned   INTEGER NOT NULL DEFAULT 0,
+    pinned_at   VARCHAR(32) DEFAULT NULL,
     UNIQUE (scene_id, repo_key)
 )
 """
@@ -821,8 +824,23 @@ CREATE TABLE IF NOT EXISTS distributed_locks (
     locked_at   BIGINT       NOT NULL DEFAULT 0, -- 获取锁时间戳（秒）
     expires_at  BIGINT       NOT NULL DEFAULT 0, -- 锁过期时间戳（秒），过期可被抢占
     update_at   BIGINT       NOT NULL DEFAULT 0, -- 最后更新时间戳（排查用）
-    created_at  BIGINT       NOT NULL DEFAULT 0, -- 锁记录首次创建时间（排查用）
+    created_at  BIGINT       NOT NULL DEFAULT 0, -- 锁记录首次创建时间戳（排查用）
     PRIMARY KEY (lock_key)
+)
+"""
+
+# Issue #993：分支守卫的期望远端 sha 状态（与 distributed_locks 同源 DB，跨 worker 可见）。
+_BRANCH_GUARD_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS branch_guard_state (
+    repo_key            VARCHAR(255) NOT NULL DEFAULT '',
+    head_branch         VARCHAR(255) NOT NULL DEFAULT '',
+    expected_remote_sha VARCHAR(64)  NOT NULL DEFAULT '',
+    pr_number           INTEGER      NOT NULL DEFAULT 0,
+    base_branch         VARCHAR(255) NOT NULL DEFAULT '',
+    updated_at          TEXT         NOT NULL DEFAULT '',
+    pending_expected_sha VARCHAR(64) NOT NULL DEFAULT '',
+    pending_prev_sha    VARCHAR(64)  NOT NULL DEFAULT '',
+    PRIMARY KEY (repo_key, head_branch)
 )
 """
 
@@ -861,6 +879,8 @@ CREATE TABLE IF NOT EXISTS autopilot_executions (
     -- v3.0 新增字段
     agent_type      TEXT DEFAULT '',                     -- 执行快照
     findings_json   MEDIUMTEXT DEFAULT '',               -- findings list JSON
+    -- Issue #1546：执行记录直接持有的 agent_tasks.id（非 events.seq），反查唯一权威来源
+    agent_task_id   TEXT DEFAULT NULL,                   -- agent_tasks.id（字符串，空=历史行）
     -- Feishu subscription notification: terminal-state notify idempotency guard
     notified        INTEGER NOT NULL DEFAULT 0           -- 0=pending 1=notified (prevents double-send from two terminal hooks)
 )
@@ -891,6 +911,7 @@ _NEW_TABLES = [
     ("admin_accounts", _ADMIN_ACCOUNTS_TABLE_DDL),
     ("meta", _META_TABLE_DDL),
     ("grape_t_patrol_findings", _PATROL_FINDINGS_DDL),
+    ("grape_t_merge_gate_log", _MERGE_GATE_LOG_DDL),
     ("grape_t_schema_migrations", _SCHEMA_MIGRATIONS_DDL),
     ("agent_runtimes", _AGENT_RUNTIMES_DDL),
     ("agent_tasks", _AGENT_TASKS_DDL),
@@ -913,7 +934,6 @@ _NEW_TABLES = [
     ("event_route_config", _EVENT_ROUTE_CONFIG_DDL),
     ("agent_type", _AGENT_TYPE_DDL),
     ("skill", _SKILL_DDL),
-    ("global_im_bot_config", _GLOBAL_IM_BOT_CONFIG_DDL),
     ("grape_im_instance", _IM_INSTANCE_DDL),
     ("feishu_onboard_task", _FEISHU_ONBOARD_TASK_DDL),
     ("vod_conversations", _VOD_CONVERSATIONS_DDL),
@@ -1704,6 +1724,18 @@ def _create_tables():
         except Exception as e:
             log.warning(f"Create table '{name}' failed: {e}")
 
+    # IM 渠道 4 表（Issue #742 §5.1）：DDL 与引擎启动迁移共用 scripts/migrations/001_channel_tables，
+    # 在此统一建/补（幂等），保证 MySQL 后端下即使 IM 引擎模式为 off 也表示层完整（P1 回填/对账依赖）。
+    try:
+        from src.im.engine_wiring import ensure_channel_schema
+        with db_lock:
+            ensure_channel_schema(db)
+            db.commit()
+        log.info("IM channel tables ready "
+                 "(grape_t_channel_installation / session_binding / inbound_dedup / sender_identity)")
+    except Exception as e:
+        log.warning(f"IM channel tables setup failed: {e}")
+
     # grape_accounts email 唯一索引（D12: 统一用 NULL + 普通唯一索引，SQLite 和 MySQL 统一语法）
     # 幂等补列：verification_codes.ip（老库可能缺此列）
     try:
@@ -1832,7 +1864,15 @@ _DDL_MANUAL_REVIEW: List[str] = []
 _LEGACY_BLOCKED_DDL: List[str] = []
 
 
-def _ensure_column(c, tbl: str, col: str, ddl: str, allow_copy: bool = False):
+def _strip_null_default(ddl: str) -> str:
+    """Issue #1546 修复：仅剥离尾部 `DEFAULT NULL`（与可空列的隐式默认完全等价）；
+    其它显式默认值（0/'' 等）原样保留——剥掉会改变历史行语义。"""
+    import re as _re
+    return _re.sub(r"\s+DEFAULT\s+NULL\s*$", "", (ddl or "").strip(), flags=_re.IGNORECASE)
+
+
+def _ensure_column(c, tbl: str, col: str, ddl: str, allow_copy: bool = False,
+                   strict: bool = False):
     """Idempotent column add: PRAGMA check if column missing then ALTER.
 
     Column name wrapped in backticks for MySQL compatibility (e.g. `binary` is reserved).
@@ -1841,12 +1881,20 @@ def _ensure_column(c, tbl: str, col: str, ddl: str, allow_copy: bool = False):
     1. 首选 ``ALGORITHM=INSTANT``（8.0 加可空列默认 INSTANT，不锁表）；
     2. INSTANT 不支持 → 降级重试 ``ALGORITHM=INPLACE, LOCK=NONE``（显式声明，
        做不到就报错而非默默锁全表）；
+    2.5 带 ``DEFAULT NULL`` 的 TEXT/MEDIUMTEXT 列上述两者都不支持（Issue #1546 实测）→
+       剥离该默认值后重试两者（与可空列隐式默认等价，不改历史行语义）；
     3. 再失败 → 记 ERROR 进人工处理清单，**绝不静默降级到 COPY**；
-       列未建成，下次启动幂等重试。
+       注意：此处不抛异常，调用方迁移仍会盖章 → 该列不会自动重试，只能另行补一条
+       幂等修复迁移（参考 202611090002）。
 
     allow_copy=True（小表迁移专用，如 issue 表百级行）：第 3 步改为允许默认算法
     补列（MySQL 会自动选 COPY 重建）。带 DEFAULT 的 TEXT 列无法 INSTANT/INPLACE，
     不加此开关时会被安全策略挡下导致列永远建不出来。
+
+    strict=True（注册式迁移专用）：所有降级分支都失败时 **raise** 而不是只记人工
+    清单后正常返回。理由：迁移执行器约定「fn 正常返回=盖章」，若这里静默返回，
+    列没建成也会盖死版本号，下次启动不再重试，线上表现为查询该列 1054 且接口
+    静默返回空 —— 与 2026-11-06 issue.vcs_exists 事故同态（QA 审查 M1）。
     """
     cols = [r[1] for r in c.execute(f"PRAGMA table_info({tbl})").fetchall()]
     if col in cols:
@@ -1875,6 +1923,23 @@ def _ensure_column(c, tbl: str, col: str, ddl: str, allow_copy: bool = False):
         if _is_mdl_timeout(_inplace_err):
             _LEGACY_BLOCKED_DDL.append(f"{tbl}.{col} ADD COLUMN（MDL 超时）")
             raise _MdlWaitTimeout(str(_inplace_err))
+        # Issue #1546 修复（2026-11-09）：带 DEFAULT NULL 的 TEXT/MEDIUMTEXT 列在 MySQL 上
+        # INSTANT 与 INPLACE,LOCK=NONE 均不支持；此前直接落人工清单后正常返回 → 迁移照样盖章、
+        # 列永不创建也不重试（SQLite 全绿，生产运行时才 1054）。DEFAULT NULL 与可空列隐式默认
+        # 等价，剥离后重试，既能把列补上、又不必退到 COPY 锁全表。
+        _ddl_nd = _strip_null_default(ddl)
+        if _ddl_nd != ddl:
+            _base_nd = f"ALTER TABLE {tbl} ADD COLUMN `{col}` {_ddl_nd}"
+            for _algo_nd in ("ALGORITHM=INSTANT", "ALGORITHM=INPLACE, LOCK=NONE"):
+                try:
+                    c.execute(f"{_base_nd}, {_algo_nd}")
+                    log.info(f"_ensure_column({tbl}.{col}) 剥离 DEFAULT NULL 后补列成功（{_algo_nd}）")
+                    return
+                except Exception as _nd_err:
+                    if _is_mdl_timeout(_nd_err):
+                        _LEGACY_BLOCKED_DDL.append(f"{tbl}.{col} ADD COLUMN（MDL 超时）")
+                        raise _MdlWaitTimeout(str(_nd_err))
+                    _inplace_err = _nd_err
         if allow_copy:
             try:
                 c.execute(base_sql)      # 默认算法：MySQL 按需选 COPY 重建（小表安全）
@@ -1885,11 +1950,15 @@ def _ensure_column(c, tbl: str, col: str, ddl: str, allow_copy: bool = False):
                          f"({_copy_err})——需人工处理")
                 _DDL_MANUAL_REVIEW.append(entry)
                 log.error(f"_ensure_column MANUAL REVIEW: {entry}")
+                if strict:
+                    raise RuntimeError(f"_ensure_column 补列失败（strict）: {entry}")
                 return
         entry = (f"{tbl}.{col}: INSTANT 与 INPLACE,LOCK=NONE 均失败 "
                  f"(INPLACE err={_inplace_err})——需人工处理，未静默 COPY")
         _DDL_MANUAL_REVIEW.append(entry)
         log.error(f"_ensure_column MANUAL REVIEW: {entry}")
+        if strict:
+            raise RuntimeError(f"_ensure_column 补列失败（strict）: {entry}")
 
 
 def _rename_column_if_exists(c, tbl: str, old: str, new: str):
@@ -2712,11 +2781,55 @@ class Migration:
 
 _MIGRATIONS: List[Migration] = []
 
+# 🧊 老轨 _run_all_migrations() 的冻结快照（调用名清单）。
+# 存量库不会跑老轨，任何新增补列/补表一律 register_migration（见该函数 docstring）。
+# tests/atomic/test_migration_track_guard.py 用 AST 比对：本常量与函数体里的实际调用
+# 集合必须一致 —— 有人往老轨塞新迁移，测试立刻红；确实要改动老轨（极少见）时，
+# 先评估是否该改成注册式迁移，只有确认必须留老轨才同步改这里，并在 PR 里说明原因。
+LEGACY_TRACK_FROZEN = (
+    "_ensure_case_insensitive_indexes",
+    "_ensure_whitelist_columns",
+    "_migrate_a2a_idempotency_key",
+    "_migrate_allow_signup_default",
+    "_migrate_event_status_pending",
+    "_migrate_issue_created_by",
+    "_migrate_knowledge_dedup_and_ref",
+    "_migrate_tables",
+    "_migrate_whitelist_from_file",
+)
+
 
 def register_migration(version: str, name: str, kind: str,
                        fn: Optional[Callable[[], None]] = None) -> Migration:
-    """登记一条迁移（新增迁移一律走这里 + kind 规则）。"""
+    """登记一条迁移（新增迁移一律走这里 + kind 规则）。
+
+    ⚠️ 新增补列/补表/回填必须走这里，不要写进老轨 _run_all_migrations()
+    ────────────────────────────────────────────────────────────────
+    存量库的 grape_t_schema_migrations 早已被 legacy-stamp 盖帽
+    （202610300001），启动时执行器只跑本函数登记的增量迁移 —— 写进老轨的
+    ALTER TABLE 永远不会执行，运行代码查该列立刻 Unknown column(1054)，
+    异常被各处 except 吞掉后接口静默返回空数组（2026-11-06 Issue #995
+    的 issue.vcs_exists 就是这么挂的：升级后四台 794 次 1054，
+    /api/issues/mine 从有数据变成 0 条）。
+
+    提交前自查五条（tests/atomic/test_migration_track_guard.py 会卡前 1/2/3/4 条）：
+    1. version 未被占用：库里已盖章的号 + 源码里其它 register_migration 的号都不能重
+       （同号会被判「已执行」永久跳过；历史事故 202611050001 / 202611060001）；
+    2. fn 失败要抛出，不要 try/except 吞掉 —— 执行器约定「抛错=不盖章，下次启动重试」，
+       吞了就会「列没建成、版本号却盖死」；
+    3. 加 TEXT 列且带非 NULL DEFAULT 时，_ensure_column 要传 allow_copy=True
+       （TEXT 带 DEFAULT 走不了 INSTANT/INPLACE，不传会被 DDL 安全带挡下）；
+    4. fn 必须幂等（IF NOT EXISTS / _ensure_column），存量库会重跑；
+    5. renumber 前必须人工核对目标环境 grape_t_schema_migrations 现值
+       （SELECT version, name FROM grape_t_schema_migrations）——测试连不了真实库，
+       跨分支撞号只能靠这一步发现；执行器对「同号不同名」会报 ERROR 但不阻断启动。
+    """
     mig = Migration(version=version, name=name, kind=kind, fn=fn)
+    if any(m.version == version for m in _MIGRATIONS):
+        _prev = next(m.name for m in _MIGRATIONS if m.version == version)
+        log.error(
+            f"迁移版本号撞号: {version} 已被 {_prev} 占用，本迁移 {name} 将被版本表"
+            f"判为「已执行」而永久跳过。改用未占用号（日期+序号顺延）后再提交。")
     _MIGRATIONS.append(mig)
     _MIGRATIONS.sort(key=lambda m: m.version)
     return mig
@@ -2737,6 +2850,168 @@ register_migration(
     name="create-patrol-findings-table",
     kind="safe",
     fn=_fn_create_grape_t_patrol_findings,
+)
+
+
+def _fn_task_liveness_index_and_revived_at() -> None:
+    """Issue #1071：迟到结果复活所需的结构（存量库幂等补齐）。
+
+    - agent_tasks.revived_at：复活只允许发生一次，靠此列落痕（NULL = 未复活）。
+    不加 task_messages(task_id, created_at) 复合索引：实测该表已有
+    idx_task_messages_task(task_id)（db_setup:1986，存量库均在），而活性查询是
+    「按 task_id 过滤 + ORDER BY id DESC LIMIT 20」，单列索引即命中；task_messages 是
+    追加最频繁的表，再挂一个索引只有写入放大、没有读收益。
+    走 register_migration（legacy 清单已冻结，不再往 _NEW_TABLES/legacy 里加）。
+    """
+    with db_lock:
+        c = db.cursor()
+        try:
+            _ensure_column(c, "agent_tasks", "revived_at", "TEXT DEFAULT NULL")
+            db.commit()
+        except Exception as e:
+            log.warning(f"agent_tasks.revived_at migration failed: {e}")
+
+
+register_migration(
+    version="202611080004",
+    name="task-liveness-revived-at",
+    kind="safe",
+    fn=_fn_task_liveness_index_and_revived_at,
+)
+
+
+def _fn_create_grape_t_merge_gate_log() -> None:
+    """Issue #752：存量库补建合入门禁日志表（CREATE TABLE IF NOT EXISTS 幂等，
+    与 patrol-findings 同路径：_NEW_TABLES 只服务 legacy 全量首跑，已盖章库走本迁移）。"""
+    with db_lock:
+        db.execute(_MERGE_GATE_LOG_DDL)
+        db.commit()
+
+
+register_migration(
+    # 20261105 修复：远端曾误改为 0001（与 issue658_role_tags 撞号），且生产版本表
+    # 已按 0002 落库——回到 0002 对齐生产；issue865 挪至 0004 避让。
+    # 2026-11-10：目标库 202611030002 已被 issue865_agent_runtimes_model 占用（同号不同名，
+    # 本次迁移被判已执行永久跳过）→ renumber 到 202611100002。该迁移只做
+    # CREATE TABLE IF NOT EXISTS，重跑幂等无损。
+    version="202611100002",
+    name="create-merge-gate-log-table",
+    kind="safe",
+    fn=_fn_create_grape_t_merge_gate_log,
+)
+
+
+def _fn_add_agent_tasks_trace_context() -> None:
+    """MR-2（weekly-10）：存量库补 agent_tasks.trace_context（幂等补列）。
+
+    _migrate_tables 里的同名 _ensure_column 只在 legacy 全量迁移路径执行，已盖章的
+    存量库不会再跑那一段，缺列时代码侧 _TASK_COLUMNS_LIST 含该列会让
+    _create_direct_task 的严格 INSERT 直接抛错、任务行永不落库。故补一条独立迁移。
+    """
+    with db_lock:
+        c = db.cursor()
+        _ensure_column(c, "agent_tasks", "trace_context", "TEXT DEFAULT ''")
+        db.commit()
+
+
+register_migration(
+    version="202611100001",
+    name="add-agent-tasks-trace-context",
+    kind="safe",
+    fn=_fn_add_agent_tasks_trace_context,
+)
+
+
+def _fn_create_branch_guard_state() -> None:
+    """Issue #993：存量库补建分支守卫状态表（CREATE TABLE IF NOT EXISTS 幂等）。
+
+    与 distributed_locks 同源 DB，跨 worker 共享 expected_remote_sha；早期把它落在
+    本机 workspace 文件，跨 worker 调度时漂移检测会 fail-open。
+    """
+    with db_lock:
+        db.execute(_BRANCH_GUARD_STATE_DDL)
+        db.commit()
+
+
+register_migration(
+    version="202611060001",
+    name="create-branch-guard-state-table",
+    kind="safe",
+    fn=_fn_create_branch_guard_state,
+)
+
+
+def _fn_add_branch_guard_pending_columns() -> None:
+    """Issue #993 复审：pre-push 钩子候选 sha 字段（存量库幂等补列）。
+
+    钩子退出后才真正传输，无法在钩子内确认 push 成功；用 pending_expected_sha +
+    pending_prev_sha 记录候选与推送前远端，下一次守卫按远端实际值收敛，避免 push
+    失败后误报 remote_drift。
+    """
+    with db_lock:
+        c = db.cursor()
+        _ensure_column(c, "branch_guard_state", "pending_expected_sha",
+                       "VARCHAR(64) NOT NULL DEFAULT ''")
+        _ensure_column(c, "branch_guard_state", "pending_prev_sha",
+                       "VARCHAR(64) NOT NULL DEFAULT ''")
+        db.commit()
+
+
+register_migration(
+    version="202611060002",
+    name="add-branch-guard-pending-columns",
+    kind="safe",
+    fn=_fn_add_branch_guard_pending_columns,
+)
+
+
+def _fn_add_ap_exec_agent_task_id() -> None:
+    """Issue #1546：autopilot_executions 直接持有 agent_tasks.id（存量库幂等补列 + 索引）。
+
+    反查任务不再依赖 `event_seq`（= exec_id）与 events.seq 的跨序列撞号；索引
+    支撑按 agent_task_id 直连查询。列/索引已存在时正常返回并盖章，失败抛出由
+    迁移执行器跳过不盖章（幂等重试）。
+    """
+    with db_lock:
+        c = db.cursor()
+        _ensure_column(c, "autopilot_executions", "agent_task_id", "TEXT DEFAULT NULL")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ap_exec_agent_task "
+            "ON autopilot_executions(agent_task_id)")
+        db.commit()
+
+
+register_migration(
+    # 撞号避让（2026-11-09 变基）：weekly-10 已用 202611060003 给
+    # backfill_events_terminal_completed_at，同号后登记项会被判「已执行」永久跳过。
+    version="202611090001",
+    name="add-autopilot-exec-agent-task-id",
+    kind="safe",
+    fn=_fn_add_ap_exec_agent_task_id,
+)
+
+
+def _fn_repair_ap_exec_agent_task_id() -> None:
+    """Issue #1546 修复（2026-11-09）：原迁移在 MySQL 上可能「已盖章但列未创建」。
+
+    _ensure_column 两级降级失败时不抛异常、只记人工清单，迁移仍会被盖章 → 该列再也
+    不会补。本迁移幂等重查一次：列存在则只补索引（无副作用），缺失则按修正后的
+    剥离 DEFAULT NULL 路径补列；即使仍失败，下次启动也会重试（未被提前盖章掩盖）。
+    """
+    with db_lock:
+        c = db.cursor()
+        _ensure_column(c, "autopilot_executions", "agent_task_id", "TEXT DEFAULT NULL")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ap_exec_agent_task "
+            "ON autopilot_executions(agent_task_id)")
+        db.commit()
+
+
+register_migration(
+    version="202611090002",
+    name="repair-autopilot-exec-agent-task-id",
+    kind="safe",
+    fn=_fn_repair_ap_exec_agent_task_id,
 )
 
 
@@ -2809,6 +3084,451 @@ register_migration(
     name="issue658_agent_runtimes_role_tags",
     kind="safe",
     fn=_fn_add_agent_runtimes_role_tags,
+)
+
+
+def _fn_add_agent_runtimes_model() -> None:
+    """Issue #865 补注册：agent_runtimes 增 model_name/model_source/model_reported_at
+    三列（配置模型展示）。与 #658 role_tags 同模式：legacy 盖帽库不自动执行时
+    附手工 ALTER（见 _migrate_tables 冻结清单）；幂等：查列缺才 ALTER。"""
+    is_mysql = False
+    try:
+        from src.session_manager import _is_mysql_backend
+        is_mysql = _is_mysql_backend()
+    except Exception:
+        pass
+    with db_lock:
+        c = db.cursor()
+        if is_mysql:
+            # Issue #1412 QA Required：逐列 _ensure_column 幂等补列。原实现在 have<3
+            # 分支内无条件执行第三个 ALTER，当 model_reported_at 已存在而
+            # model_name/model_source 缺一个（have==2）时每次启动都抛
+            # Duplicate column name (1060)，迁移永不盖章、三列永远补不齐。
+            # _ensure_column 内部 PRAGMA table_info 由 mysql_compat 转
+            # information_schema，按列判断存在性；strict=True 保证补列失败
+            # 不盖章（下次启动重试）。
+            for col in ("model_name", "model_source", "model_reported_at"):
+                _ensure_column(c, "agent_runtimes", col, "TEXT DEFAULT ''",
+                               allow_copy=True, strict=True)
+            db.commit()
+        else:
+            c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_runtimes'")
+            row = c.fetchone()
+            ddl = (row[0] or "") if row else ""
+            if not row:
+                return
+            for col in ("model_name", "model_source", "model_reported_at"):
+                if col not in ddl:
+                    db.execute(f"ALTER TABLE agent_runtimes ADD COLUMN {col} TEXT DEFAULT ''")
+            db.commit()
+
+
+register_migration(
+    # 20261105 修复：原 0002 与 merge-gate-log 撞号（merge-gate-log 已按 0002 落库），
+    # 挪至 0004；后 0004 又被其它分支落库的 issue-646-mysql-fks 占用（Issue #1412），
+    # 再 renumber 至全新日期段 202611070001（name 不变，兼容已按旧号盖章的环境）。
+    # 列添加幂等（已存在则跳过），生产/新库均安全。
+    version="202611070001",
+    name="issue865_agent_runtimes_model",
+    kind="safe",
+    fn=_fn_add_agent_runtimes_model,
+)
+
+
+def _fn_add_obs_llm_usage_engine_index() -> None:
+    """性能补丁（2026-11-03）：obs_llm_usage 原先没有 engine_id 索引，
+    引擎页的"最近使用模型"聚合（Issue #865 `_recent_models_by_runtime`）
+    每页触发一次全表扫描（EXPLAIN: type=ALL + Using temporary）——千万行量级
+    下单页 0.3~0.6s，且全程持 db_lock，会串行堵住其它 DB 请求。
+    补 (engine_id, model_key, model_raw, created_at) 索引后按引擎收窄 + 覆盖分组，
+    实测（sqlite，100 万行）38ms → 1.5ms。幂等：索引已存在即跳过。"""
+    is_mysql = False
+    try:
+        from src.session_manager import _is_mysql_backend
+        is_mysql = _is_mysql_backend()
+    except Exception:
+        pass
+    _idx = "idx_obs_llm_engine_model"
+    with db_lock:
+        c = db.cursor()
+        if is_mysql:
+            # MySQL 下 model_key/model_raw/created_at 是 TEXT，必须带前缀长度
+            c.execute(
+                "SELECT COUNT(*) FROM information_schema.statistics "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='obs_llm_usage' "
+                "AND INDEX_NAME=%s", (_idx,))
+            if c.fetchone()[0]:
+                return
+            c.execute(
+                f"CREATE INDEX {_idx} ON obs_llm_usage "
+                "(engine_id, model_key(64), model_raw(64), created_at(32))")
+            db.commit()
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name=?", (_idx,))
+            if c.fetchone():
+                return
+            c.execute(
+                f"CREATE INDEX {_idx} ON obs_llm_usage "
+                "(engine_id, model_key, model_raw, created_at)")
+            db.commit()
+
+
+register_migration(
+    version="202611030003",
+    name="perf_obs_llm_usage_engine_index",
+    kind="safe",
+    fn=_fn_add_obs_llm_usage_engine_index,
+)
+
+
+def _backfill_scene_rows_skill_id(rows: list, update_sql: str) -> int:
+    """Issue #979 backfill 公共循环（devops_pipeline_scene / scene_market 共用）。
+
+    rows 元素为 (row_id, repo_key, uid, nodes_json)：对仅含 skill_name 的节点按
+    现有规则（user→repo→official，resolve_skill_id）解析一次并写回 skill_id
+    （update_sql 形如 "UPDATE <table> SET nodes_json=? WHERE id=?"）。
+    幂等：节点已有 skill_id 跳过；解析不到保持原样（派发时按名字降级 + warning）。
+    返回发生写回的行数。
+    """
+    from src.user.db import resolve_skill_id
+    updated = 0
+    for row_id, repo_key, uid, nodes_json in rows:
+        try:
+            nodes = json.loads(nodes_json or "[]")
+        except Exception as e:
+            log.warning(f"issue979 backfill: bad nodes_json (row={row_id}): {e}")
+            continue
+        if not isinstance(nodes, list) or not nodes:
+            continue
+        changed = False
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            _name = n.get("skill") or ""
+            if not _name or n.get("skill_id"):
+                continue
+            sid = resolve_skill_id(_name, repo_key=repo_key or "", user_id=uid or 0)
+            if sid:
+                n["skill_id"] = int(sid)
+                changed = True
+        if changed:
+            try:
+                with db_lock:
+                    db.cursor().execute(update_sql,
+                                        (json.dumps(nodes, ensure_ascii=False), row_id))
+                    db.commit()
+                updated += 1
+            except Exception as e:
+                log.warning(f"issue979 backfill: write back failed (row={row_id}): {e}")
+    return updated
+
+
+def _fn_scene_nodes_skill_id_backfill() -> None:
+    """Issue #979：存量场景节点写回 skill_id（backfill，幂等续跑）。
+
+    三档（official/repo/user）同名技能并存时，节点仅存 skill_name 无法锁定
+    档位。本迁移对仅含 skill_name 的节点按现有规则（user→repo→official，
+    resolve_skill_id）解析一次并写回 skill_id：
+    - devops_pipeline_scene：user 上下文取 created_by（gitcode 用户名 →
+      unified_user_mapping.user_id），repo 上下文取行内 repo_key；
+    - scene_market：user 上下文取 source_user_id，repo 上下文取行内 repo_key
+      （scope='repo' 行；此前空 repo_key 解析会漏 repo 档）。
+    解析不到（官方内置包形态等）保持原样，派发时按名字降级 + warning。
+    仅写回 skill_id，不删 skill_name（显示与降级兜底）。"""
+    with db_lock:
+        c = db.cursor()
+        c.execute(
+            "SELECT id, repo_key, nodes_json, created_by "
+            "FROM devops_pipeline_scene WHERE is_active=1")
+        scene_rows = c.fetchall() or []
+        try:
+            c.execute("SELECT id, repo_key, source_user_id, nodes_json FROM scene_market")
+            market_rows = c.fetchall() or []
+        except Exception as e:
+            log.warning(f"issue979 backfill: scene_market read failed: {e}")
+            market_rows = []
+    # devops_pipeline_scene：created_by（gitcode 用户名）→ user_id
+    normalized = []
+    for row_id, repo_key, nodes_json, created_by in scene_rows:
+        uid = 0
+        if created_by:
+            try:
+                with db_lock:
+                    r2 = db.cursor().execute(
+                        "SELECT user_id FROM unified_user_mapping "
+                        "WHERE gitcode_user=? AND user_id>0 LIMIT 1",
+                        (created_by,)).fetchone()
+                if r2:
+                    uid = int(r2[0] or 0)
+            except Exception as e:
+                log.warning(f"issue979 backfill: created_by lookup failed "
+                            f"(row={row_id}, user={created_by}): {e}")
+        normalized.append((row_id, repo_key or "", uid, nodes_json))
+    _backfill_scene_rows_skill_id(
+        normalized, "UPDATE devops_pipeline_scene SET nodes_json=? WHERE id=?")
+    # scene_market：source_user_id 即 user 上下文，repo_key 行内（repo 档）
+    _backfill_scene_rows_skill_id(
+        [(row_id, repo_key or "", int(source_user_id or 0), nodes_json)
+         for row_id, repo_key, source_user_id, nodes_json in market_rows],
+        "UPDATE scene_market SET nodes_json=? WHERE id=?")
+
+
+register_migration(
+    version="202611040001",
+    name="issue979_scene_nodes_skill_id_backfill",
+    kind="backfill",
+    fn=_fn_scene_nodes_skill_id_backfill,
+)
+
+
+def _fn_add_issue_repo_created_index() -> None:
+    """性能补丁（2026-11-04 压测）：需求中心服务端分页（Issue #926）按
+    `WHERE repo_key=? ... ORDER BY created_at DESC LIMIT/OFFSET` 取数，issue 表只有
+    (repo_key, issue_number) 唯一索引 → 每页 COUNT(*) 全扫 + ORDER BY 建临时 B-TREE
+    （200k 行实测首页 78ms / 深页 350ms），且全程持 db_lock 串行阻塞其它查询。
+    补 (repo_key, created_at) 后 COUNT 与 time 模式排序可走索引；default 模式
+    的第一排序键是状态优先级 CASE，无法完全免排序，深页由路由侧偏移上限兜底。
+    幂等：索引已存在即跳过。"""
+    is_mysql = False
+    try:
+        from src.session_manager import _is_mysql_backend
+        is_mysql = _is_mysql_backend()
+    except Exception:
+        pass
+    _idx = "idx_issue_repo_created"
+    with db_lock:
+        c = db.cursor()
+        if is_mysql:
+            # MySQL 下 repo_key/created_at 是 TEXT，必须带前缀长度
+            c.execute(
+                "SELECT COUNT(*) FROM information_schema.statistics "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='issue' "
+                "AND INDEX_NAME=%s", (_idx,))
+            if c.fetchone()[0]:
+                return
+            c.execute(
+                f"CREATE INDEX {_idx} ON issue (repo_key(64), created_at(32))")
+            db.commit()
+        else:
+            c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name=?", (_idx,))
+            if c.fetchone():
+                return
+            c.execute(f"CREATE INDEX {_idx} ON issue (repo_key, created_at)")
+            db.commit()
+
+
+register_migration(
+    version="202611040002",
+    name="perf_issue_repo_created_index",
+    kind="safe",
+    fn=_fn_add_issue_repo_created_index,
+)
+
+
+def _fn_add_issue_status_priority_index() -> None:
+    """性能补丁（2026-11-04 压测，方案 B）：需求中心默认排序是
+    `CASE 状态优先级, created_at DESC`（路由 _status_order_sql，单一事实源）。
+    普通列索引对"算出来的第一排序键"无效 → 20 万行 offset 19950 实测 168ms，
+    且全程持 db_lock。改为表达式索引：sqlite 支持 `CREATE INDEX ... ON issue
+    (repo_key, <CASE 表达式>, created_at DESC)`，EXPLAIN 变为
+    `SEARCH ... USING INDEX`，同数据同深页 168ms → 1.0ms（首页 0.1ms）。
+    表达式的 CASE 文本必须与 _status_order_sql() 完全一致（同一函数懒导入生成，
+    避免两处手写漂移）；MySQL 侧函数索引需 >= 8.0.13，失败只告警跳过（不阻断启动，
+    深页由路由偏移护栏兜底）。幂等：索引已存在即跳过。"""
+    is_mysql = False
+    try:
+        from src.session_manager import _is_mysql_backend
+        is_mysql = _is_mysql_backend()
+    except Exception:
+        pass
+    from src.api.routes.issues import _status_order_sql  # 懒导入：避免模块级环形依赖
+    _expr = _status_order_sql()
+    _idx = "idx_issue_repo_statuspri_time"
+    with db_lock:
+        c = db.cursor()
+        if is_mysql:
+            try:
+                c.execute(
+                    "SELECT COUNT(*) FROM information_schema.statistics "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='issue' "
+                    "AND INDEX_NAME=%s", (_idx,))
+                if c.fetchone()[0]:
+                    return
+                c.execute(
+                    f"CREATE INDEX {_idx} ON issue (repo_key(64), ({_expr}), created_at(32))")
+                db.commit()
+            except Exception as e:
+                log.warning(
+                    f"{_idx} 建索引失败（MySQL 函数索引需 >= 8.0.13，跳过；"
+                    f"默认排序深页由偏移护栏兜底）: {e}")
+            return
+        c.execute("SELECT name FROM sqlite_master WHERE type='index' AND name=?", (_idx,))
+        if c.fetchone():
+            return
+        c.execute(f"CREATE INDEX {_idx} ON issue (repo_key, {_expr}, created_at DESC)")
+        db.commit()
+
+
+register_migration(
+    version="202611040003",
+    name="perf_issue_status_priority_index",
+    kind="safe",
+    fn=_fn_add_issue_status_priority_index,
+)
+
+
+def _fn_backfill_events_terminal_completed_at(conn=None) -> None:
+    """Issue #1105：存量回填——终态（completed/failed/cancelled）且 completed_at
+    为空的 events 行，取 created_at 回填（created_at 为空则兜底当前时间），
+    恢复「终态 ⇔ completed_at 非空」不变量。
+
+    幂等：只更新 completed_at 为空的行，重跑无副作用。
+    分批回填（每批 500 条，按 seq 升序推进），避免大表单条 UPDATE 长事务/锁。
+    conn 可选：测试注入独立连接；缺省用全局 db（受 db_lock 保护）。
+    """
+    _TERMINALS = ("completed", "failed", "cancelled")
+    _BATCH = 500
+    _own = conn is None
+    if _own:
+        conn = db
+    try:
+        from src.session_manager import _is_mysql_backend
+    except Exception:
+        _is_mysql_backend = lambda: False  # noqa: E731
+    _mysql = _is_mysql_backend()
+    _ph = "%s" if _mysql else "?"
+    _now_fn = "NOW()" if _mysql else "datetime('now')"
+    with db_lock:
+        c = conn.cursor()
+        _placeholders = ",".join(_ph for _ in _TERMINALS)
+        while True:
+            try:
+                c.execute(
+                    f"SELECT seq FROM events WHERE status IN ({_placeholders}) "
+                    "AND (completed_at IS NULL OR completed_at='') "
+                    f"ORDER BY seq LIMIT {_BATCH}", _TERMINALS)
+                rows = c.fetchall()
+                if not rows:
+                    break
+                seqs = [r[0] for r in rows]
+                _in = ",".join(_ph for _ in seqs)
+                c.execute(
+                    f"UPDATE events SET completed_at="
+                    f"COALESCE(NULLIF(created_at,''), {_now_fn}) "
+                    f"WHERE seq IN ({_in}) "
+                    f"AND status IN ({_placeholders}) "
+                    "AND (completed_at IS NULL OR completed_at='')",
+                    (*seqs, *_TERMINALS))
+                conn.commit()
+                if len(seqs) < _BATCH:
+                    break
+            except Exception as e:
+                log.warning(f"backfill_events_terminal_completed_at failed: {e}")
+                break
+
+
+register_migration(
+    # 撞号修复（2026-11-06 发版实测）：本迁移原用 202611060001，与
+    # create-branch-guard-state-table 同号 —— 执行器按 version 判定，后登记的
+    # 那条会被判「已执行」而永久跳过（生产库当时是拿包内改号 202611060003 绕过的，
+    # 分支上必须同步成同一个号，否则下次从分支打包又会撞）。
+    version="202611060003",
+    name="backfill_events_terminal_completed_at",
+    kind="safe",
+    fn=_fn_backfill_events_terminal_completed_at,
+)
+
+
+def _fn_backfill_events_terminal_completed_at_1497(conn=None) -> None:
+    """Issue #1497：存量回填（第二轮）——终态（completed/failed/cancelled/timeout）
+    且 completed_at 为空的 events 行补写 completed_at。
+
+    口径：completed_at = COALESCE(已有非空值, updated_at, created_at, 当前时间)。
+    events 表当前无 updated_at 列（列存在时优先取，语义为「最后更新时间」兜底口径），
+    缺列时按 created_at 回填——与 #1105 第一轮迁移口径一致并记录于此。
+    幂等：只更新 completed_at 为空的行，重跑无副作用；分批（每批 500 条，按 seq 升序）。
+    conn 可选：测试注入独立连接；缺省用全局 db（受 db_lock 保护）。
+    """
+    _TERMINALS = ("completed", "failed", "cancelled", "timeout")
+    _BATCH = 500
+    _own = conn is None
+    if _own:
+        conn = db
+    try:
+        from src.session_manager import _is_mysql_backend
+    except Exception:
+        _is_mysql_backend = lambda: False  # noqa: E731
+    _mysql = _is_mysql_backend()
+    _ph = "%s" if _mysql else "?"
+    _now_fn = "NOW()" if _mysql else "datetime('now')"
+    with db_lock:
+        c = conn.cursor()
+        # updated_at 列存在性探测（events 老库无该列）
+        _has_updated_at = False
+        try:
+            _cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
+            _has_updated_at = "updated_at" in _cols
+        except Exception:
+            _has_updated_at = False
+        _val_expr = (
+            "COALESCE(NULLIF(updated_at,''), NULLIF(created_at,''), " + _now_fn + ")"
+            if _has_updated_at else
+            "COALESCE(NULLIF(created_at,''), " + _now_fn + ")")
+        while True:
+            try:
+                c.execute(
+                    f"SELECT seq FROM events WHERE status IN ({','.join(_ph for _ in _TERMINALS)}) "
+                    "AND (completed_at IS NULL OR completed_at='') "
+                    f"ORDER BY seq LIMIT {_BATCH}", _TERMINALS)
+                rows = c.fetchall()
+                if not rows:
+                    break
+                seqs = [r[0] for r in rows]
+                _in = ",".join(_ph for _ in seqs)
+                c.execute(
+                    f"UPDATE events SET completed_at={_val_expr} "
+                    f"WHERE seq IN ({_in}) "
+                    f"AND status IN ({','.join(_ph for _ in _TERMINALS)}) "
+                    "AND (completed_at IS NULL OR completed_at='')",
+                    (*seqs, *_TERMINALS))
+                conn.commit()
+                if len(seqs) < _BATCH:
+                    break
+            except Exception as e:
+                log.warning(f"backfill_events_terminal_completed_at_1497 failed: {e}")
+                break
+
+
+register_migration(
+    version="202611080001",
+    name="backfill_events_terminal_completed_at_1497",
+    kind="safe",
+    fn=_fn_backfill_events_terminal_completed_at_1497,
+)
+
+
+def _fn_scene_pin_columns() -> None:
+    """Issue #1735：devops_pipeline_scene 补置顶列（存量库幂等补列）。
+
+    is_pinned / pinned_at 供项目场景列表「置顶」（仓库共享、pinned_at 倒序）。
+    异常必须抛出（不吞），保证执行器不盖章、下次启动重试。
+    """
+    with db_lock:
+        c = db.cursor()
+        _ensure_column(c, "devops_pipeline_scene", "is_pinned", "INTEGER NOT NULL DEFAULT 0", strict=True)
+        _ensure_column(c, "devops_pipeline_scene", "pinned_at", "VARCHAR(32) DEFAULT NULL", strict=True)
+        db.commit()
+
+
+register_migration(
+    # 2026-11-10：202611100001 已被 add-agent-tasks-trace-context 占用（rebase 到
+    # weekly-mys 后同号不同名，本迁移会被判「已执行」永久跳过）→ 顺延到
+    # 202611100003（202611100002 已被 create-merge-gate-log-table 占用）。
+    # 迁移只做 _ensure_column 幂等补列，重跑无损。
+    version="202611100003",
+    name="scene-pin-columns",
+    kind="safe",
+    fn=_fn_scene_pin_columns,
 )
 
 
@@ -3063,9 +3783,13 @@ def _run_migrations_with_conn(conn, registry: Optional[List[Migration]] = None,
     def _applied_versions() -> dict:
         try:
             c = conn.cursor()
-            c.execute("SELECT version, checksum FROM grape_t_schema_migrations")
-            return {r[0]: (r[1] or "") for r in c.fetchall()}
-        except Exception:
+            c.execute("SELECT version, name, checksum FROM grape_t_schema_migrations")
+            return {r[0]: ((r[1] or ""), (r[2] or "")) for r in c.fetchall()}
+        except Exception as _read_err:
+            # Issue #1412 QA Optional：区分「读失败」与「版本表为空」，避免线上
+            # 只能看到 legacy 全量重放却无从定位异常。全新库尚无该表时 SELECT
+            # 也会失败，属预期，故仅 warning 不做 fail-closed。
+            log.warning(f"读取 grape_t_schema_migrations 失败，按空表处理: {_read_err}")
             return {}
 
     applied = _applied_versions()
@@ -3106,10 +3830,26 @@ def _run_migrations_with_conn(conn, registry: Optional[List[Migration]] = None,
         # 盖帽后重读（上面全量迁移可能已含注册表内的早期迁移语义，直接进入增量判定）
         applied = _applied_versions()
 
+    # 同号不同名守卫（Issue #1412）：撞号 ≠ 普通 checksum 漂移。
+    # 存量库可能已被其它分支的同号迁移盖章（name 不同），此时 pending 判定按
+    # version 会把它永久判「已执行」，本分支的迁移 fn 永不执行 —— 必须 ERROR 报出，
+    # 让 operator 能据此 renumber。行为仍是跳过不执行（fail-safe，不阻断启动）。
+    for m in registry:
+        if m.version not in applied:
+            continue
+        recorded_name = applied[m.version][0]
+        if recorded_name and recorded_name != m.name:
+            log.error(
+                f"迁移版本号撞号（同号不同名，非普通 checksum 漂移）: version={m.version} "
+                f"库内盖章名={recorded_name} 本次注册名={m.name}。该号在目标库已被其它分支的"
+                f"迁移占用，本次迁移会被判「已执行」而永久跳过、其 DDL 不会执行。"
+                f"修复指引：把本次迁移 renumber 到未占用号（日期+序号顺延），并先核对目标库 "
+                f"`SELECT version, name FROM grape_t_schema_migrations` 的现值。")
+
     # checksum 漂移告警（fail-safe：不阻断不重跑；先于 pending 判定，0 pending 时也要查）
     for m in registry:
         if m.version in applied and m.fn is not None:
-            recorded = applied.get(m.version, "")
+            recorded = applied[m.version][1]
             current = _fn_checksum(m.fn)
             if recorded and current and recorded != current:
                 log.warning(
@@ -3182,7 +3922,24 @@ def run_pending_migrations() -> None:
 
 
 def _run_all_migrations():
-    """init_database 的迁移段（顺序与历史一致；MySQL/SQLite 共用，避免两处清单漂移）。"""
+    """init_database 的迁移段（顺序与历史一致；MySQL/SQLite 共用，避免两处清单漂移）。
+
+    🧊 老轨已冻结（FROZEN LEGACY TRACK）——只跑两种场景：
+    ① 全新库（grape_t_schema_migrations 为空）首跑全量；
+    ② run_pending_migrations 执行器自身异常时的兜底重放。
+    存量库（已盖 legacy-stamp 202610300001）启动时**完全不执行本函数**。
+
+    ⛔ 所以：任何新增的补列 / 补表 / 回填 / 补索引，一律写成
+       register_migration(version, name, kind, fn) 注册式迁移，
+       **不要加到本函数里**（加了不报错、也不执行，直到线上查询报 1054 才暴露）。
+    事故样本：Issue #995 issue.vcs_exists（2026-11-06 升级后列表静默变空）、
+             Issue #785 grape_t_patrol_findings（表永远不建）。
+
+    🧪 守卫：tests/atomic/test_migration_track_guard.py 用 AST 比对本函数里的
+       迁移调用清单与 LEGACY_TRACK_FROZEN —— 少一条（删了要同步改常量）或多一条
+       （有人又往老轨塞东西）都会让测试变红。要往这里加东西，正确做法是
+       register_migration，不是改这个常量。
+    """
     _tasks_to_issue_rename_pre_create()
     _create_tables()
     _seed_admin_accounts()
@@ -3231,6 +3988,213 @@ def _run_all_migrations():
         _migrate_a2a_idempotency_key()
     except Exception as _e:
         log.warning(f"A2A idempotency key migration failed: {_e}")
+    # ===== Issue #805: issue.created_by 列兜底（SQLite 新库建表已含，存量库/MySQL 幂等补列）=====
+    try:
+        _migrate_issue_created_by()
+    except Exception as _e:
+        log.warning(f"Issue #805 issue created_by migration failed: {_e}")
+
+
+def _migrate_issue_vcs_exists():
+    """Issue #995：issue 表幂等补 VCS 存在性列（存量回填由 issue_vcs_index 异步执行）。
+
+    - SQLite 新库：CREATE TABLE issue 已含该列，_ensure_column 自动跳过；
+    - 存量 SQLite / MySQL：_ensure_column 走 ALTER TABLE ADD COLUMN（幂等可重跑）；
+    - vcs_exists 默认 1（未知/存在），vcs_checked_at 空表示尚未校验。
+
+    失败必须抛出（不吞）——迁移执行器约定「fn 抛错=不盖章，下次启动幂等重试」，
+    吞掉异常会导致列没建成却把版本号盖死，存量库永远等不到补列。
+
+    两道保险（QA 审查 M1：_ensure_column 的人工清单分支默认只 log 不抛）：
+    ① 两个补列都传 strict=True，降级算法全失败时直接 raise；
+    ② 补完再显式回验列存在，缺一个就 raise —— 印章只在 schema 真落地后才写。
+    """
+    from src.session_manager import db, db_lock
+    wanted = {"vcs_exists", "vcs_checked_at"}
+    with db_lock:
+        c = db.cursor()
+        _ensure_column(c, "issue", "vcs_exists", "INTEGER NOT NULL DEFAULT 1", strict=True)
+        # TEXT 列带 DEFAULT 无法 INSTANT/INPLACE，须 allow_copy 兜底（issue 表行数级别可接受）
+        _ensure_column(c, "issue", "vcs_checked_at", "TEXT DEFAULT NULL",
+                       allow_copy=True, strict=True)
+        db.commit()
+        cols = {r[1] for r in c.execute("PRAGMA table_info(issue)").fetchall()}
+        missing = wanted - cols
+        if missing:
+            raise RuntimeError(
+                f"issue.vcs_exists migration finished but columns still missing: {sorted(missing)}")
+
+
+# 注册式迁移：老轨（_run_all_migrations）在版本表盖帽后即冻结，补列写在那里永远不会执行。
+# 本迁移与 _fn_create_grape_t_patrol_findings 同因——存量库靠新轨增量补列。
+# 已知时序（QA 审查 I3）：若某次启动同时满足「版本表为空」+「破坏性 DDL 被
+# min_code_version 门槛或 MDL 超时拦截」，执行器会先 return 不盖帽、本轮不跑 pending，
+# 补列推迟到下一次启动（幂等，不丢）。真正的新库建表已含两列，不受影响。
+register_migration(
+    "202611060004", "issue995_issue_vcs_exists_columns", "safe",
+    _migrate_issue_vcs_exists)
+
+
+def _fn_normalize_legacy_health_column(conn=None) -> int:
+    """Issue #1496：遗留 health 列按 status+last_seen_at 口径幂等回填。
+
+    背景：现 DDL _AGENT_RUNTIMES_DDL 只有 healthy INTEGER，没有 health 列；
+    库中出现的 health 是历史版本遗留列（读路径已不消费，展示侧统一走
+    derive_runtime_health(status, last_seen_at) 派生）。旧写入方单独写
+    health 不同步 status → 「health='online' AND status<>'online'」自相矛盾行
+    （存量 4 条 id 23259–23262），测试直读库即红、列表/派发口径分叉（#758 表现）。
+
+    裁定（Spec 拍板）：status 为唯一真源；health 仅允许作为派生展示值。
+    本迁移【只规范化不删列】（存在无法立即下线的外部写入方），登记待删除；
+    回填值必须由 status+last_seen_at 派生——绝不信旧 health 值，防止真失联
+    引擎被旧 health='online' 反向"复活"。
+
+    幂等：值级幂等（health 已等于派生目标值的行不再 UPDATE），重复执行零变更；
+    无遗留列时 no-op 且不引入新列。
+    conn 可选：测试注入独立连接；缺省用全局 db（受 db_lock 保护）。
+    返回本次实际改写的行数（幂等断言用）。
+    """
+    _own = conn is None
+    if _own:
+        conn = db
+    try:
+        from src.session_manager import _is_mysql_backend
+        is_mysql = _is_mysql_backend()
+    except Exception:
+        is_mysql = False
+    from src.runtime.health import derive_runtime_health
+    import time as _time
+
+    def _has_col() -> bool:
+        if is_mysql:
+            c.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='agent_runtimes' "
+                "AND COLUMN_NAME='health'")
+            return bool(c.fetchone()[0])
+        # SQLite：PRAGMA table_info（mysql_compat Cursor 对 PRAGMA 特判翻译，
+        # 但本函数测试注入的是裸 sqlite3 连接，直接原生查询双方言通用）
+        try:
+            return any(r[1] == "health" for r in c.execute(
+                "PRAGMA table_info(agent_runtimes)").fetchall())
+        except Exception:
+            return False
+
+    changed = 0
+    with db_lock:
+        c = conn.cursor()
+        if not _has_col():
+            return 0
+        _ph = "%s" if is_mysql else "?"
+        c.execute(
+            f"SELECT id, status, last_seen_at, health, credential_id, installed, healthy "
+            f"FROM agent_runtimes "
+            f"WHERE health IS NOT NULL AND health != ''")
+        rows = c.fetchall()
+        now_ts = _time.time()
+        from src.runtime.health import derive_local_runtime_health
+        for rid, status, last_seen, health, cred, installed, healthy in rows:
+            # Issue #1496 返工：本机直连（cred0）按 #592 口径派生（installed+healthy），
+            # 不能用远端心跳口径——本机 last_seen 10min 才刷新，套 100s 新鲜度会把健康
+            # 的本机引擎回填成 recently_lost（制造新的矛盾行）。
+            if not (cred or 0):
+                target = derive_local_runtime_health(
+                    bool(installed if installed is not None else 1), bool(healthy))
+            else:
+                target = derive_runtime_health(status or "offline", last_seen, now_ts)
+            if (health or "") == target:
+                continue  # 值级幂等：已等不再 UPDATE
+            c.execute(
+                f"UPDATE agent_runtimes SET health={_ph} WHERE id={_ph} AND health={_ph}",
+                (target, rid, health))
+            changed += c.rowcount if c.rowcount and c.rowcount > 0 else 0
+        conn.commit()
+    if changed:
+        log.info(f"Issue #1496: 遗留 health 列回填 {changed} 行（按 status+last_seen 派生口径）")
+    return changed
+
+
+register_migration(
+    # 版本号取当前日期段顺延（全库 register_migration 现存最大 202611060004；202611080001 已被 #1497 占用 → 顺延 202611080002；
+    # 避开 #1412 撞号教训的 202611030004/20261105 0001/20261106 0001 已占号段）。
+    # 列不删、只按派生口径规范化 + 登记待删除（外部写入方下线后再清理）。
+    "202611080002", "issue1496_normalize_legacy_health_column", "safe",
+    _fn_normalize_legacy_health_column)
+
+
+def _fn_normalize_task_messages_created_at_default(conn=None) -> int:
+    """Issue #1495（B 项）：MySQL 侧 task_messages.created_at 默认值统一为 ISO+00:00（UTC）。
+
+    病根：MySQL 默认 `cast(now() as char)` 是**本地墙钟、空格分隔、无时区**的形态；
+    parse_dt 的 mysql 分支虽按 CST 正确解析这种值，但只要有写入方按 UTC 空格格式
+    （SQLite 口径）落库，就会产生 8h 偏差 → 活跃任务被判不活跃（实测复现）。
+
+    处理：
+    - SQLite：默认 `datetime('now')` 本身是 UTC，parse_dt 的 sqlite 分支按 UTC 解析，
+      无歧义 → **no-op**（SQLite 不支持 ALTER COLUMN 改默认值，新库沿用原 DDL）。
+    - MySQL：ALTER COLUMN ... SET DEFAULT 为元数据变更（8.0 起 INSTANT），
+      值形如 `2026-11-08T12:34:09.824507+00:00`，与写入侧 isoformat() 一致。
+
+    幂等：默认值已含 '+00:00' 直接跳过；重复执行零变更。
+    注意：表达式刻意不用 DATE_FORMAT('%%Y-...')——mysql_compat 参数化会把 `%` 转义成
+    `%%`，默认值退化为常量串（实测）；改用 CONCAT/REPLACE 拼装，表达式中无 `%`。
+    """
+    try:
+        from src.session_manager import _is_mysql_backend
+        if not _is_mysql_backend():
+            return 0
+    except Exception:
+        return 0
+    _own = conn is None
+    if _own:
+        conn = db
+    try:
+        with db_lock:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COLUMN_DEFAULT FROM information_schema.columns "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='task_messages' "
+                "AND COLUMN_NAME='created_at'")
+            row = c.fetchone()
+            if not row:
+                return 0            # 表不存在（初始化顺序）→ 跳过
+            _cur_default = str(row[0] or "")
+            if "+00:00" in _cur_default:
+                return 0            # 已是 ISO+00:00，幂等
+            c.execute(
+                "ALTER TABLE task_messages ALTER COLUMN created_at SET DEFAULT "
+                "(CONCAT(REPLACE(CAST(UTC_TIMESTAMP(6) AS CHAR), ' ', 'T'), '+00:00'))")
+            conn.commit()
+            log.info("Issue #1495: task_messages.created_at 默认值改为 ISO+00:00（UTC）")
+            return 1
+    except Exception as e:
+        log.warning(f"Issue #1495 default migration skipped: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+register_migration(
+    "202611080003", "issue1495_task_messages_created_at_default", "safe",
+    _fn_normalize_task_messages_created_at_default)
+
+
+def _migrate_issue_created_by():
+    """Issue #805：issue 表幂等补 `created_by TEXT DEFAULT ''` 列（创建人一等数据化）。
+
+    - SQLite 新库：CREATE TABLE issue 已含该列，_ensure_column 自动跳过；
+    - 存量 SQLite / MySQL：_ensure_column 走 ALTER TABLE ADD COLUMN（MySQL 经 mysql_compat 翻译）。
+    """
+    from src.session_manager import db, db_lock
+    try:
+        with db_lock:
+            c = db.cursor()
+            _ensure_column(c, "issue", "created_by", "TEXT DEFAULT ''")
+            db.commit()
+    except Exception as e:
+        log.warning(f"issue created_by column migration failed: {e}")
 
 
 def _migrate_a2a_idempotency_key():
@@ -4393,9 +5357,6 @@ def _migrate_tables():
         "ALTER TABLE events ADD COLUMN agent_logs TEXT DEFAULT '[]'",
         "ALTER TABLE events ADD COLUMN started_at TEXT DEFAULT ''",
         "ALTER TABLE events ADD COLUMN completed_at TEXT DEFAULT ''",
-        "ALTER TABLE devops_agent_session ADD COLUMN im_provider TEXT DEFAULT ''",
-        "ALTER TABLE devops_agent_session ADD COLUMN im_app_id TEXT DEFAULT ''",
-        "ALTER TABLE devops_agent_session ADD COLUMN im_app_secret TEXT DEFAULT ''",
         "ALTER TABLE devops_agent_session ADD COLUMN backend_session_id TEXT DEFAULT ''",
         "ALTER TABLE chat_conversations ADD COLUMN agent_session_id TEXT DEFAULT ''",
         "ALTER TABLE chat_conversations ADD COLUMN backend_session_id TEXT DEFAULT ''",
@@ -4438,14 +5399,6 @@ def _migrate_tables():
         "ALTER TABLE user_accounts ADD COLUMN github_id TEXT DEFAULT ''",
         "ALTER TABLE user_accounts ADD COLUMN github_api_token TEXT DEFAULT ''",
         "ALTER TABLE user_accounts ADD COLUMN github_login TEXT DEFAULT ''",
-        # 飞书 Bot Lease——集群部署保证同一 bot 同一时刻只有一个实例连 WebSocket
-        "ALTER TABLE global_im_bot_config ADD COLUMN bot_name VARCHAR(128) DEFAULT ''",
-        "ALTER TABLE global_im_bot_config ADD COLUMN lease_token VARCHAR(128) DEFAULT NULL",
-        "ALTER TABLE global_im_bot_config ADD COLUMN lease_expires_at DATETIME DEFAULT NULL",
-        "ALTER TABLE global_im_bot_config ADD COLUMN lease_owner VARCHAR(128) DEFAULT NULL",
-        "ALTER TABLE global_im_bot_config ADD COLUMN lease_acquired_at DATETIME DEFAULT NULL",
-        # SQLite 不支持 ALTER ADD COLUMN non-constant default（CURRENT_TIMESTAMP 会静默失败）
-        "ALTER TABLE global_im_bot_config ADD COLUMN updated_at TEXT DEFAULT ''",
         # ===== knowledge-obs-design：agent_shared_knowledge OBS 对象存储字段 =====
         "ALTER TABLE agent_shared_knowledge ADD COLUMN obs_key VARCHAR(512) DEFAULT ''",
         "ALTER TABLE agent_shared_knowledge ADD COLUMN content_hash VARCHAR(64) DEFAULT ''",
@@ -4479,6 +5432,10 @@ def _migrate_tables():
         "ALTER TABLE agent_runtimes ADD COLUMN health_reset_at VARCHAR(64) DEFAULT ''",
         # ===== Issue #658: 引擎角色标签（显式声明；空=按引擎类型默认角色映射兜底）=====
         "ALTER TABLE agent_runtimes ADD COLUMN role_tags TEXT DEFAULT ''",
+        # ===== Issue #865: 配置模型（worker 注册上报；legacy 盖帽库需手工执行同款 ALTER）=====
+        "ALTER TABLE agent_runtimes ADD COLUMN model_name TEXT DEFAULT ''",
+        "ALTER TABLE agent_runtimes ADD COLUMN model_source TEXT DEFAULT ''",
+        "ALTER TABLE agent_runtimes ADD COLUMN model_reported_at TEXT DEFAULT ''",
         # ===== Issue #498: 健康统计自愈留痕（失败衰减窗口有效失败数 + 最近失败时间）=====
         "ALTER TABLE runtime_health_scores ADD COLUMN failed_tasks_effective INTEGER DEFAULT 0",
         "ALTER TABLE runtime_health_scores ADD COLUMN last_failure_at TEXT DEFAULT ''",
@@ -4550,25 +5507,6 @@ def _migrate_tables():
         _rebuild_scene_market_unique()
     except Exception as e:
         log.warning(f"Scene market unique rebuild failed: {e}")
-    # 迁移 im 凭证到 im_bot_config 统一表
-    try:
-        with db_lock:
-            c = db.cursor()
-            # 迁移旧表 im_bot_config -> global_im_bot_config(保留 bot_type,secret 移入 devops_agent_session)
-            _tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-            if "im_bot_config" in _tables and "global_im_bot_config" not in _tables:
-                c.execute("ALTER TABLE im_bot_config RENAME TO global_im_bot_config")
-                db.commit()
-                log.info("Migrated table im_bot_config -> global_im_bot_config")
-            elif "im_bot_config" in _tables and "global_im_bot_config" in _tables:
-                c.execute("INSERT OR IGNORE INTO global_im_bot_config (bot_app_id, bot_type) SELECT bot_app_id, bot_type FROM im_bot_config")
-                # 补齐 secret 到 devops_agent_session
-                c.execute("UPDATE devops_agent_session SET im_app_secret=(SELECT bot_app_secret FROM im_bot_config WHERE bot_app_id=devops_agent_session.im_app_id) WHERE im_app_id!='' AND im_app_secret=''")
-                c.execute("DROP TABLE im_bot_config")
-                db.commit()
-                log.info("Migrated im_bot_config -> global_im_bot_config (data moved)")
-    except Exception as e:
-        log.info(f"Migrate global_im_bot_config skipped: {e}")
     # 迁移旧表 chat_config -> chat_agent_session(合并 user 配置)
     try:
         with db_lock:
@@ -4580,8 +5518,8 @@ def _migrate_tables():
                     if not r[0]:
                         continue
                     sid = f"sess-cfg-{r[0]}"
-                    c.execute("INSERT OR REPLACE INTO chat_agent_session (id, user_id, repo_key, backend, skill, im_app_id, im_app_secret, im_provider, created_at, last_active_at) VALUES (?,?,?,?,?,?,?,'feishu',datetime('now'),datetime('now'))",
-                              (sid, r[0], "", r[1] or "opencode", r[2] or "", r[3] or "", r[4] or ""))
+                    c.execute("INSERT OR REPLACE INTO chat_agent_session (id, user_id, repo_key, backend, skill, created_at, last_active_at) VALUES (?,?,?,?,?,datetime('now'),datetime('now'))",
+                              (sid, r[0], "", r[1] or "opencode", r[2] or ""))
                 db.commit()
                 log.info("Migrated chat_config -> chat_agent_session")
     except Exception as e:
@@ -4717,23 +5655,6 @@ def _migrate_tables():
                         log.info("Migrated repo_im_group_binding: chat_id -> im_chat_id")
     except Exception as e:
         log.warning(f"Migrate repo_im_group_binding columns failed: {e}")
-    # 迁移 repo_im_group_binding 的 im_app_id='default' -> Chat Bot app_id(清理 default 兜底账户)
-    try:
-        with db_lock:
-            c = db.cursor()
-            _tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-            if "repo_im_group_binding" in _tables:
-                c.execute("SELECT COUNT(*) FROM repo_im_group_binding WHERE im_app_id='default' OR im_app_id IS NULL OR im_app_id=''")
-                cnt = c.fetchone()[0]
-                if cnt > 0:
-                    c.execute("SELECT bot_app_id FROM global_im_bot_config WHERE bot_type='chat_bot' LIMIT 1")
-                    row = c.fetchone()
-                    if row and row[0]:
-                        c.execute("UPDATE repo_im_group_binding SET im_app_id=? WHERE im_app_id='default' OR im_app_id IS NULL OR im_app_id=''", (row[0],))
-                        db.commit()
-                        log.info(f"Migrated {cnt} repo_im_group_binding im_app_id='default' -> {row[0]}")
-    except Exception as e:
-        log.warning(f"Migrate repo_im_group_binding im_app_id failed: {e}")
     # 清理历史 bot_username 占位值 + 纠正跨平台回填错误
     # Issue #345: 按 repo_key 前缀分流——github: 取 github_bot_username，其余取 GitCode bot name
     try:
@@ -4828,7 +5749,7 @@ def _migrate_tables():
                 log.info("Migrated table agent_sessions -> devops_agent_session")
             elif "agent_sessions" in _tables and "devops_agent_session" in _tables:
                 # 新表已被创建但旧表仍存在(历史库),迁移数据后删除旧表
-                c.execute("INSERT OR IGNORE INTO devops_agent_session (id, repo_key, agent_type, backend, skill, oc_session_id, repo_gitcode_token, status, created_at, last_active_at, im_provider, im_app_id, im_app_secret) SELECT id, repo_key, agent_type, backend, skill, oc_session_id, repo_gitcode_token, status, created_at, last_active_at, im_provider, im_app_id, im_app_secret FROM agent_sessions")
+                c.execute("INSERT OR IGNORE INTO devops_agent_session (id, repo_key, agent_type, backend, skill, oc_session_id, repo_gitcode_token, status, created_at, last_active_at) SELECT id, repo_key, agent_type, backend, skill, oc_session_id, repo_gitcode_token, status, created_at, last_active_at FROM agent_sessions")
                 c.execute("DROP TABLE agent_sessions")
                 db.commit()
                 log.info("Migrated agent_sessions data into devops_agent_session and dropped agent_sessions")
@@ -4884,26 +5805,6 @@ def _migrate_tables():
             log.info("Dropped legacy tables: agent_type_config, user_skills, repo_skill_mapping")
     except Exception as e:
         log.warning(f"Drop legacy skill tables failed: {e}")
-    # 迁移 devops_agent_session:vod_bot_app_id -> im_app_id(通用化,保留 im_* 通用字段)
-    try:
-        with db_lock:
-            c = db.cursor()
-            cols = [r[1] for r in c.execute("PRAGMA table_info(devops_agent_session)").fetchall()]
-            if "vod_bot_app_id" in cols:
-                # 1. vod_bot_app_id -> im_app_id + im_provider='feishu' + im_app_secret 补齐
-                c.execute("UPDATE devops_agent_session SET im_app_id=vod_bot_app_id, im_provider='feishu' WHERE vod_bot_app_id!='' AND vod_bot_app_id IS NOT NULL")
-                _tables2 = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-                if "im_bot_config" in _tables2:
-                    c.execute("UPDATE devops_agent_session SET im_app_secret=(SELECT bot_app_secret FROM im_bot_config WHERE bot_app_id=devops_agent_session.im_app_id) WHERE im_app_id!='' AND im_app_secret=''")
-                db.commit()
-                # 2. 删除 vod_bot_app_id 列
-                _ok = _destructive_ddl(c, "ALTER TABLE devops_agent_session DROP COLUMN vod_bot_app_id",
-                                       kind_hint="cleanup")
-                db.commit()
-                if _ok:
-                    log.info("Migrated devops_agent_session vod_bot_app_id -> im_app_id, dropped vod_bot_app_id")
-    except Exception as e:
-        log.warning(f"Migrate vod_bot_app_id -> im_app_id failed: {e}")
     # 迁移 devops_agent_session.oc_session_id -> backend_session_id
     try:
         with db_lock:
@@ -5201,6 +6102,10 @@ def _migrate_tables():
             # §6.4 追踪：trace_id（任务级轨迹）+ pipeline_trace_id（同一 issue 流程共享）
             _ensure_column(c, "agent_tasks", "trace_id", "TEXT DEFAULT ''")
             _ensure_column(c, "agent_tasks", "pipeline_trace_id", "TEXT DEFAULT ''")
+            # 架构守护 BLOCKED-2（2026-11-09）：MR-2 跨进程 trace 串联依赖该列。
+            # 之前只在 dev 库手工加列，新库/未 ALTER 的存量库会被 _avail 列过滤静默剔除，
+            # 导致 worker 取不到 traceparent、execute/finish 各自成为新根 trace。
+            _ensure_column(c, "agent_tasks", "trace_context", "TEXT DEFAULT ''")
             # 告警策略层（P1-1）：规则侧节流/聚合/时段/升级 + 事件侧通知状态
             # P2-1 SLO：采样表补"在线"列（老库迁移；历史行只能为 0 = 数据不足）
             _ensure_column(c, "obs_runtime_samples", "online", "INTEGER NOT NULL DEFAULT 0")

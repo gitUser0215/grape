@@ -28,23 +28,43 @@ _PRIO_REPO = 10
 _PRIO_GLOBAL = 50
 _PRIO_LOCAL = 90
 
-# ===== Issue #658：引擎角色（role_tags）与节点角色（agent_type）硬匹配 =====
-# 引擎类型 → 默认角色集（帮助文档分工：opencode/codearts→Coding/Issue/QA、hermes→VOD/Chat/SRE）。
-# 引擎注册可显式声明 role_tags 覆盖默认映射；未声明且类型不在映射内 → None（不限角色，存量零配置兼容）。
-_DEFAULT_ENGINE_ROLE_TAGS = {
-    "opencode": ["coding", "issue", "qa"],
-    "codearts": ["coding", "issue", "qa"],
-    "hermes": ["vod", "chat", "sre"],
-}
+# ===== Issue #658 修订（2026-11-03 用户裁定）：引擎角色不按类型默认映射 =====
+# 撤销 opencode/codearts/hermes 的类型刻板映射——引擎能力与引擎类型无关，
+# 所有引擎默认不限角色；仅显式声明 role_tags 时才按声明硬过滤。
+# （类型默认映射曾把 hermes 锁在 vod/chat/sre、opencode 锁在 coding/issue/qa，
+# 误伤跨类型绑定的合法场景；保留显式声明轨，默认口径 = 不限。）
+_DEFAULT_ENGINE_ROLE_TAGS: dict = {}
 
 # 已知节点角色全集（认领侧守卫仅对角色类 pool_tag 生效；自定义路由 tag 如 "b520tag"
-# 不是角色，不受角色硬过滤约束）
-_KNOWN_AGENT_ROLES = {"coding", "issue", "qa", "vod", "chat", "sre"}
+# 不是角色，不受角色硬过滤约束）。Issue #955：节点 id 即角色名（agent_type），
+# 场景写侧/读侧统一引用该公开常量做枚举校验与 id 优先匹配（避免各模块重复定义漂移）。
+KNOWN_AGENT_ROLES = {"coding", "issue", "qa", "vod", "chat", "sre"}
+
+# 兼容别名（既有内部引用保留；外部模块请使用 KNOWN_AGENT_ROLES）
+_KNOWN_AGENT_ROLES = KNOWN_AGENT_ROLES
+
+
+def node_agent_role(node) -> str:
+    """Issue #955：解析节点角色名（agent_type）——id 优先、tag 兜底。
+
+    节点 id 为角色名（标准写侧口径），tag 为展示用阶段名（可为中文等任意值，
+    仅存量 tag-only 节点兜底）；非 dict 节点返回空串。
+    """
+    if not isinstance(node, dict):
+        return ""
+    return (node.get("id") or node.get("tag") or "").strip()
+
+
+def node_matches_agent_role(node, role) -> bool:
+    """Issue #955：节点是否匹配指定角色——id 优先、tag 兜底（存量兼容）。"""
+    if not isinstance(node, dict) or not role:
+        return False
+    return node.get("id") == role or node.get("tag") == role
 
 
 def is_agent_role(tag: str) -> bool:
     """pool_tag 是否为已知节点角色（Issue #658 认领侧守卫的适用判定）。"""
-    return (tag or "").strip().lower() in _KNOWN_AGENT_ROLES
+    return (tag or "").strip().lower() in KNOWN_AGENT_ROLES
 
 
 def engine_role_tags(engine_name: str, role_tags_json: str = "") -> list | None:
@@ -182,25 +202,25 @@ def _member_scope(m: dict, repo: str) -> str:
 
 
 def _health_ok(m: dict) -> bool:
-    """健康判定：远端按 status='online' + last_seen_at 新鲜；本机按 installed+healthy。
+    """健康判定：唯一真源 src.runtime.health.engine_health_ok（Issue #592 / #259 / #1487 /
+    #1496 收敛）——派发与认领共用同一把尺子，禁止在此复制判定逻辑。
 
-    远端引擎（credential_id>0）必须 last_seen_at 在 _RUNTIME_STALE_SECONDS 内才算健康，
-    防止 AI DevSpace 环境被删后 runtime 行残留 status=online 但实际不可达（模式 QQ）。
+    status 是 agent_runtimes 在线态唯一真源；遗留 health 列是派生展示值，
+    不参与派发判定（列表侧展示统一走 derive_runtime_health）。
+    心跳缺失（last_seen_at 空/解析失败）与超时同判不可用——status=online 但从未
+    心跳的幽灵行不得被派发放行（对齐 derive_runtime_health → recently_lost）。
+
+    远端引擎（credential_id>0）必须 status 在线且 last_seen_at 在 _RUNTIME_STALE_SECONDS 内，
+    防止 AI DevSpace 环境被删后 runtime 行残留 status=online 但实际不可达（模式 QQ）；
+    本机直连（credential_id=0）按 installed+healthy，不判心跳（本机不参与 15s 心跳）。
+
+    认领侧（service._check_pool_engines_reachable）调用同一函数——两侧口径必须一致，
+    否则会出现「派发认为健康、认领认为失联」的任务入队即失败（Issue #1487）。
     """
-    cid = m.get("credential_id") or 0
-    if cid == 0:
-        return bool(m.get("installed")) and bool(m.get("healthy"))
-    if (m.get("status") or "") != "online":
-        return False
-    # 远端引擎检查心跳新鲜度
-    last_seen = m.get("last_seen_at") or ""
-    if last_seen:
-        from src.runtime.health import parse_dt
-        import time as _time
-        ts = parse_dt(last_seen)
-        if ts is not None and _time.time() - ts > _RUNTIME_STALE_SECONDS:
-            return False
-    return True
+    from src.runtime.health import engine_health_ok
+    return engine_health_ok(m.get("credential_id"), m.get("status"), m.get("healthy"),
+                            m.get("installed"), m.get("last_seen_at"),
+                            stale_seconds=_RUNTIME_STALE_SECONDS)
 
 
 # ===== 派发决策可观测性（Issue #605）=====
@@ -412,14 +432,15 @@ def _repo_user_id(repo_key: str, issue_creator: str = "") -> int:
     """从 user_repos 表反查 repo_key 对应的 user_id。
 
     优先按 issue_creator（GitCode 用户名）查 unified_user_mapping 获取 user_id；
-    issue_creator 为空或查不到时，增加 user_accounts.username/gitcode_id 直接查询作为二级回退；
-    仍查不到时，user_repos 回退按创建者过滤（JOIN user_accounts），而非取第一个 join 用户。
+    issue_creator 为空或查不到时，改查 grape_accounts/external_identities
+    （平台 login 匹配 external_login，或平台数字 ID 匹配 external_id）作为二级回退；
+    仍查不到时，user_repos 回退按创建者过滤（JOIN grape_accounts），而非取第一个 join 用户。
 
     Issue #76 修复：原逻辑按 user_id ASC 取第一条 is_join=1 的记录，
     对于多用户仓库会返回"最早加入的用户"而非 Issue 创建者，
     导致 scope=user 引擎无法通过 claim_by_tag 认领任务。
 
-    Issue #211 增强：增加 user_accounts 二级回退 + user_repos 按创建者过滤，
+    Issue #211 增强：二级回退 + user_repos 按创建者过滤，
     确保已注册 grape 的项目组成员能正确映射而非落为 user_id=0。
     """
     if not repo_key:
@@ -1129,10 +1150,10 @@ def query_engines(repo_key: str, scope: str, agent_type: str = "", username: str
 
 # ====== 引擎绑定真实性同步（docs/weekly-06/engine-binding-truth-sync-design.md）======
 
-# 引擎离线判定为真死、触发场景绑定清理的阈值（秒）。默认 8h：
-# 心跳周期 15s，8h 无恢复 = 连续 ~1920 个心跳周期全丢，机器不会自己回来。
-# 置 0 禁用自动解绑（只提示不清理）。
-_ENGINE_DETACH_AFTER_SECONDS = int(os.environ.get("ENGINE_DETACH_AFTER_SECONDS", "28800"))
+# 引擎离线判定为真死、触发场景绑定清理的阈值（秒）。默认 0 = 禁用自动解绑（只提示不清理）；
+# 需要自动清理时显式设置 ENGINE_DETACH_AFTER_SECONDS（如 28800 = 8h：心跳 15s，8h 无恢复
+# = 连续 ~1920 个心跳周期全丢，机器不会自己回来）。
+_ENGINE_DETACH_AFTER_SECONDS = int(os.environ.get("ENGINE_DETACH_AFTER_SECONDS", "0"))
 
 
 def cleanup_scene_engine_bindings(rid_list: list) -> int:

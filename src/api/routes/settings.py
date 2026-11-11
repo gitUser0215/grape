@@ -1,3 +1,4 @@
+
 """Settings 路由：凭据、通知偏好、GitCode Repo、Backend Runtimes"""
 import json
 from datetime import datetime, timedelta
@@ -1111,9 +1112,12 @@ def get_agent_runtimes(user: dict = Depends(require_org_member), page: int = 1, 
             " ".join(rt.get("local_skills") or []),
         ]).lower()]
     if type:
+        # 类型过滤用 _engine_type_of 规范化后精确匹配（原 `_tlow in name` 子串
+        # 匹配会让 "aishell" 筛选带出 aishell-dsh——与派发侧 includes 误命中
+        # 同族问题，2026-11-06 页面验收发现）。type 值本身即 _engine_type_of 派生。
         _tlow = type.lower()
-        visible_runtimes = [rt for rt in visible_runtimes if _tlow in (
-            rt.get("instance_name") or rt.get("name") or "").lower()]
+        visible_runtimes = [rt for rt in visible_runtimes
+                            if _engine_type_of(rt).lower() == _tlow]
     if scene:
         _scenes = [s.strip().lower() for s in scene.split(",") if s.strip()]
         visible_runtimes = [rt for rt in visible_runtimes
@@ -1130,16 +1134,19 @@ def get_agent_runtimes(user: dict = Depends(require_org_member), page: int = 1, 
     health_stats = _health_stats(visible_runtimes)
 
     # Issue #185: 分页（page_size>0 时对 visible_runtimes 切片，total 为过滤后总数）
+    # Issue #865：仅对当前页批量附加模型字段（单条 GROUP BY，无 N+1）
     total_runtimes = len(visible_runtimes)
     if page_size and page_size > 0:
         _page = max(page, 1)
         _offset = (_page - 1) * page_size
         paged_runtimes = visible_runtimes[_offset:_offset + page_size]
+        _attach_engine_models(paged_runtimes)
         return {"runtimes": paged_runtimes, "devices": devices,
                 "total": total_runtimes, "page": _page, "page_size": page_size,
                 "avail_scopes": _avail_scopes, "avail_types": _avail_types,
                 "avail_scenes": _avail_scenes, "avail_tags": _avail_tags,
                 "health_stats": health_stats}
+    _attach_engine_models(visible_runtimes)
     return {"runtimes": visible_runtimes, "devices": devices, "total": total_runtimes,
             "avail_scopes": _avail_scopes, "avail_types": _avail_types,
             "avail_scenes": _avail_scenes, "avail_tags": _avail_tags,
@@ -1147,8 +1154,25 @@ def get_agent_runtimes(user: dict = Depends(require_org_member), page: int = 1, 
 
 
 def _engine_type_of(rt: dict) -> str:
-    """从引擎名派生类型标签（与前端 _availTypes 的 includes 判定一致）。"""
+    """从引擎名派生类型标签——走 canonical_engine 查表后转展示类型名
+    （canonical 是后端键：aishell/hwcloud → hwcloud；本函数是页面类型：
+    旧 AI Shell 显示 aishell、新引擎 aishell-dsh，与前端 _availTypes 一致）。
+    非前缀形态的历史名保留 includes 兜底（旧轨判定不变）。"""
     n = (rt.get("instance_name") or rt.get("name") or "").lower()
+    if not n:
+        return ""
+    from src.runtime.instances import canonical_engine
+
+    c = canonical_engine(n)
+    if c == "aishell-dsh":
+        return "aishell-dsh"
+    if c == "hwcloud":
+        return "aishell"
+    if c != "opencode":
+        return c
+    # 旧轨兜底：名字中段包含引擎词的历史形态（与改造前 includes 判定一致）
+    if "aishell-dsh" in n:
+        return "aishell-dsh"
     if "aishell" in n or "hwcloud" in n:
         return "aishell"
     if "hermes" in n:
@@ -1174,6 +1198,69 @@ def _health_stats(items: list) -> dict:
             counts[h] += 1
     counts["total"] = len(items)
     return counts
+
+
+# ====== Issue #865：引擎模型展示（配置模型 + 最近实际使用模型）======
+
+_RECENT_MODELS_TOP_N = 3
+
+
+def _recent_models_by_runtime(runtime_ids: list[int]) -> dict[int, list[dict]]:
+    """按 runtime_ids 批量聚合 obs_llm_usage 的最近实际使用模型（top N）。
+
+    单条 GROUP BY（engine_id × model 维度一次查询，避免 N+1），
+    top N 在应用层排序（count desc → last_used desc）。
+    返回 {runtime_id: [{model, count, last_used_at}, ...]}；无用量/异常返回空 dict。
+    安全约束（Issue #865 Spec）：仅聚合模型名字段，不取 base_url/api_key。
+    """
+    ids = [int(rid) for rid in (runtime_ids or []) if rid]
+    if not ids:
+        return {}
+    from src.session_manager import db, db_lock
+    out: dict[int, list[dict]] = {}
+    try:
+        with db_lock:
+            c = db.cursor()
+            ph = ",".join("?" * len(ids))
+            c.execute(
+                f"SELECT engine_id, model_key, model_raw, COUNT(*) AS cnt, MAX(created_at) AS last_used "
+                f"FROM obs_llm_usage WHERE engine_id IN ({ph}) GROUP BY engine_id, model_key, model_raw",
+                ids)
+            for eng_id, m_key, m_raw, cnt, last_used in c.fetchall():
+                model = str(m_key or m_raw or "").strip()
+                if not model:
+                    continue
+                out.setdefault(int(eng_id or 0), []).append(
+                    {"model": model[:120], "count": int(cnt or 0), "last_used_at": last_used or ""})
+    except Exception as e:
+        log.warning(f"recent_models aggregation failed: {e}")
+        return {}
+    for rows in out.values():
+        rows.sort(key=lambda r: (-r["count"], r["last_used_at"]))
+        del rows[_RECENT_MODELS_TOP_N:]
+    return out
+
+
+def _attach_engine_models(runtimes: list[dict]) -> None:
+    """为列表/详情的引擎行附加模型字段（Issue #865）。
+
+    - recent_models：obs_llm_usage 聚合（批量单查，无 N+1）
+    - 配置模型：DB model_name（worker 上报）；本机直连（credential_id=0）且未上报时
+      服务端读本机配置兜底（model_source=local_config，复用 worker 同一解析器）
+    仅附加模型名字段，绝不输出 base_url/api_key/环境变量值。
+    """
+    from src.runtime.engine_model import detect_engine_model
+    recent = _recent_models_by_runtime([rt.get("id") for rt in runtimes])
+    for rt in runtimes:
+        rt["recent_models"] = recent.get(rt.get("id"), [])
+        if not (rt.get("model_name") or "") and (rt.get("credential_id") or 0) == 0:
+            try:
+                _m = detect_engine_model(rt.get("name") or "")
+            except Exception:
+                _m = ""
+            if _m:
+                rt["model_name"] = _m
+                rt["model_source"] = "local_config"
 
 
 def _runtime_health(rt: dict, now: float) -> str:
@@ -1322,6 +1409,8 @@ def _build_runtime_devices(db, db_lock, cred_map, visible_credential, valid_user
                 {"id": x[0], "name": _td2(x[1]), "version": x[2], "healthy": bool(x[3]),
                  "installed": bool(x[4]),
                  "instance_name": instance_name(x[1], cred.get("device_name", ""), cid),
+                 # Issue #1310：承载引擎 chip 显示「引擎名（凭据名）」——补凭据名 worker_name
+                 "worker_name": cred.get("name", ""),
                  "health": derive_runtime_health(x[5], x[6], now),
                  "local_skills": _json.loads(x[7] or "[]") if x[7] else [],
                  "skill_scan_result": _json.loads(x[8] or "[]") if x[8] else [],
@@ -1382,6 +1471,8 @@ def _build_runtime_devices(db, db_lock, cred_map, visible_credential, valid_user
                 "id": rt["id"], "name": rt["name"], "version": rt.get("version", ""),
                 "healthy": rt.get("healthy", False), "installed": rt.get("installed", False),
                 "instance_name": rt.get("instance_name", rt.get("name", "")),
+                # Issue #1310：本机直连按 host_name 兜底凭据名
+                "worker_name": _hn,
                 "health": rt.get("health", "offline"),
                 "local_skills": rt.get("local_skills", []),
                 "skill_scan_result": rt.get("skill_scan_result", []),
@@ -1406,6 +1497,8 @@ def _build_runtime_devices(db, db_lock, cred_map, visible_credential, valid_user
                 "id": rt["id"], "name": rt["name"], "version": rt.get("version", ""),
                 "healthy": rt.get("healthy", False), "installed": rt.get("installed", False),
                 "instance_name": rt.get("instance_name", rt.get("name", "")),
+                # Issue #1310：本机直连按 host_name 兜底凭据名
+                "worker_name": _hn,
                 "health": rt.get("health", "offline"),
                 "local_skills": rt.get("local_skills", []),
                 "skill_scan_result": rt.get("skill_scan_result", []),

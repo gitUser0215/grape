@@ -58,6 +58,7 @@ from src.api.issues_center import (  # noqa: F401
     _get_issue_title,
     _get_task_issue_info,
     _get_user_id_by_gitcode,
+    _get_gitcode_user_by_user_id,
     _patch_github_issue_body,
     _patch_issue_body,
     _post_gitcode_issue,
@@ -189,10 +190,11 @@ def ensure_issue_task(repo_key: str, issue_number: int, title: str = "",
             _subtask_val = subtask_mode if subtask_mode >= 0 else _get_issue_subtask_mode(repo_key, issue_number)
             _parent_val = _get_issue_parent(repo_key, issue_number)
             c.execute(
-                "INSERT INTO issue (user_id, assignee, repo_key, issue_number, title, task_description, status, is_subtask_mode, parent_issue_number, parent_issue_id, org_id) "
-                "VALUES (?,?,?,?,?,?,'active',?,?,?,?)",
+                "INSERT INTO issue (user_id, assignee, repo_key, issue_number, title, task_description, status, is_subtask_mode, parent_issue_number, parent_issue_id, org_id, created_by) "
+                "VALUES (?,?,?,?,?,?,'active',?,?,?,?,?)",
                 (user_id, target, repo_key, issue_number, title, description,
-                 _subtask_val, _parent_val, _get_issue_parent_id(repo_key, issue_number), org_id)
+                 _subtask_val, _parent_val, _get_issue_parent_id(repo_key, issue_number), org_id,
+                 sender.strip() or _get_gitcode_user_by_user_id(user_id or 0))
             )
             db.commit()
             task_id = c.lastrowid
@@ -209,6 +211,14 @@ def ensure_issue_task(repo_key: str, issue_number: int, title: str = "",
         except Exception as e:
             log.warning(f"ensure_issue_task conversation link failed: {e}")
     return task_id
+
+
+def _feishu_api_for_ctx(ctx):
+    """按 ctx 的 app_id 取 FeishuAsync（旧 IM 下线 A2 M2：不再依赖 BotManager.api）。"""
+    if not ctx:
+        return None
+    from src.im.engine_wiring import feishu_api
+    return feishu_api(getattr(ctx, "app_id", "") or "")
 
 
 @router.post("/notify", operation_id="tasks_notify", summary="Task assign/notify (Agent runtime)", description="Called by issue agents after assign/reassign/takeover: creates a task, refreshes the assignee, writes the conversation and sends static template + Feishu notifications. Session-only (tk_), repo scope must match.")
@@ -271,14 +281,12 @@ async def notify_task(body: TaskNotifyBody, request: Request,
     if not open_id:
         log.warning(f"Task notify: assignee={body.assignee} 无飞书 open_id（unified_user_mapping.feishu_open_id 为空），跳过飞书通知 task_id={task_id} issue=#{body.issue_number}")
     cfg = get_chat_config(user_id) if user_id else {"backend": "opencode"}
-    from src.api import main as api_main
-    bm = api_main.bot_manager
     # open_id 为 app 级（feishu-app-scoped-openid-fix.md）：必须用**用户本人 chat bot** 发送，
     # 否则命名空间不匹配 → send_card_to_user 静默失败。用户未配置本人 bot → 不通知（不回落其它 bot）。
-    ctx = _resolve_user_chat_bot(bm, user_id) if bm else None
+    ctx = _resolve_user_chat_bot(None, user_id)
     if not ctx:
         log.warning(f"Task notify: assignee={body.assignee} 未配置本人 chat bot，跳过飞书通知 task_id={task_id} issue=#{body.issue_number}")
-    api = bm.api if bm else None
+    api = _feishu_api_for_ctx(ctx)
     asyncio.create_task(_run_notify(ctx, api, user_id, conv_id, open_id,
                                     body.task_description, body.repo_key, body.issue_number, cfg))
 

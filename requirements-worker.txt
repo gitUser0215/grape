@@ -14,3 +14,19 @@ aiohttp>=3.9
 bcrypt>=4.0
 click>=8.0
 httpx>=0.24
+# Issue #666 (M4): codegraph (project-info analysis engine) is an npm platform
+# binary package @colbymchenry/codegraph (self-contained node runtime + Rust core),
+# NOT a pip package -- hence not declared here. Worker-side preinstall goes through
+# scripts/install-codegraph.sh (shipped in package) or online npm install;
+# install-worker.sh then verifies `codegraph --version` (missing = warn only,
+# does not block registration).
+#
+# ASCII-only on purpose: this file ships inside the cross-platform worker package
+# and is parsed by pip on machines whose preferred locale may be non-UTF8 (e.g.
+# Chinese Windows GBK): pip's auto_decode falls back to the locale encoding and
+# dies on non-ASCII UTF-8 bytes (UnicodeDecodeError, 2026-11-07 real install
+# failure). Keep every line ASCII.
+# OpenTelemetry tracing (worker-side task spans / trace relay client). Pinned to a
+# compatible minor band: the otel python ecosystem ships breaking changes monthly.
+opentelemetry-sdk>=1.27,<2
+opentelemetry-exporter-otlp-proto-http>=1.27,<2

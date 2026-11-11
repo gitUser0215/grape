@@ -42,6 +42,8 @@ class TestWorkerPackage:
         assert "grape-worker/SHA256SUMS" in names
         assert "grape-worker/src/config.py" in names
         assert "grape-worker/src/runtime/agent.py" in names
+        assert "grape-worker/src/api/merge_gate.py" in names
+        assert "grape-worker/src/runtime/worktree_guard.py" in names
         assert "grape-worker/src/agent/executor.py" in names
         assert "grape-worker/requirements-worker.txt" in names
         # 不应泄漏服务端代码 / 配置 / 静态资源（内置 Python stdlib 含 statistics.py 等，跳过）
@@ -133,6 +135,11 @@ class TestWorkerPackage:
             "sys.path.insert(0, sys.argv[1])\n"
             "import src.config\n"           # 启动链第一环（事故死因）
             "import src.runtime.agent\n"    # worker 主模块全量闭包
+            "import src.observability.otel\n"  # PR #1077：worker 侧 span/中继依赖（漏打=静默失效）
+            # 架构守护 F1（2026-11-10）：prompt_builder 在包内且新增顶层
+            # src.service_diagnostics 导入；此前的闭包只导 config/agent/otel，
+            # 漏列 service_diagnostics 不会被任何用例拦住（worker 侧静默降级）。
+            "import src.prompt_builder\n"
             "print('IMPORT_CLOSURE_OK')\n"
         )
         r = subprocess.run(
@@ -226,15 +233,24 @@ class TestEnsureWheelsMultiPlatform:
 
 
 class TestGrapeCliWheel:
-    def test_skip_when_wheel_present(self, monkeypatch, tmp_path):
-        """wheels/ 已含 grape-*.whl → 不触发网络/clone/pip wheel（离线安全）。"""
+    def test_other_wheels_untouched_during_grape_build(self, monkeypatch, tmp_path):
+        """#896 前置清理由只删 grape-*.whl——其他依赖 wheel（click 等）不动。"""
         import src.worker_package as wp
-        (tmp_path / "grape-0.1.0-py3-none-any.whl").write_text("dummy", encoding="utf-8")
-        called = []
-        monkeypatch.setattr(wp, "_git", lambda *a, **k: called.append("git"))
-        monkeypatch.setattr(wp.subprocess, "run", lambda *a, **k: called.append("pip"))
+        from types import SimpleNamespace
+
+        click_whl = tmp_path / "click-8.1.7-py3-none-any.whl"
+        click_whl.write_text("click-bytes", encoding="utf-8")
+
+        def _fake_run(cmd, **kw):
+            if cmd[:3] == [sys.executable, "-m", "pip"] and "wheel" in cmd:
+                (tmp_path / "grape-1.0.0-py3-none-any.whl").write_text("g", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(wp, "CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(wp, "_git", lambda *a, **k: None)
+        monkeypatch.setattr(wp.subprocess, "run", _fake_run)
         wp._ensure_grape_cli_wheel(str(tmp_path))
-        assert called == []  # 已有 wheel：什么都不做
+        assert click_whl.read_text(encoding="utf-8") == "click-bytes"
 
     def test_builds_wheel_when_missing(self, monkeypatch, tmp_path):
         """wheel 缺失 → 触发 clone + pip wheel 写入同一目录。"""
@@ -255,6 +271,59 @@ class TestGrapeCliWheel:
         monkeypatch.setattr(wp.subprocess, "run", _fake_run)
         wp._ensure_grape_cli_wheel(str(tmp_path))
         assert events and (tmp_path / "grape-1.0.0-py3-none-any.whl").exists()
+
+    def test_stale_wheel_is_replaced_by_fresh_build(self, monkeypatch, tmp_path):
+        """陈旧 wheel（内容与远端不一致，如 0.3.3-48a08d1 缺 GRAPE_AUTH_FILE）必须被重建替换。
+
+        #896：缓存的 grape wheel 一旦过期就永远过期——`pip wheel` 只在同一
+        文件名已存在时报错，`pip install` 对同版本号也不重新解压。导致某次
+        服务端升级包（已含令牌穿透运行时）里带的仍是缺
+        GRAPE_AUTH_FILE 读文件逻辑的旧 CLI：dsh 任务拿到 auth 文件路径，
+        CLI 却不读 → 穿透失效，且永不自愈。
+        修法：构建前先清掉旧 grape-*.whl，保证 wheels 里永远是当前 HEAD 的
+        grape-cli main 快照。
+        """
+        import src.worker_package as wp
+        from types import SimpleNamespace
+
+        stale = tmp_path / "grape-0.3.3-py3-none-any.whl"
+        stale.write_text("stale-bytes", encoding="utf-8")
+
+        def _fake_run(cmd, **kw):
+            if cmd[:3] == [sys.executable, "-m", "pip"] and "wheel" in cmd:
+                stale.write_text("fresh-bytes", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(wp, "CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(wp, "_git", lambda *a, **k: None)
+        monkeypatch.setattr(wp.subprocess, "run", _fake_run)
+        wp._ensure_grape_cli_wheel(str(tmp_path))
+        assert stale.read_text(encoding="utf-8") == "fresh-bytes", \
+            "旧 grape wheel 应在重建前被清除，不允许陈旧产物存活"
+
+    def test_stale_wheel_removal_failure_logs_warning_and_continues(self, monkeypatch, tmp_path, caplog):
+        """删除旧 grape wheel 失败 → 记录 warning 且不中断构建（#896 审查意见）。"""
+        import logging
+
+        import src.worker_package as wp
+        from types import SimpleNamespace
+
+        stale = tmp_path / "grape-0.3.3-py3-none-any.whl"
+        stale.write_text("stale-bytes", encoding="utf-8")
+
+        def _fake_run(cmd, **kw):
+            if cmd[:3] == [sys.executable, "-m", "pip"] and "wheel" in cmd:
+                stale.write_text("fresh-bytes", encoding="utf-8")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(wp, "CACHE_DIR", str(tmp_path))
+        monkeypatch.setattr(wp, "_git", lambda *a, **k: None)
+        monkeypatch.setattr(wp.subprocess, "run", _fake_run)
+        monkeypatch.setattr(wp.os, "remove", lambda p: (_ for _ in ()).throw(OSError("busy")))
+        with caplog.at_level(logging.WARNING, logger=wp.log.name):
+            wp._ensure_grape_cli_wheel(str(tmp_path))
+        assert any("failed to remove stale grape wheel" in r.message for r in caplog.records), \
+            "删除失败必须 log.warning，不允许静默吞掉"
 
 
 class TestInstallEndpoints:
@@ -508,3 +577,32 @@ class TestBundlePythonByArch:
             f.write("# touch\n")
         f2 = wp._pythons_fingerprint(wp._find_pythons())
         assert f1 != f2, "任一架构 python 变化应触发指纹变化"
+
+
+def test_manifest_covers_worktree_guard_deps():
+    """Issue #752：worktree_guard 随 src/runtime/ 整目录进 worker 包并在 worker 内执行，
+    其 `from src.api.<mod> import ...` 依赖必须一并入包。
+
+    历史教训：MANIFEST 漏列 time_utils 导致 worker 启动即崩（2026-08-17）；漏列
+    merge_gate 会让守卫的 fallback 扫描（unmerged 路径 / 旧 git）静默失效——异常被
+    except 吞掉后返回空结果，守卫形同虚设。
+    """
+    import pathlib
+    import re
+
+    from src.worker_package import MANIFEST
+
+    txt = pathlib.Path("src/runtime/worktree_guard.py").read_text(encoding="utf-8")
+    deps = set(re.findall(r"from\s+src\.api\.([a-zA-Z0-9_]+)\s+import", txt))
+    assert deps, "worktree_guard 应至少懒加载一个 src.api 依赖（否则本守卫失效）"
+    missing = [d for d in sorted(deps) if f"src/api/{d}.py" not in MANIFEST]
+    assert not missing, f"worker MANIFEST missing worktree_guard deps: {missing}"
+
+
+class TestManifestCodegraphInstaller:
+    """Issue #666 (M4)：worker 包随包下发 codegraph 离线安装脚本。"""
+
+    def test_manifest_contains_install_codegraph(self):
+        from src.worker_package import MANIFEST, ROOT
+        assert "scripts/install-codegraph.sh" in MANIFEST
+        assert os.path.isfile(os.path.join(ROOT, "scripts", "install-codegraph.sh"))

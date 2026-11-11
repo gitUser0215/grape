@@ -7,7 +7,7 @@
 - 引擎 skill 目录（跨平台）
 - extra_skill_dirs（分隔符 ; vs :）
 - path_separator
-- bun_cache_dir（Unix /var/cache vs Windows LOCALAPPDATA）
+- bun_cache_dir（Unix 三级解析：GRAPE_BUN_CACHE_DIR / ~/.cache / Windows LOCALAPPDATA）
 - remap_cwd（Unix 不变 / Windows Unix→Windows 路径转换）
 - hostname（跨平台）
 - temp_dir
@@ -107,9 +107,12 @@ class TestFindCli:
 
 
 class TestEngineSearchPaths:
-    def test_unix_returns_empty(self):
+    def test_unix_returns_local_bin_candidate(self):
+        # Linux 兜底语义：返回 ~/.local/bin/<cli> 候选（是否真实存在由 find_cli
+        # 的 isfile 判定，本函数不检查）——Windows 路径不得出现
         with patch.object(os_adapter, "_IS_WINDOWS", False):
-            assert os_adapter.engine_search_paths("opencode") == []
+            paths = os_adapter.engine_search_paths("opencode")
+        assert paths == [os.path.join(os.path.expanduser("~"), ".local", "bin", "opencode")]
 
     def test_windows_returns_paths(self):
         with patch.object(os_adapter, "_IS_WINDOWS", True):
@@ -117,6 +120,53 @@ class TestEngineSearchPaths:
             assert isinstance(paths, list)
             # 应包含路径（即使 LOCALAPPDATA 为空也会有元素）
             assert len(paths) >= 0
+
+    def test_windows_aishell_desktop_cmd_entry(self):
+        """aishell-dsh 二期 Windows 对接：AI Shell 桌面安装的 CLI 启动器兜底。
+
+        aishell CLI 唯一形态是桌面安装内 resources/runtime/cli/bin/aishell.cmd
+        （ELECTRON_RUN_AS_NODE 启动器，无 aishell.exe）。find_cli("aishell")
+        （discover_backends 与 aishell_acp.stream_execute 的调用形态）在 PATH
+        查不到时必须经此条目命中——未启动过桌面的机器用户 PATH 无该目录。
+        """
+        with patch.object(os_adapter, "_IS_WINDOWS", True), \
+             patch.object(os_adapter, "_windows_registry_install_dirs", return_value=[]):
+            paths = os_adapter.engine_search_paths("aishell")
+            assert len(paths) == 1
+            assert paths[0].lower().endswith("aishell.cmd")
+            assert "AI Shell" in paths[0]
+            assert os.path.join("resources", "runtime", "cli", "bin") in paths[0]
+            # find_cli 全链：PATH 落空 → 兜底路径存在即返回该 .cmd
+            # （须与上面同作用域：registry mock 退出后 Linux 会走 winreg import）
+            with patch("src.runtime.os_adapter.which", return_value=""):
+                with patch("os.path.isfile", return_value=True):
+                    assert os_adapter.find_cli("aishell") == paths[0]
+
+    def test_windows_aishell_registry_fallback(self):
+        """AI Shell 装在非默认目录：经 Uninstall 注册表 InstallLocation 定位。
+
+        注册表枚举仅 Windows 可验（winreg 为平台模块，Linux 上无法 patch 出
+        真实键值遍历）；Windows 真机已实证（6a1b12ac-… InstallLocation 命中），
+        此处跳过以免 Linux CI 假失败。
+        """
+        if not sys.platform.startswith("win"):
+            pytest.skip("registry enumeration requires real Windows")
+        custom = r"D:\Example\AI Shell"
+        expected = os.path.join(custom, "resources", "runtime", "cli", "bin", "aishell.cmd")
+        with patch.object(os_adapter, "_IS_WINDOWS", True):
+            with patch.object(os_adapter, "_windows_registry_install_dirs",
+                              return_value=[custom]) as mreg:
+                paths = os_adapter.engine_search_paths("aishell")
+                assert expected in paths
+                # 全链：默认路径不存在（isfile 仅对注册表候选为真）→ 命中注册表路径
+                with patch("src.runtime.os_adapter.which", return_value=""):
+                    with patch("os.path.isfile", side_effect=lambda p: p == expected):
+                        assert os_adapter.find_cli("aishell") == expected
+            # 注册表兜底只在 aishell 键上生效，其他引擎不查注册表
+            with patch.object(os_adapter, "_windows_registry_install_dirs",
+                              return_value=[custom]) as mreg2:
+                os_adapter.engine_search_paths("codex")
+                mreg2.assert_not_called()
 
 
 class TestEngineSkillDirs:
@@ -181,15 +231,89 @@ class TestPathSeparator:
 
 
 class TestBunCacheDir:
-    def test_unix(self):
+    def test_unix_default_user_cache(self):
         with patch.object(os_adapter, "_IS_WINDOWS", False):
-            assert os_adapter.bun_cache_dir() == "/var/cache/bun-compile"
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("GRAPE_BUN_CACHE_DIR", None)
+                d = os_adapter.bun_cache_dir()
+            assert d == os.path.join(os.path.expanduser("~"), ".cache", "grape", "bun-compile")
+
+    def test_env_override(self):
+        with patch.object(os_adapter, "_IS_WINDOWS", False):
+            with patch.dict(os.environ, {"GRAPE_BUN_CACHE_DIR": "/tmp/custom-bun-cache"}):
+                assert os_adapter.bun_cache_dir() == "/tmp/custom-bun-cache"
+
+    def test_env_override_expands_user_and_vars(self):
+        with patch.object(os_adapter, "_IS_WINDOWS", False):
+            with patch.dict(os.environ, {"GRAPE_BUN_CACHE_DIR": "~/cache/$MYVAR", "MYVAR": "sub"}):
+                assert os_adapter.bun_cache_dir() == os.path.expanduser("~/cache/sub")
+
+    def test_env_override_explicit_empty_string_falls_back_to_default(self):
+        with patch.object(os_adapter, "_IS_WINDOWS", False):
+            with patch.dict(os.environ, {"GRAPE_BUN_CACHE_DIR": ""}):
+                d = os_adapter.bun_cache_dir()
+            assert d == os.path.join(os.path.expanduser("~"), ".cache", "grape", "bun-compile")
+
+    def test_fallback_dir_under_tempdir(self):
+        import tempfile
+        d = os_adapter.bun_cache_fallback_dir()
+        assert d == os.path.join(tempfile.gettempdir(), "grape", "bun-compile")
 
     def test_windows(self):
         with patch.object(os_adapter, "_IS_WINDOWS", True):
             d = os_adapter.bun_cache_dir()
             assert "grape" in d
             assert "bun-compile" in d
+
+
+class TestOpencodeGetEnvBunCache:
+    def _runtime(self):
+        from src.runtime.opencode import OpencodeRuntime
+        return OpencodeRuntime()
+
+    def test_env_injects_resolved_cache_dir(self, tmp_path):
+        rt = self._runtime()
+        with patch.dict(os.environ, {"GRAPE_BUN_CACHE_DIR": str(tmp_path / "bun")}):
+            env = rt.get_env()
+        assert env["BUN_RUNTIME_TRANSPILER_CACHE_PATH"] == str(tmp_path / "bun")
+        assert env["JSC_diskCachePath"] == str(tmp_path / "bun")
+        assert os.path.isdir(str(tmp_path / "bun"))
+
+    def test_makedirs_failure_degrades_to_fallback_with_warning(self, tmp_path, caplog):
+        import logging
+        rt = self._runtime()
+        fallback = tmp_path / "fallback"
+        with patch.dict(os.environ, {"GRAPE_BUN_CACHE_DIR": str(tmp_path / "unwritable")}):
+            with patch("src.runtime.os_adapter.bun_cache_fallback_dir", return_value=str(fallback)):
+                with patch("os.makedirs", side_effect=PermissionError("Operation not permitted")):
+                    with caplog.at_level(logging.WARNING, logger="src.runtime.opencode"):
+                        env = rt.get_env()
+        assert any("Operation not permitted" in r.message for r in caplog.records)
+        # makedirs 全部失败 → 不注入缓存变量，但 get_env 正常返回（不抛错）
+        assert "BUN_RUNTIME_TRANSPILER_CACHE_PATH" not in env
+        assert "DEVOPS_SKILLS_DIR" in env
+
+    def test_makedirs_primary_failure_uses_fallback_dir(self, tmp_path, caplog):
+        import logging
+        real_makedirs = os.makedirs
+        primary = tmp_path / "primary"
+        fallback = tmp_path / "fb"
+        calls = []
+
+        def fake_makedirs(path, exist_ok=False):
+            calls.append(path)
+            if path == str(primary):
+                raise PermissionError("Operation not permitted")
+            return real_makedirs(path, exist_ok=exist_ok)
+
+        rt = self._runtime()
+        with patch.dict(os.environ, {"GRAPE_BUN_CACHE_DIR": str(primary)}):
+            with patch("src.runtime.os_adapter.bun_cache_fallback_dir", return_value=str(fallback)):
+                with patch("os.makedirs", side_effect=fake_makedirs):
+                    with caplog.at_level(logging.WARNING, logger="src.runtime.opencode"):
+                        env = rt.get_env()
+        assert env["BUN_RUNTIME_TRANSPILER_CACHE_PATH"] == str(fallback)
+        assert any("falling back" in r.message for r in caplog.records)
 
 
 class TestRemapCwd:

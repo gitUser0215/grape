@@ -1,41 +1,34 @@
 """用户系统数据库：users/credentials/vms/skills 表管理
 
 D32 迁移完成后 user_accounts 表为死表，不再被业务代码读取。
-以下函数标记为 @deprecated——新代码不应调用，应使用 grape_account_db.py 中的对应函数：
-  get_user/get_user_by_username → get_grape_account_by_id/get_grape_account_by_username
-  create_user → create_grape_account
-  verify_user → verify_grape_account
-  update_password → grape_account_db.update_password
-  get_token_version → grape_account_db.get_token_version
-  increment_token_version → grape_account_db.increment_token_version
-  get_user_account → get_grape_account_by_username
-  link_gitcode_user/link_github_user → create_external_identity
-  get_user_by_gitcode_id/get_user_by_github_id → get_external_identity
+Issue #1588 B 批：老表包装函数（create_user/get_user/get_user_by_username/list_users/
+delete_user/update_password/verify_user/get_token_version/increment_token_version/
+get_user_by_gitcode_id/link_gitcode_user/get_all_user_accounts/get_user_account/
+save_user_account/delete_user_account 等 16 个包装、其私有别名与字段常量）
+已整体删除——新代码一律使用 src/auth/grape_account_db.py：
+  账号 CRUD → create_grape_account/get_grape_account_by_id/get_grape_account_by_username
+  密码/校验 → update_password/verify_grape_account
+  token_version → grape_account_db.get_token_version/increment_token_version
+  外部绑定 → create_external_identity/get_external_identity
 """
-import json, hashlib, re, time, os, warnings, threading
+import json, hashlib, re, time, os, threading
 from src.session_manager import db, db_lock
 from src.config import log
 
+
+def _apply_runtime_state_compat(c, runtime_id: int, status: str, last_seen_at: str) -> None:
+    """延迟绑定 apply_runtime_state（Issue #1496）。
+
+    src/runtime/service.py 反向 import 本模块（get_task_token），模块级
+    `from src.runtime.health import apply_runtime_state` 会形成
+    user.db → runtime.health → runtime/__init__ → service → user.db 环；
+    运行期（调用点）再解析则无环。
+    """
+    from src.runtime.health import apply_runtime_state
+    apply_runtime_state(c, runtime_id, status, last_seen_at)
+
 # OAuth state 存储（内存，不依赖 SQLite 跨线程事务）
 # OAuth state 已改为 DB 共享存储（oauth_states 表），不再用进程内存
-
-
-def _deprecated_user_accounts_fn(replacement: str = ""):
-    """装饰器：标记 user_accounts 老表函数为 deprecated。
-    调用时发出 DeprecationWarning，日志记录。
-    """
-    import functools
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            msg = f"user_accounts.{fn.__name__}() is deprecated"
-            if replacement:
-                msg += f", use {replacement} instead"
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
-            log.warning(f"Deprecated function called: {fn.__name__}() — {msg}")
-            return fn(*args, **kwargs)
-        return wrapper
-    return decorator
 
 
 # ====== 用户账户表（合并 users + bot_accounts） ======
@@ -69,143 +62,6 @@ CREATE TABLE IF NOT EXISTS user_accounts (
     last_active_at TEXT DEFAULT NULL  -- 最后活跃时间（用户在线状态判定）
 )
 """
-
-
-def _hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-
-@_deprecated_user_accounts_fn("create_grape_account")
-def create_user(username: str, password: str, created_by: int = 0) -> dict | None:
-    """创建普通用户，返回用户信息或 None。
-
-    新用户自动创建个人组织（is_personal=1），实现组织特性向后兼容。
-    """
-    pw_hash = _hash_password(password)
-    try:
-        with db_lock:
-            c = db.cursor()
-            c.execute("INSERT INTO user_accounts (username, password_hash, password, created_by, created_at) VALUES (?,?,?,?,datetime('now'))",
-                      (username, pw_hash, password, created_by))
-            db.commit()
-            uid = c.lastrowid
-            log.info(f"User created: {username} (id={uid}, by={created_by})")
-
-            # 自动创建个人组织
-            from src.user.org_db import create_org
-            slug = f"personal-{uid}"
-            create_org(
-                name=f"{username}的个人空间", slug=slug,
-                owner_id=uid, is_personal=1
-            )
-            log.info(f"Personal org created for user {uid}")
-
-            return {"id": uid, "username": username}
-    except Exception as e:
-        log.warning(f"Create user failed: {e}")
-        return None
-
-
-@_deprecated_user_accounts_fn("get_grape_account_by_id")
-def get_user(user_id: int) -> dict | None:
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT id, username, created_by, created_at FROM user_accounts WHERE id=?", (user_id,))
-        row = c.fetchone()
-    if not row:
-        return None
-    return {"id": row[0], "username": row[1], "created_by": row[2], "created_at": row[3]}
-
-
-@_deprecated_user_accounts_fn("get_grape_account_by_username")
-def get_user_by_username(username: str) -> dict | None:
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT id, username, password_hash, created_by, created_at FROM user_accounts WHERE username=?", (username,))
-        row = c.fetchone()
-    if not row:
-        return None
-    return {"id": row[0], "username": row[1], "password_hash": row[2], "created_by": row[3], "created_at": row[4]}
-
-
-@_deprecated_user_accounts_fn("admin/db.py list_grape_accounts")
-def list_users() -> list[dict]:
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT id, username, created_by, created_at FROM user_accounts ORDER BY id")
-        return [{"id": r[0], "username": r[1], "created_by": r[2], "created_at": r[3]} for r in c.fetchall()]
-
-
-@_deprecated_user_accounts_fn("grape_account_db.soft_delete_account")
-def delete_user(user_id: int) -> bool:
-    try:
-        with db_lock:
-            c = db.cursor()
-            c.execute("DELETE FROM user_accounts WHERE id=?", (user_id,))
-            db.commit()
-            return c.rowcount > 0
-    except Exception as e:
-        log.warning(f"Delete user failed: {e}")
-        return False
-
-
-@_deprecated_user_accounts_fn("grape_account_db.update_password")
-def update_password(user_id: int, new_password: str) -> bool:
-    try:
-        pw_hash = _hash_password(new_password)
-        with db_lock:
-            c = db.cursor()
-            c.execute("UPDATE user_accounts SET password_hash=?, password=? WHERE id=?", (pw_hash, new_password, user_id))
-            db.commit()
-            return c.rowcount > 0
-    except Exception as e:
-        log.warning(f"Update password failed: {e}")
-        return False
-
-
-@_deprecated_user_accounts_fn("grape_account_db.verify_grape_account")
-def verify_user(username: str, password: str) -> dict | None:
-    """验证用户名密码，成功返回用户信息（含 token_version），失败返回 None。
-
-    被管理员禁用的用户（is_disabled=1）返回 None（Issue #281：admin 禁用后旧体系登录口立即失效）。
-    """
-    user = get_user_by_username(username)
-    if not user:
-        return None
-    if user["password_hash"] != _hash_password(password):
-        return None
-    token_version = get_token_version(user["id"])
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT is_disabled FROM user_accounts WHERE id=?", (user["id"],))
-        row = c.fetchone()
-    if row and row[0]:
-        return None
-    return {"id": user["id"], "username": user["username"], "created_by": user["created_by"], "created_at": user["created_at"], "token_version": token_version}
-
-
-# ====== JWT token_version 管理 ======
-
-@_deprecated_user_accounts_fn("grape_account_db.get_token_version")
-def get_token_version(user_id: int) -> int:
-    """获取用户的 token_version——JWT verify 时对比，不匹配则 token 失效。
-    用户不存在时返回 -1（不等于任何有效 token 的 ver=0，使旧 token 失效）。"""
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT token_version FROM user_accounts WHERE id=?", (user_id,))
-        row = c.fetchone()
-    if not row:
-        return -1  # 用户不存在 → 任何 token 都失效
-    return (row[0] if row[0] is not None else 0)
-
-
-@_deprecated_user_accounts_fn("grape_account_db.increment_token_version")
-def increment_token_version(user_id: int) -> None:
-    """token_version+1——改密码/logout 时调用，使所有旧 token 失效"""
-    with db_lock:
-        c = db.cursor()
-        c.execute("UPDATE user_accounts SET token_version=token_version+1 WHERE id=?", (user_id,))
-        db.commit()
 
 
 def batch_update_last_active(uids: list) -> None:
@@ -447,72 +303,6 @@ def validate_oauth_state(state: str, provider: str = "") -> dict | None:
 
 
 
-
-
-@_deprecated_user_accounts_fn("grape_account_db.get_external_identity")
-def get_user_by_gitcode_id(gitcode_id: str) -> dict | None:
-    """通过 GitCode 用户 ID 查找本地用户"""
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT id, username, created_by, created_at FROM user_accounts WHERE gitcode_id=?", (gitcode_id,))
-        row = c.fetchone()
-    if not row:
-        return None
-    return {"id": row[0], "username": row[1], "created_by": row[2], "created_at": row[3]}
-
-
-@_deprecated_user_accounts_fn("grape_account_db.create_external_identity")
-def link_gitcode_user(user_id: int, gitcode_id: str, access_token: str, refresh_token: str = "") -> bool:
-    """绑定本地用户与 GitCode 用户，存储 access_token 到 user_credentials"""
-    try:
-        with db_lock:
-            c = db.cursor()
-            c.execute("UPDATE user_accounts SET gitcode_id=? WHERE id=?", (gitcode_id, user_id))
-            c.execute("INSERT OR REPLACE INTO user_credentials (user_id, provider, config_json, updated_at) VALUES (?,?,?,datetime('now'))",
-                      (user_id, "gitcode_oauth", json.dumps({
-                          "gitcode_id": gitcode_id,
-                          "access_token": access_token,
-                          "refresh_token": refresh_token,
-                          "fetched_at": int(time.time())
-                      })))
-            db.commit()
-            return True
-    except Exception as e:
-        log.warning(f"Link GitCode user failed: {e}")
-        return False
-
-
-@_deprecated_user_accounts_fn("grape_account_db.get_external_identity")
-def get_user_by_github_id(github_id: str) -> dict | None:
-    """通过 GitHub 用户 ID 查找本地用户"""
-    with db_lock:
-        c = db.cursor()
-        c.execute("SELECT id, username, created_by, created_at FROM user_accounts WHERE github_id=?", (github_id,))
-        row = c.fetchone()
-    if not row:
-        return None
-    return {"id": row[0], "username": row[1], "created_by": row[2], "created_at": row[3]}
-
-
-@_deprecated_user_accounts_fn("grape_account_db.create_external_identity")
-def link_github_user(user_id: int, github_id: str, access_token: str, refresh_token: str = "") -> bool:
-    """绑定本地用户与 GitHub 用户，存储 access_token 到 user_credentials"""
-    try:
-        with db_lock:
-            c = db.cursor()
-            c.execute("UPDATE user_accounts SET github_id=? WHERE id=?", (github_id, user_id))
-            c.execute("INSERT OR REPLACE INTO user_credentials (user_id, provider, config_json, updated_at) VALUES (?,?,?,datetime('now'))",
-                      (user_id, "github_oauth", json.dumps({
-                          "github_id": github_id,
-                          "access_token": access_token,
-                          "refresh_token": refresh_token,
-                          "fetched_at": int(time.time())
-                      })))
-            db.commit()
-            return True
-    except Exception as e:
-        log.warning(f"Link GitHub user failed: {e}")
-        return False
 
 
 # ====== 凭据表 ======
@@ -1106,8 +896,12 @@ def ensure_repo_skill_dir(repo_key: str, skill_name: str) -> str:
     return path
 
 
-def get_skill_by_id(skill_id) -> dict | None:
-    """按 skill 表主键 id 查询 skill 信息（含 skill_name、skill_path、scope、agent_type、content_hash）"""
+def get_skill_by_id(skill_id, *, raise_on_error: bool = False) -> dict | None:
+    """按 skill 表主键 id 查询 skill 信息（含 skill_name、skill_path、scope、agent_type、content_hash）
+
+    Issue #1758: raise_on_error=True 时数据库异常上抛，供单一 scope 判官按
+    fail-closed 策略处理；默认 False 维持既有吞异常返回 None 的兼容语义。
+    """
     if not skill_id:
         return None
     try:
@@ -1125,6 +919,8 @@ def get_skill_by_id(skill_id) -> dict | None:
                 "content_hash": row[9] or "",
             }
     except Exception as e:
+        if raise_on_error:
+            raise
         log.warning(f"get_skill_by_id failed: {e}")
         return None
 
@@ -1303,6 +1099,106 @@ def resolve_skill_id(skill_name: str, owner_id: str = "",
     except Exception as e:
         log.warning(f"resolve_skill_id failed: {e}")
     return 0
+
+
+def resolve_skill_dispatch(skill_name: str, skill_id: int = 0,
+                           repo_key: str = "", user_id: str | int = "",
+                           scene_id: str = "", node_tag: str = "") -> dict:
+    """派发技能解析（Issue #979）：skill_id 权威直查 → 名字降级 + warning。
+
+    - skill_id 非零且 skill 表命中（is_active=1）→ 直接返回该档（显式绑定，
+      三档同名下锁定用户选择的档位）；
+    - skill_id 缺失（老场景仅名字）或失效（技能被删/停用）→ 按
+      resolve_skill_id 现有规则（user→repo→official）降级解析，并打
+      warning（含场景/节点/降级原因），行为与既有名字派发一致；
+    - 两者都解析不到 → skill_id=0（调用方按 #657 scope 门禁/内置包兜底）。
+
+    返回 {skill_id, skill_name, skill_path, degraded, skill}。
+    """
+    out = {"skill_id": 0, "skill_name": skill_name or "",
+           "skill_path": skill_name or "", "degraded": False, "skill": None}
+    if not skill_name and not skill_id:
+        return out
+    if skill_id:
+        row = get_skill_by_id(skill_id)
+        if row:
+            _name = row.get("skill_name") or skill_name or ""
+            out.update(skill_id=int(skill_id), skill_name=_name,
+                       skill_path=row.get("skill_path") or _name, skill=row)
+            return out
+        log.warning(
+            f"resolve_skill_dispatch: skill_id={skill_id} invalid/inactive "
+            f"(scene={scene_id or '-'} node={node_tag or '-'} "
+            f"skill_name='{skill_name or ''}'), degrade to name resolution")
+    elif skill_name:
+        log.warning(
+            f"resolve_skill_dispatch: node without skill_id "
+            f"(scene={scene_id or '-'} node={node_tag or '-'} "
+            f"skill_name='{skill_name}'), degrade to name resolution "
+            f"(user→repo→official)")
+    sid = resolve_skill_id(skill_name, repo_key=repo_key, user_id=user_id)
+    if sid:
+        out["skill_id"] = int(sid)
+        out["degraded"] = True
+        row = get_skill_by_id(sid)
+        out["skill"] = row
+        if row:
+            out["skill_name"] = row.get("skill_name") or skill_name
+            out["skill_path"] = row.get("skill_path") or out["skill_name"]
+    else:
+        out["degraded"] = True
+    return out
+
+
+def get_skill_scope_info(skill_name: str, repo_key: str = "",
+                         *, raise_on_error: bool = False) -> dict:
+    """技能 scope 与场景（repo 级）scope 匹配判定（Issue #657）。
+
+    按 repo → official → user（任意 owner）顺序查 skill 表：
+    - 命中 repo（owner_id=repo_key）或 official → matched=True（repo 级场景可引用）；
+    - 仅 user scope 存在 → found=True, matched=False
+      （scope 不匹配：repo 级场景不可引用 user 级技能，无论 owner 是谁）；
+    - 全部未命中 → found=False（技能不在 skill 表，如官方内置包形态，
+      由调用方走内置包兜底/派发侧门禁，维持存量场景兼容）。
+
+    返回 {found, matched, scope, skill_id, owner_id}。
+    Issue #1758: raise_on_error=True 时数据库异常上抛（供单一 scope 判官
+    fail-closed）；默认 False 维持吞异常返回 found=False 的兼容语义。
+    """
+    info = {"found": False, "matched": False, "scope": "", "skill_id": 0, "owner_id": ""}
+    if not skill_name:
+        return info
+    try:
+        with db_lock:
+            c = db.cursor()
+            if repo_key:
+                row = c.execute(
+                    "SELECT id, owner_id FROM skill WHERE skill_name=? AND scope='repo' "
+                    "AND owner_id=? AND is_active=1 LIMIT 1",
+                    (skill_name, repo_key)).fetchone()
+                if row:
+                    info.update(found=True, matched=True, scope="repo",
+                                skill_id=row[0], owner_id=row[1] or "")
+                    return info
+            row = c.execute(
+                "SELECT id FROM skill WHERE skill_name=? AND scope='official' "
+                "AND is_active=1 LIMIT 1", (skill_name,)).fetchone()
+            if row:
+                info.update(found=True, matched=True, scope="official",
+                            skill_id=row[0], owner_id="")
+                return info
+            row = c.execute(
+                "SELECT id, owner_id FROM skill WHERE skill_name=? AND scope='user' "
+                "AND is_active=1 LIMIT 1", (skill_name,)).fetchone()
+            if row:
+                info.update(found=True, matched=False, scope="user",
+                            skill_id=row[0], owner_id=row[1] or "")
+                return info
+    except Exception as e:
+        if raise_on_error:
+            raise
+        log.warning(f"get_skill_scope_info failed: {e}")
+    return info
 
 
 def get_skill_path(skill_id) -> str:
@@ -2719,16 +2615,6 @@ def get_user_github_token(user_id: int) -> str:
     return get_user_github_token_by_id(user_id)
 
 
-def _get_username_by_id(user_id: int) -> str:
-    """根据 user_id 查 username（D32-补丁：查 grape_accounts，不查 user_accounts）。"""
-    try:
-        from src.auth.grape_account_db import get_grape_account_by_id
-        acc = get_grape_account_by_id(user_id)
-        return acc["username"] if acc else ""
-    except Exception:
-        return ""
-
-
 def refresh_gitcode_oauth_token(user_id: int) -> str | None:
     """用 refresh_token 刷新 GitCode OAuth access_token（Issue #52）。
 
@@ -2814,83 +2700,7 @@ def get_all_managed_repos() -> list[dict]:
                  "full_name": from_repo_key(r[0]), "webhook_id": r[4], "created_at": r[5]} for r in c.fetchall()]
 
 
-# ====== 用户账户 CRUD ======
-
-USER_ACCOUNT_FIELDS = [
-    "id", "username", "password_hash", "gitcode_id",
-    "gitcode_api_token",
-    "github_id", "github_api_token", "github_login",
-    "nickname",
-    "feishu_app_id", "feishu_app_secret",
-    "huawei_cloud_ak", "huawei_cloud_sk",
-    "CODEARTS_CLI_AK", "CODEARTS_CLI_SK",
-    "gitcode_publish_repo", "github_publish_repo",
-    "password",
-    "created_by", "created_at",
-    "hw_iam_domain", "hw_iam_user", "hw_iam_password",
-    "hw_iam_account_type",
-]
-
-
-def get_all_user_accounts() -> list[dict]:
-    """获取所有用户账户"""
-    with db_lock:
-        c = db.cursor()
-        c.execute(f"SELECT {','.join(USER_ACCOUNT_FIELDS)} FROM user_accounts ORDER BY username")
-        rows = c.fetchall()
-    result = []
-    for r in rows:
-        d = dict(zip(USER_ACCOUNT_FIELDS, r))
-        d["name"] = d["username"]  # 向后兼容
-        try:
-            d["bot_usernames"] = json.loads(d.get("bot_usernames", "[]"))
-        except (json.JSONDecodeError, TypeError):
-            d["bot_usernames"] = [s.strip() for s in d.get("bot_usernames", "").split(",") if s.strip()]
-        result.append(d)
-    return result
-
-
-@_deprecated_user_accounts_fn("grape_account_db.get_grape_account_by_username")
-def get_user_account(username: str) -> dict | None:
-    """获取单个用户账户"""
-    with db_lock:
-        c = db.cursor()
-        c.execute(f"SELECT {','.join(USER_ACCOUNT_FIELDS)} FROM user_accounts WHERE username=?", (username,))
-        row = c.fetchone()
-    if not row:
-        return None
-    d = dict(zip(USER_ACCOUNT_FIELDS, row))
-    d["name"] = d["username"]  # 向后兼容
-    try:
-        d["bot_usernames"] = json.loads(d.get("bot_usernames", "[]"))
-    except (json.JSONDecodeError, TypeError):
-        d["bot_usernames"] = [s.strip() for s in d.get("bot_usernames", "").split(",") if s.strip()]
-    return d
-
-
-def save_user_account(username: str, data: dict):
-    """创建或更新用户账户（保留 id，不会因 INSERT OR REPLACE 产生新 id）"""
-    fields = {k: data.get(k, "") for k in USER_ACCOUNT_FIELDS if k not in ("id", "username", "created_at")}
-    set_clause = ",".join(f"{k}=?" for k in fields)
-    vals = list(fields.values())
-    with db_lock:
-        c = db.cursor()
-        existing = c.execute("SELECT id FROM user_accounts WHERE username=?", (username,)).fetchone()
-        if existing:
-            c.execute(f"UPDATE user_accounts SET {set_clause} WHERE username=?", vals + [username])
-        else:
-            c.execute(f"INSERT INTO user_accounts ({','.join(fields.keys())},username) VALUES ({','.join('?' for _ in fields)},?)", vals + [username])
-        db.commit()
-
-
-@_deprecated_user_accounts_fn("grape_account_db.soft_delete_account")
-def delete_user_account(username: str) -> bool:
-    with db_lock:
-        c = db.cursor()
-        c.execute("DELETE FROM user_accounts WHERE username=?", (username,))
-        db.commit()
-        return c.rowcount > 0
-
+# ====== Bot 用户名 ======
 
 def get_all_bot_usernames() -> list[str]:
     """获取所有托管仓库配置的 bot 用户名列表（用于 self-comment 检测）。
@@ -3006,7 +2816,7 @@ def is_server_base_url_configured() -> bool:
 
 
 def _split_face_public(key: str) -> bool:
-    """拆分配置项（browser_callback_url/worker_connect_url）是否已配置且非回环。"""
+    """拆分配置项（browser_callback_url/worker_connect_url/task_business_api_url）是否已配置且非回环。"""
     _v = _split_url_configured_value(key)
     if not _v:
         return False
@@ -3014,11 +2824,18 @@ def _split_face_public(key: str) -> bool:
     return _host not in _LOOPBACK_HOSTS
 
 
+_SPLIT_KEY_USAGE = {
+    "browser_callback_url": "浏览器回调",
+    "worker_connect_url": "worker 回连",
+    "task_business_api_url": "任务业务 API",
+}
+
+
 def _split_face_warning(key: str) -> str:
-    """单个拆分项指向回环时的告警文案（面向对应语义：浏览器回调/worker 回连）。"""
+    """单个拆分项指向回环时的告警文案（面向对应语义：浏览器回调/worker 回连/任务业务 API）。"""
     _v = _split_url_configured_value(key)
     _host = _v.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
-    _usage = "浏览器回调" if key == "browser_callback_url" else "worker 回连"
+    _usage = _SPLIT_KEY_USAGE.get(key, key)
     return (
         f"{key} 当前指向本机回环地址 {_v}，{_usage}对外不可达；"
         f"请在 configs/server-config.json 配置对外可访问地址后重启。"
@@ -3035,7 +2852,7 @@ def get_server_base_url_warning() -> str:
     - 全未配置 → 保留「未配置」告警（提示配 server_base_url 或两个拆分项均可）。
     """
     # 逐面检查拆分项：指向回环的面对出回环告警
-    for _key in ("browser_callback_url", "worker_connect_url"):
+    for _key in ("browser_callback_url", "worker_connect_url", "task_business_api_url"):
         if _split_url_configured_value(_key) and not _split_face_public(_key):
             return _split_face_warning(_key)
     # 任一面已公网配置 → 无告警（含拆分项，双地址部署不误报）
@@ -3270,32 +3087,6 @@ def migrate_accounts_from_json():
                     log.info("Deleted default account (no config to migrate)")
     except Exception as e:
         log.warning(f"Migrate/delete default account failed: {e}")
-
-
-def link_user_provider(user_id: int, provider: str, external_id: str,
-                        access_token: str, refresh_token: str = "") -> bool:
-    """通用 OAuth 绑定——统一写入 user_credentials。
-
-    D32-补丁：不再写 user_accounts 老表专属列（gitcode_id/github_id）。
-    此函数已无外部调用方（_sync_legacy_binding 已删除），保留仅作历史兼容。
-    """
-    provider_key = f"{provider}_oauth"
-    try:
-        with db_lock:
-            c = db.cursor()
-            # 统一写入 user_credentials
-            c.execute("INSERT OR REPLACE INTO user_credentials (user_id, provider, config_json, updated_at) VALUES (?,?,?,datetime('now'))",
-                      (user_id, provider_key, json.dumps({
-                          f"{provider}_id": external_id,
-                          "access_token": access_token,
-                          "refresh_token": refresh_token,
-                          "fetched_at": int(time.time())
-                      }, ensure_ascii=False)))
-            db.commit()
-            return True
-    except Exception as e:
-        log.warning(f"Link {provider} user failed: {e}")
-        return False
 
 
 def _read_refresh_token_from_identity(user_id: int, provider: str) -> str:
@@ -3712,15 +3503,19 @@ def save_agent_runtimes(agents: list[dict], scope: str = "global", owner_id: str
                     (name, scope, owner_id, host_name, host_name))
                 row = c.fetchone()
                 if row:
+                    # Issue #1496：status+last_seen_at 走统一写入口（同事务含遗留
+                    # health 列派生同步），其余展示/配置字段仍随本 upsert 原地更新。
+                    _rid0 = row[0]
+                    _apply_runtime_state_compat(c, _rid0, "online", _now_iso)
                     c.execute(
                         "UPDATE agent_runtimes SET display_name=?, installed=?, cli_path=?, version=?, healthy=?, "
-                        "pip_package=?, status='online', last_seen_at=?, updated_at=?, "
+                        "pip_package=?, updated_at=?, "
                         "local_skills=?, skill_scan_result=?, host_name=? WHERE id=?",
                         (a.get("display_name", name),
                          1 if a.get("installed") else 0, a.get("cli_path", ""),
                          a.get("version", ""), 1 if a.get("healthy") else 0,
-                         a.get("pip_package", ""), _now_iso, _now_iso,
-                         _ls_json, _detail_json, host_name, row[0])
+                         a.get("pip_package", ""), _now_iso,
+                         _ls_json, _detail_json, host_name, _rid0)
                     )
                 else:
                     # 方案1（engine-selection-design.md §4.3）：本机直连（credential_id=0）是独立受管资源。
@@ -3791,9 +3586,9 @@ def get_agent_runtimes(scope: str | None = "global", owner_id: str = "") -> list
     with db_lock:
         c = db.cursor()
         if scope is None:
-            c.execute("SELECT id, name, display_name, installed, cli_path, version, healthy, pip_package, updated_at, scope, owner_id, credential_id, status, last_seen_at, local_skills, skill_scan_result, agent_tags, host_name, max_concurrent, scene_tags, alias, worker_version, org_id FROM agent_runtimes ORDER BY name")
+            c.execute("SELECT id, name, display_name, installed, cli_path, version, healthy, pip_package, updated_at, scope, owner_id, credential_id, status, last_seen_at, local_skills, skill_scan_result, agent_tags, host_name, max_concurrent, scene_tags, alias, worker_version, org_id, model_name, model_source, model_reported_at FROM agent_runtimes ORDER BY name")
         else:
-            c.execute("SELECT id, name, display_name, installed, cli_path, version, healthy, pip_package, updated_at, scope, owner_id, credential_id, status, last_seen_at, local_skills, skill_scan_result, agent_tags, host_name, max_concurrent, scene_tags, alias, worker_version, org_id FROM agent_runtimes WHERE scope=? AND (owner_id=? OR owner_id='') ORDER BY name", (scope, owner_id))
+            c.execute("SELECT id, name, display_name, installed, cli_path, version, healthy, pip_package, updated_at, scope, owner_id, credential_id, status, last_seen_at, local_skills, skill_scan_result, agent_tags, host_name, max_concurrent, scene_tags, alias, worker_version, org_id, model_name, model_source, model_reported_at FROM agent_runtimes WHERE scope=? AND (owner_id=? OR owner_id='') ORDER BY name", (scope, owner_id))
         return _rows_to_runtimes(c.fetchall())
 
 
@@ -3815,7 +3610,10 @@ def _rows_to_runtimes(rows) -> list[dict]:
          "scene_tags": json.loads(r[19]) if r[19] else ["default"],
          "alias": r[20] or "",
          "worker_version": r[21] or "",
-         "org_id": r[22] or 0}
+         "org_id": r[22] or 0,
+         "model_name": r[23] or "",
+         "model_source": r[24] or "",
+         "model_reported_at": r[25] or ""}
         for r in rows
     ]
 
@@ -4729,6 +4527,71 @@ def get_worker_connect_url() -> str:
     return get_server_base_url()
 
 
+def get_business_api_url_explicit() -> str:
+    """显式配置的 task_business_api_url（未配置返回空串，不回落 server_base_url）。
+
+    Issue #1577：用于解析优先级「显式配置 > server_base_url > 本机回环」，
+    本机 runtime 也要尊重显式业务基址配置（QA 复审 Spec 偏离项）。
+    """
+    return _split_url_configured_value("task_business_api_url")
+
+
+def get_business_api_url() -> str:
+    """主控业务 API 基址（任务内 grape 业务命令 issues / git-repo 等全量端点用）。
+
+    Issue #1577：与 worker 回连基址（get_worker_connect_url）语义拆分——
+    任务派发时 `GRAPE_SERVER_URL` 指向业务 API（本项），worker runtime 基址由
+    `RUNTIME_SERVER_URL` 独立承载。优先 task_business_api_url（server-config.json
+    > meta），未配置回退 server_base_url（单地址部署与改造前等价）。
+    """
+    _v = get_business_api_url_explicit()
+    if _v:
+        return _v
+    return get_server_base_url()
+
+
+def get_business_api_port() -> str:
+    """本机业务 API 端口（单机多进程部署时与 runtime 端口解耦，Issue #1731）。
+
+    优先 task_business_api_port（server-config.json > meta），其次环境变量
+    `GRAPE_BUSINESS_PORT`；未配置返回空串，由调用方回退 `_local_port()` 兼容默认
+    （GRAPE_PORT > GRAPE_MAIN_PORT > 3000）。runtime 端口可能指向 runtime 网关
+    （如 8083）而非业务 API（如 8081），故业务端口需独立配置。
+    """
+    _v = _split_url_configured_value("task_business_api_port")
+    if _v:
+        return _v
+    return str(os.environ.get("GRAPE_BUSINESS_PORT") or "").strip()
+
+
+# Issue #1858：任务环境按服务注入基址——业务面（VCS / Issue）与控制面（A2A）分离。
+# 显式配置键（server-config.json > meta）；未配置由 prompt_builder 按聚合网关前缀
+# 或业务/回连基址回退，且来源在 env 中显式记录（不乱冒充）。
+_TASK_SERVICE_API_KEYS = {
+    "vcs": "task_vcs_api_url",
+    "issue": "task_issue_api_url",
+    "a2a": "task_a2a_api_url",
+}
+
+
+def get_task_service_api_url_explicit(service: str) -> str:
+    """显式配置的按服务任务基址（vcs/issue/a2a）；未配置返回空串。
+
+    Issue #1858：同一 base_url 无法同时承载 8081 业务 API 与 8082 A2A 时，
+    运维可分别配置 `task_vcs_api_url` / `task_issue_api_url` / `task_a2a_api_url`。
+    """
+    key = _TASK_SERVICE_API_KEYS.get((service or "").strip().lower(), "")
+    return _split_url_configured_value(key) if key else ""
+
+
+def get_task_gateway_base_url() -> str:
+    """可选聚合网关基址（按 /vcs /issue /a2a 前缀路由三面）；未配置返回空串。
+
+    Issue #1858：网关就绪时作为默认分服务变量的替代（二者择一，显式服务键优先）。
+    """
+    return _split_url_configured_value("task_gateway_base_url")
+
+
 def _split_url_configured_value(key: str) -> str:
     """读取拆分配置项（server-config.json > meta），空串表示未配置。
 
@@ -4737,13 +4600,13 @@ def _split_url_configured_value(key: str) -> str:
     """
     try:
         from src.config import read_server_config
-        _v = (read_server_config().get(key) or "").strip().rstrip("/")
+        _v = str(read_server_config().get(key) or "").strip().rstrip("/")
         if _v:
             return _v
     except Exception:
         pass
     try:
-        return (get_meta_value(key) or "").strip().rstrip("/")
+        return str(get_meta_value(key) or "").strip().rstrip("/")
     except Exception:
         return ""
 
@@ -4751,13 +4614,13 @@ def _split_url_configured_value(key: str) -> str:
 def get_url_split_warning() -> str:
     """Issue #471 E1：拆分配置项错误的明确报错引导；配置正确返回空串。"""
     warnings = []
-    for _key in ("browser_callback_url", "worker_connect_url"):
+    for _key in ("browser_callback_url", "worker_connect_url", "task_business_api_url"):
         _v = _split_url_configured_value(_key)
         if not _v:
             continue
         _host = _v.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
         if _host in _LOOPBACK_HOSTS:
-            _usage = "浏览器回调" if _key == "browser_callback_url" else "worker 回连"
+            _usage = _SPLIT_KEY_USAGE.get(_key, _key)
             warnings.append(
                 f"{_key} 当前指向本机回环地址 {_v}，{_usage}对外不可达；"
                 f"请在 configs/server-config.json 配置对外可访问地址后重启。"

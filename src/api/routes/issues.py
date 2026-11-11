@@ -23,7 +23,8 @@ from src.config import log
 from src.api.time_utils import normalize_event_time
 from src.api.issues_center import (TaskAwaitingInputBody, TaskPendingReviewBody,
                                    _review_pass, _review_reject, _set_issue_pending_review,
-                                   _find_github_mirror_repo_key)
+                                   _read_issue_status, _find_github_mirror_repo_key,
+                                   cancel_issue_rows)
 
 router = APIRouter(prefix="/api/issues", tags=["issues"])
 
@@ -84,8 +85,12 @@ def _sync_missing_issue_row(repo_keys: list[str], number) -> str:
         if state == "exists":
             try:
                 from src.api.issues_center import ensure_issue_task
+                # Issue #805: VCS 兜底补建行时带上创建人（GitCode issue 作者）
+                _fb_user = (data or {}).get("user") or {}
+                _fb_creator = (_fb_user.get("login") or _fb_user.get("username") or "") \
+                    if isinstance(_fb_user, dict) else ""
                 ensure_issue_task(rk, int(num), title=str((data or {}).get("title", "") or ""),
-                                  event_type="issue_opened")
+                                  event_type="issue_opened", creator=_fb_creator)
                 return "exists"
             except Exception as e:
                 log.warning(f"issues: fallback ensure_issue_task failed repo={rk} #{num}: {e}")
@@ -233,7 +238,7 @@ def _issue_stage_map(repo_keys: list[str], numbers: list[str] = None) -> dict:
             c = db.cursor()
             c.execute(
                 f"SELECT id, issue_number, stage, owner_agent, assignee, a2a_seq, scene_id, "
-                f"parent_issue_id, is_subtask_mode, scene_user_id, allow_scene_override "
+                f"parent_issue_id, is_subtask_mode, scene_user_id, allow_scene_override, created_by "
                 f"FROM issue WHERE repo_key IN ({placeholders}){_num_clause}",
                 repo_keys + _num_params)
             for r in c.fetchall():
@@ -246,6 +251,8 @@ def _issue_stage_map(repo_keys: list[str], numbers: list[str] = None) -> dict:
                     "scene_id": r[6] or "", "parent_issue_id": r[7] or "",
                     "is_subtask_mode": r[8] or 0, "scene_user_id": r[9] or 0,
                     "allow_scene_override": r[10] or 0,
+                    # Issue #805: 创建人（issue.created_by，issue_state 过渡期数据无此列 → 兜底空）
+                    "creator": r[11] or "",
                 }
     except Exception as e:
         log.warning(f"issues: load issue table failed: {e}")
@@ -274,6 +281,7 @@ def _issue_stage_map(repo_keys: list[str], numbers: list[str] = None) -> dict:
                     "scene_id": r[5] or "", "parent_issue_id": r[6] or "",
                     "is_subtask_mode": r[7] or 0, "scene_user_id": r[8] or 0,
                     "allow_scene_override": r[9] or 0,
+                    "creator": "",
                 }
     except Exception as e:
         log.warning(f"issues: load issue_state failed: {e}")
@@ -296,6 +304,80 @@ def _task_status_map(repo_keys: list[str]) -> dict:
     return out
 
 
+# Issue #859 性能（2026-11-03）：事件 payload 内联额度
+# 每 issue 只内联最新 N 条的 output/logs；单次请求最多 M 条；单条超过 CHARS 就截断。
+_EVENT_PAYLOAD_PER_ISSUE = 1
+_EVENT_PAYLOAD_MAX_EVENTS = 200
+_EVENT_PAYLOAD_MAX_CHARS = 32768
+
+
+def _attach_event_payloads(group_map: dict) -> None:
+    """按需补 structured_output / agent_logs（Issue #859 性能修复，2026-11-03）。
+
+    旧实现把 payload 两列塞进事件主查询：单仓 2 万事件 × 平均 8.3KB 日志 ≈ 166MB
+    传输 + 2 万次 JSON 解析（实测 50ms → 386ms@5KB/条），且全程持 db_lock。
+    现在主查询只取 12 列元数据，再按 seq 只补"每个 issue 最新 N 条"的 payload：
+    单次最多 _EVENT_PAYLOAD_MAX_EVENTS 条、单条最多 _EVENT_PAYLOAD_MAX_CHARS 字符
+    （超出即截断并打 *_truncated 标记，避免 MB 级大字段拖垮响应）。
+    未命中的事件保留 output=None/logs=[]（与原响应形状一致）并标记 payload_omitted。
+    """
+    picks = []
+    for evs in group_map.values():
+        picks.extend(evs[-_EVENT_PAYLOAD_PER_ISSUE:])
+    if len(picks) > _EVENT_PAYLOAD_MAX_EVENTS:
+        picks = picks[-_EVENT_PAYLOAD_MAX_EVENTS:]
+    if not picks:
+        return
+    cap = _EVENT_PAYLOAD_MAX_CHARS
+    seqs = [int(p["seq"]) for p in picks]
+    placeholders = ",".join("?" * len(seqs))
+    from src.session_manager import db, db_lock
+    import json as _json
+    try:
+        with db_lock:
+            c = db.cursor()
+            # SUBSTR 在 sqlite/MySQL 语义一致；多取 1 字符用于判断是否被截断
+            # payload 不截断：Issue #996 复审指出先 SUBSTR 再 json.loads 会在
+            # >32KB 时解析失败，导致 files/guard_impact 静默丢失；投影后仅保留
+            # files/guard_impact 两个视图，内存占用随行释放。
+            c.execute(
+                f"SELECT seq, SUBSTR(structured_output, 1, {cap + 1}), "
+                f"SUBSTR(agent_logs, 1, {cap + 1}), payload "
+                f"FROM events WHERE seq IN ({placeholders})",
+                seqs)
+            rows = {int(r[0]): (r[1], r[2], r[3] if len(r) > 3 else None)
+                    for r in c.fetchall()}
+    except Exception:
+        return
+    picked = set()
+    for p in picks:
+        picked.add(id(p))
+        raw_so, raw_logs, raw_payload = rows.get(int(p["seq"]), (None, None, None))
+        if raw_payload:
+            from src.api.event_payload_view import payload_view_from_json
+            p.update(payload_view_from_json(raw_payload, seq=p["seq"]))
+        if raw_so:
+            if len(raw_so) > cap:
+                p["output_truncated"] = True
+            else:
+                try:
+                    p["output"] = _json.loads(raw_so)
+                except Exception:
+                    p["output"] = None
+        if raw_logs:
+            if len(raw_logs) > cap:
+                p["logs_truncated"] = True
+            else:
+                try:
+                    p["logs"] = _json.loads(raw_logs)
+                except Exception:
+                    p["logs"] = []
+    for evs in group_map.values():
+        for e in evs:
+            if id(e) not in picked:
+                e["payload_omitted"] = True
+
+
 def _group_events_by_issue(repo_keys: list[str], numbers: list[str] = None) -> dict:
     """仓库内 issue_id → events 列表（seq 升序），带时间格式化。
 
@@ -307,6 +389,7 @@ def _group_events_by_issue(repo_keys: list[str], numbers: list[str] = None) -> d
     _query_pr_subscription_events 独立处理，不受影响）。
     """
     from src.session_manager import db, db_lock
+    import json as _json
     out = {}
     placeholders = ",".join("?" * len(repo_keys))
     _num_clause = ""
@@ -315,23 +398,26 @@ def _group_events_by_issue(repo_keys: list[str], numbers: list[str] = None) -> d
         _iids = [f"#{n}" for n in numbers]
         _num_clause = f" AND issue_id IN ({','.join('?' * len(_iids))})"
         _num_params = _iids
+    _has_so = False
     with db_lock:
         c = db.cursor()
         try:
             cols = [r[1] for r in c.execute("PRAGMA table_info(events)").fetchall()]
             _has_so = "structured_output" in cols
-            _sel = (f"SELECT seq, issue_id, event_type, agent_type, title, actor, summary, status, created_at, runtime, skill"
-                    + (", structured_output, agent_logs" if _has_so else ""))
+            # Issue #859: 统一使用 _sel 执行查询（含 PRAGMA 动态探测 structured_output/agent_logs），
+            # 并补充 entity_type 列保留 Issue #252 PR 事件过滤；列顺序与下方 r[N] 索引一一对应。
+            # 性能（2026-11-03）：payload 两列不再随主查询全量返回，改由 _attach_event_payloads 按需补。
+            _sel = (f"SELECT seq, issue_id, event_type, agent_type, title, actor, summary, status, created_at, "
+                    f"runtime, skill, entity_type")
             c.execute(
-                f"SELECT seq, issue_id, event_type, agent_type, title, actor, summary, status, created_at, entity_type "
-                f"FROM events WHERE repo_key IN ({placeholders}) AND issue_id!=''{_num_clause} ORDER BY seq ASC",
+                f"{_sel} FROM events WHERE repo_key IN ({placeholders}) AND issue_id!=''{_num_clause} ORDER BY seq ASC",
                 repo_keys + _num_params)
             rows = c.fetchall()
         except Exception:
             rows = []
     for r in rows:
         iid = r[1]
-        _entity_type = r[9] if len(r) > 9 else ""
+        _entity_type = r[11] if len(r) > 11 else ""
         # Issue #252: PR 事件不混入 issue 分组
         if _entity_type == "pull_request":
             continue
@@ -343,21 +429,27 @@ def _group_events_by_issue(repo_keys: list[str], numbers: list[str] = None) -> d
             "title": r[4] or r[2], "actor": r[5] or "",
             "summary": r[6] or r[4] or r[2],
             "status": r[7], "created_at": normalize_event_time(r[8]),
-            "runtime": r[9] if len(r) > 9 else "",
-            "skill": r[10] if len(r) > 10 else "",
+            "runtime": r[9] or "",
+            "skill": r[10] or "",
         }
-        if len(r) > 11:  # structured_output / agent_logs 存在
-            raw_so = r[11]
+        if _has_so and len(r) > 12:  # structured_output / agent_logs 存在（旧形态兼容）
+            raw_so = r[12]
             try:
                 item["output"] = _json.loads(raw_so) if raw_so else None
             except Exception:
                 item["output"] = None
             try:
-                raw_logs = r[12] if len(r) > 12 else None
+                raw_logs = r[13] if len(r) > 13 else None
                 item["logs"] = _json.loads(raw_logs) if raw_logs else []
             except Exception:
                 item["logs"] = []
+        elif _has_so:
+            # 性能（2026-11-03）：主查询不再取 payload，先占位，随后按需补
+            item["output"] = None
+            item["logs"] = []
         out.setdefault(n, []).append(item)
+    if _has_so:
+        _attach_event_payloads(out)
     return out
 
 
@@ -391,11 +483,91 @@ def _assemble_issue(repo_key: str, number: str, stage_map: dict, status_map: dic
         "owner_agent": stage.get("owner_agent", "vod"),
         "scene_id": stage.get("scene_id", ""),
         "assignee": stage.get("assignee", ""),
+        # Issue #805: 创建人（created_by 建档固化；issue_state 过渡期兜底无值 → 空串）
+        "creator": stage.get("creator", ""),
         "is_subtask_mode": stage.get("is_subtask_mode") or 0,
         "parent_issue_id": stage.get("parent_issue_id", ""),
         "events_count": len(events),
         "latest_event": latest,
     }
+
+
+def _issue_attachments_batch(repo_keys: list[str]) -> dict[str, list[dict]]:
+    """Issue #648 性能修复：按仓库前缀一次 ListObjects 拉全量附件清单，内存按 issue 编号分组。
+
+    原实现（_issue_attachments）逐卡调一次 OBS list（~16-110ms），几百卡串行 = 十几秒，
+    是需求中心列表接口慢的根因（#648 引入）。OBS/本地两种后端均走 storage 一次前缀枚举。
+    返回 {issue_number_str: [ {filename,url,size,is_image}, ... ]}，无附件的编号不在 map 中。
+    分页 cursor 循环拉全量（OBS 单次 max_keys=1000）。
+    """
+    result: dict[str, list[dict]] = {}
+    for rk in repo_keys or []:
+        try:
+            from src.repo_key import split_owner_repo
+            owner, rname = split_owner_repo(rk)
+        except Exception as e:
+            log.warning(f"issues: attachments batch skip bad repo_key={rk}: {e}")
+            continue
+        try:
+            from src.storage import get_storage
+            from src.api.issues_center import _ATTACH_IMAGE_EXTS
+            import os as _os
+            storage = get_storage()
+            if storage:
+                from src.api.issues_center import _attach_obs_key
+                # 仓库级前缀：{PREFIX}/issue_attachments/{owner}/{repo}/
+                # list_objects_with_meta 返回的 key 已剥 OBS_PREFIX，形如
+                # issue_attachments/{owner}/{repo}/{issue_number}/{filename}
+                prefix_key = _attach_obs_key(owner, rname, "", "").rstrip("/")
+                _prefix = prefix_key.rsplit("issue_attachments/", 1)[-1]
+                _prefix = f"issue_attachments/{_prefix}".rstrip("/") + "/"
+                _items: list[dict] = []
+                _cursor: str | None = ""
+                while _cursor is not None:
+                    page, _cursor = storage.list_objects_with_meta(_prefix, cursor=_cursor, limit=1000)
+                    _items.extend(page or [])
+                for item in _items:
+                    # key 形如 issue_attachments/{owner}/{repo}/{issue_number}/{filename}
+                    rel = (item.get("key") or "")
+                    if rel.startswith(_prefix):
+                        rel = rel[len(_prefix):]
+                    parts = rel.split("/", 1)
+                    if len(parts) != 2 or not parts[0] or not parts[1]:
+                        continue
+                    num, fname = parts
+                    ext = _os.path.splitext(fname)[1].lower()
+                    result.setdefault(num, []).append({
+                        "filename": fname,
+                        "url": storage.temporary_url(item["key"], expires=7 * 24 * 3600),
+                        "size": item.get("size", 0),
+                        "is_image": ext in _ATTACH_IMAGE_EXTS,
+                    })
+            else:
+                # 本地磁盘后端：一次 listdir 顶层目录 = 全部 issue 编号
+                from src.api.issues_center import _attach_base_dir
+                from src.user.db import get_browser_callback_url as _bcb
+                _base_url = (_bcb() or "").rstrip("/")
+                base = _attach_base_dir(owner, rname, "")
+                if _os.path.isdir(base):
+                    for num in _os.listdir(base):
+                        d = _os.path.join(base, num)
+                        if not _os.path.isdir(d):
+                            continue
+                        for fname in sorted(_os.listdir(d)):
+                            fpath = _os.path.join(d, fname)
+                            if not _os.path.isfile(fpath):
+                                continue
+                            ext = _os.path.splitext(fname)[1].lower()
+                            result.setdefault(str(num), []).append({
+                                "filename": fname,
+                                "url": f"{_base_url}/static/issue_attachments/{owner}/{rname}/{num}/{fname}",
+                                "size": _os.path.getsize(fpath),
+                                "is_image": ext in _ATTACH_IMAGE_EXTS,
+                            })
+        except Exception as e:
+            log.warning(f"issues: attachments batch failed repo={rk}: {e}")
+            continue
+    return result
 
 
 def _issue_attachments(repo_keys: list[str], issue_number) -> list[dict]:
@@ -419,6 +591,28 @@ def _issue_attachments(repo_keys: list[str], issue_number) -> list[dict]:
         if atts:
             return atts
     return []
+
+
+def _issue_attachments_count(repo_keys: list[str], issue_number) -> int:
+    """Issue #926：仅取附件数量（分页瘦身专用）。
+
+    与 _issue_attachments 同探测口径（按 repo_key 顺序，首个命中即返回），
+    但跳过 _attach_list 的 URL 预签名/元数据构造，深列表页 I/O 显著低于全量取清单。
+    """
+    if issue_number is None or str(issue_number).strip() == "":
+        return 0
+    from src.api.issues_center import _attach_count
+    from src.repo_key import split_owner_repo
+    for rk in repo_keys or []:
+        try:
+            owner, rname = split_owner_repo(rk)
+            n = _attach_count(owner, rname, str(issue_number))
+        except Exception as e:
+            log.warning(f"issues: count attachments failed repo={rk} #{issue_number}: {e}")
+            continue
+        if n:
+            return n
+    return 0
 
 
 def _pipeline_from_archive(repo_keys: list[str], number: str) -> dict | None:
@@ -495,6 +689,14 @@ def _pipeline_from_events(repo_key: str, number: str, events: list[dict]) -> dic
 
 # ===================== B 类操作（tasks-issues-api-rebound-design.md §三）=====================
 # 迁移自 /api/tasks/{task_id}/...：`{issue_id}` 即原 `{task_id}`（= issue.id），定位/逻辑零改动。
+
+
+def _feishu_api_for_ctx(ctx):
+    """按 ctx 的 app_id 取 FeishuAsync（旧 IM 下线 A2 M2：不再依赖 BotManager.api）。"""
+    if not ctx:
+        return None
+    from src.im.engine_wiring import feishu_api
+    return feishu_api(getattr(ctx, "app_id", "") or "")
 
 
 @router.post("/{issue_id}/start", operation_id="issues_start", summary="Open issue session", description="Opens the Issue conversation entry: validates ownership and returns the current status without flipping it. User-only (front-end navigation preflight).")
@@ -775,12 +977,20 @@ def _sync_issue_pipeline_terminal(repo_key: str, issue_id_num) -> int:
             log.warning(f"admin-confirm: sync agent_tasks failed: {_e}")
         try:
             c.execute(
-                "UPDATE events SET status='completed' "
+                "UPDATE events SET status='completed', "
+                "completed_at=COALESCE(NULLIF(completed_at,''), datetime('now')) "
                 "WHERE repo_key=? AND issue_id=? AND status='running'",
                 (repo_key, _issue_id))
         except Exception as _e:
             log.warning(f"admin-confirm: sync events failed: {_e}")
         db.commit()
+    # Issue #1667：admin 终审直接 SQL 把 events 置 completed，绕过了终态钩子；
+    # 对账扫描兜底派发因此滞留的排队 A2A 事件（Spec 风险表要求）。
+    try:
+        from src.api.event_pipeline import reconcile_queued_a2a
+        reconcile_queued_a2a(repo_key)
+    except Exception as _qe:
+        log.warning(f"admin-confirm: a2a queue reconcile failed: {_qe}")
     return _synced
 
 
@@ -867,6 +1077,41 @@ async def admin_confirm_issue_done(issue_id: int, user: dict = Depends(require_n
             "issue_closed": _issue_closed}
 
 
+def _cancel_issue_agents(c, repo_key: str, issue_id: str) -> int:
+    """Issue #1741：终止某需求卡片下仍在跑的 agent_tasks，返回终止数量。
+
+    取消端点主路径与「主卡已取消」幂等收口分支共用，避免历史重复行残留 running agent 继续执行。
+    """
+    if not issue_id:
+        return 0
+    c.execute(
+        "SELECT id, event_seq FROM agent_tasks WHERE repo_key=? AND issue_id=? AND status IN ('queued','dispatched','running')",
+        (repo_key, issue_id))
+    _agent_rows = c.fetchall()
+    for _at_id, _at_seq in _agent_rows:
+        try:
+            from src.runtime.service import cancel_task as _cancel_agent
+            _cancel_agent(_at_id)
+        except Exception:
+            pass
+        try:
+            if _at_seq:
+                from src.api.event_pipeline import cancel_direct_task
+                cancel_direct_task(_at_seq)
+        except Exception:
+            pass
+        try:
+            if _at_seq:
+                from src.api.event_store import update_event_status
+                update_event_status(_at_seq, "cancelled")
+        except Exception:
+            pass
+    c.execute(
+        "UPDATE agent_tasks SET status='cancelled' WHERE repo_key=? AND issue_id=? AND status IN ('queued','dispatched','running')",
+        (repo_key, issue_id))
+    return len(_agent_rows)
+
+
 @router.post("/{issue_id}/cancel", operation_id="issues_cancel", summary="Cancel issue (stop pipeline)", description="Developer cancels the requirement from any stage: terminates agents and stops the pipeline.")
 async def cancel_issue(issue_id: int, user: dict = Depends(require_no_session_token)):
     """开发者取消需求：任何阶段可取消，Agent 终止 + 流水线停止。"""
@@ -879,42 +1124,26 @@ async def cancel_issue(issue_id: int, user: dict = Depends(require_no_session_to
         if not row:
             raise HTTPException(status_code=404, detail={"code": 404, "message": "需求不存在"})
         status, repo_key, issue_number = row[0], row[1], row[2]
+        _issue_id = f"#{issue_number}" if issue_number else ""
         if status == 'cancelled':
+            # Issue #1741：主卡已是 cancelled 时仍对同一需求的历史多行做幂等收口，
+            # 防止残留 awaiting_input 行继续出现在待澄清列表；并同步终止其残留 agent_tasks。
+            if repo_key and issue_number:
+                _cancel_issue_agents(c, repo_key, _issue_id)
+                cancel_issue_rows(c, repo_key, issue_number)
+                db.commit()
             return {"ok": True, "already_cancelled": True}
         if status == 'completed':
             raise HTTPException(status_code=400, detail={"code": 400, "message": "已完成需求不可取消"})
-        _issue_id = f"#{issue_number}" if issue_number else ""
-        _cancelled_agents = 0
-        if _issue_id:
+        _cancelled_agents = _cancel_issue_agents(c, repo_key, _issue_id)
+        # Issue #1741：同一 repo_key+issue_number 的历史多行全量幂等取消，
+        # 避免只改单行时同需求其它行仍停留在待澄清列表；已完成/已取消行保持终态不受影响。
+        if repo_key and issue_number:
+            cancel_issue_rows(c, repo_key, issue_number)
+        else:
             c.execute(
-                "SELECT id, event_seq FROM agent_tasks WHERE repo_key=? AND issue_id=? AND status IN ('queued','dispatched','running')",
-                (repo_key, _issue_id))
-            _agent_rows = c.fetchall()
-            for _at_id, _at_seq in _agent_rows:
-                try:
-                    from src.runtime.service import cancel_task as _cancel_agent
-                    _cancel_agent(_at_id)
-                except Exception:
-                    pass
-                try:
-                    if _at_seq:
-                        from src.api.event_pipeline import cancel_direct_task
-                        cancel_direct_task(_at_seq)
-                except Exception:
-                    pass
-                try:
-                    if _at_seq:
-                        from src.api.event_store import update_event_status
-                        update_event_status(_at_seq, "cancelled")
-                except Exception:
-                    pass
-                _cancelled_agents += 1
-            c.execute(
-                "UPDATE agent_tasks SET status='cancelled' WHERE repo_key=? AND issue_id=? AND status IN ('queued','dispatched','running')",
-                (repo_key, _issue_id))
-        c.execute(
-            "UPDATE issue SET status='cancelled', completed_reason='user_cancelled', completed_at=datetime('now') WHERE id=?",
-            (issue_id,))
+                "UPDATE issue SET status='cancelled', completed_reason='user_cancelled', completed_at=datetime('now') WHERE id=?",
+                (issue_id,))
         db.commit()
     log.info(f"Issue #{issue_id} cancelled by user (agents={_cancelled_agents})")
     return {"ok": True, "issue_id": issue_id, "status": "cancelled", "agents_cancelled": _cancelled_agents}
@@ -935,9 +1164,17 @@ async def resume_issue(issue_id: int, user: dict = Depends(require_no_session_to
         status, repo_key, issue_number = row[0], row[1], row[2]
         if status != 'cancelled':
             raise HTTPException(status_code=400, detail={"code": 400, "message": "仅已取消需求可恢复"})
-        c.execute(
-            "UPDATE issue SET status='processing', completed_reason=NULL, completed_at=NULL WHERE id=?",
-            (issue_id,))
+        # Issue #1741：同一 repo_key+issue_number 多行全量幂等恢复（只改状态，不插入新卡，
+        # 避免恢复后产生重复卡片）。
+        if repo_key and issue_number:
+            c.execute(
+                "UPDATE issue SET status='processing', completed_reason=NULL, completed_at=NULL "
+                "WHERE repo_key=? AND issue_number=? AND status='cancelled'",
+                (repo_key, issue_number))
+        else:
+            c.execute(
+                "UPDATE issue SET status='processing', completed_reason=NULL, completed_at=NULL WHERE id=?",
+                (issue_id,))
         db.commit()
     _issue_id = f"#{issue_number}" if issue_number else ""
     if _issue_id:
@@ -967,8 +1204,12 @@ async def resume_issue(issue_id: int, user: dict = Depends(require_no_session_to
             set_issue_stage(repo_key, _issue_id, _resume_stage, "resume")
             try:
                 import urllib.request, json as _json
-                from src.prompt_builder import _resolve_server_url
-                _a2a_url = _resolve_server_url() + "/api/a2a"
+                # Issue #1858：恢复续办走 A2A 控制面基址（含可选网关 /a2a 前缀）。
+                from src.prompt_builder import resolve_a2a_base
+                _a2a_base = resolve_a2a_base()
+                if not _a2a_base:
+                    raise RuntimeError("A2A base_url unresolved")
+                _a2a_url = _a2a_base.rstrip("/") + "/api/a2a"
                 _a2a_payload = _json.dumps({
                     "agent": _resume_stage,
                     "payload": {
@@ -985,7 +1226,12 @@ async def resume_issue(issue_id: int, user: dict = Depends(require_no_session_to
                 urllib.request.urlopen(_req, timeout=5)
                 log.info(f"Issue #{issue_id} resumed → re-dispatched to stage={_resume_stage}")
             except Exception as _e:
-                log.warning(f"Issue #{issue_id} resume re-dispatch failed: {_e}")
+                from src.prompt_builder import format_base_url_candidates
+                try:
+                    _candidates = format_base_url_candidates("/api/a2a")
+                except Exception:
+                    _candidates = ""
+                log.warning(f"Issue #{issue_id} resume re-dispatch failed: {_e}; {_candidates}")
     log.info(f"Issue #{issue_id} resumed by user")
     return {"ok": True, "issue_id": issue_id, "status": "processing"}
 
@@ -1111,7 +1357,7 @@ async def get_issue_pipeline_by_id(issue_id: int, user: dict = Depends(require_n
     nodes = (pipe_cfg or {}).get("nodes", [])
     events = []
     if issue_key:
-        events = get_events(repo_key, issue_id=issue_key, limit=30)
+        events = get_events(repo_key, issue_id=issue_key, limit=30, include_payload=True)
     # 统一计算节点状态（与菜单流水线页一致；compute_node_statuses 兼算 latest_event）
     from src.api.pipeline_status import compute_node_statuses
     nodes, _ = compute_node_statuses(nodes, events, _current_stage)
@@ -1431,10 +1677,8 @@ async def issue_awaiting_input(issue_id: int, body: TaskAwaitingInputBody,
     if changed:
         from src.api.issues_center import _get_feishu_open_id_by_user_id
         open_id = _get_feishu_open_id_by_user_id(user_id) or _get_feishu_open_id(assignee, repo_key)
-        from src.api import main as api_main
-        bm = api_main.bot_manager
-        ctx = _resolve_user_chat_bot(bm, user_id) if bm else None
-        api = bm.api if bm else None
+        ctx = _resolve_user_chat_bot(None, user_id)
+        api = _feishu_api_for_ctx(ctx)
         cfg = get_chat_config(user_id) if user_id else {"backend": "opencode"}
         asyncio.create_task(_run_awaiting_notify(ctx, api, user_id, conv_id, open_id,
                                                  questions, repo_key, issue_number, cfg))
@@ -1623,10 +1867,8 @@ async def issue_pending_review(issue_id: int, body: TaskPendingReviewBody,
                                                _resolve_user_chat_bot, _run_pending_review_notify)
             from src.session_manager import get_chat_config
             _open_id = _get_feishu_open_id_by_user_id(it["user_id"]) or _get_feishu_open_id(it["assignee"], it.get("repo_key", ""))
-            from src.api import main as api_main
-            bm = api_main.bot_manager
-            _ctx = _resolve_user_chat_bot(bm, it["user_id"]) if bm else None
-            _api = bm.api if bm else None
+            _ctx = _resolve_user_chat_bot(None, it["user_id"])
+            _api = _feishu_api_for_ctx(ctx)
             _cfg = get_chat_config(it["user_id"]) if it["user_id"] else {"backend": "opencode"}
             asyncio.create_task(_run_pending_review_notify(
                 _ctx, _api, it["user_id"], conv_id, _open_id, review_points,
@@ -1647,28 +1889,44 @@ class _ReviewRejectBody(BaseModel):
     reason: str = ""
 
 
+def _review_outcome(_out: str) -> tuple:
+    """拆分内部审核结果码为 (result, reason)。
+
+    Issue #1599：`result` 保留旧字符串语义（`noop` / `rejected_*` / `passed_*`）兼容现有消费方；
+    `noop:<reason>` 拆出机器可读原因码（already_target/terminal/not_pending_review/error）。
+    """
+    if _out.startswith("noop"):
+        _reason = _out.split(":", 1)[1] if ":" in _out else "not_pending_review"
+        return "noop", _reason
+    return _out, ""
+
+
 @router.post("/{issue_id}/review-pass", operation_id="issues_review-pass",
              summary="Agent decides review passed",
-             description="Agent 判定用户已通过审核：pending_review → processing（继续）；target=done → completed+stage=done（合入/收尾）。Session-only (tk_)，repo 匹配，devops agent。")
+             description="Agent 判定用户已通过审核：pending_review → processing（继续）；target=done → completed+stage=done（合入/收尾）。响应回读 issue 表真实 status 并返回 changed(bool)；未命中附 reason（already_target/terminal/not_pending_review），不再回显名义 status 冒充成功。Session-only (tk_)，repo 匹配，devops agent。")
 async def issue_review_pass(issue_id: int, body: _ReviewPassBody,
                             user: dict = Depends(get_current_user_or_api_key)):
     it = _session_devops_issue(issue_id, user)
     _out = _review_pass(it["repo_key"], it["issue_number"],
                         target=body.target or "processing", evidence=body.evidence or "")
-    return {"ok": True, "issue_id": it["id"], "status": "completed" if _out == "passed_done" else ("processing" if _out == "passed_processing" else "pending_review"),
-            "result": _out}
+    _result, _reason = _review_outcome(_out)
+    _st = _read_issue_status(it["repo_key"], it["issue_number"]) or it["status"]
+    return {"ok": True, "issue_id": it["id"], "status": _st,
+            "changed": _result != "noop", "result": _result, "reason": _reason}
 
 
 @router.post("/{issue_id}/review-reject", operation_id="issues_review-reject",
              summary="Agent decides review rejected",
-             description="Agent 判定用户未通过审核：pending_review → processing（打回）或 awaiting_input（转澄清）。Session-only (tk_)，repo 匹配，devops agent。")
+             description="Agent 判定用户未通过审核：仅 pending_review → processing（打回）或 awaiting_input（转澄清）。响应回读 issue 表真实 status 并返回 changed(bool)；未命中附 reason（already_target/terminal/not_pending_review）。noop 排查：`grape issues detail --json-out` 查看 issue_task_status。Session-only (tk_)，repo 匹配，devops agent。")
 async def issue_review_reject(issue_id: int, body: _ReviewRejectBody,
                               user: dict = Depends(get_current_user_or_api_key)):
     it = _session_devops_issue(issue_id, user)
     _out = _review_reject(it["repo_key"], it["issue_number"],
                           target=body.target or "processing", reason=body.reason or "")
-    _st = "awaiting_input" if _out == "rejected_awaiting_input" else ("processing" if _out == "rejected_processing" else "pending_review")
-    return {"ok": True, "issue_id": it["id"], "status": _st, "result": _out}
+    _result, _reason = _review_outcome(_out)
+    _st = _read_issue_status(it["repo_key"], it["issue_number"]) or it["status"]
+    return {"ok": True, "issue_id": it["id"], "status": _st,
+            "changed": _result != "noop", "result": _result, "reason": _reason}
 
 
 class _IssueClarifyBody(BaseModel):
@@ -1801,7 +2059,7 @@ async def upload_issue_attachment(issue_id: int, file: UploadFile = File(...),
         raise HTTPException(status_code=400, detail={"code": 400, "message": f"不支持的文件类型: {ext}"})
     content = await file.read()
     if len(content) > _ATTACH_MAX_SIZE:
-        raise HTTPException(status_code=400, detail={"code": 400, "message": "文件大小超过 50MB 限制"})
+        raise HTTPException(status_code=400, detail={"code": 400, "message": f"文件大小超过 {_ATTACH_MAX_SIZE // (1024 * 1024)}MB 限制"})
     import uuid
     safe_name = f"{uuid.uuid4().hex}{ext}"
     dir_name = str(issue_number) if issue_number else "pending"
@@ -1882,7 +2140,7 @@ async def pre_upload_attachment(file: UploadFile = File(...),
         raise HTTPException(status_code=400, detail={"code": 400, "message": f"不支持的文件类型: {ext}"})
     content = await file.read()
     if len(content) > _ATTACH_MAX_SIZE:
-        raise HTTPException(status_code=400, detail={"code": 400, "message": "文件大小超过 50MB 限制"})
+        raise HTTPException(status_code=400, detail={"code": 400, "message": f"文件大小超过 {_ATTACH_MAX_SIZE // (1024 * 1024)}MB 限制"})
     import uuid
     safe_name = f"{uuid.uuid4().hex}{ext}"
     url = _attach_save(owner, rname, "pending", safe_name, content)
@@ -1907,12 +2165,13 @@ def pre_delete_attachment(filename: str, repo_key: str = "",
 
 
 @router.get("/mine", operation_id="issues_mine", summary="My issues (personal dimension)", description="My issues (issue-center personal dimension), enriched with scene/stage/is_running/agent_statuses.")
-async def my_issues(status: str = Query("", pattern="^(active|processing|awaiting_input|pending_review|completed|)?$"),
+async def my_issues(status: str = Query("", pattern="^(active|processing|awaiting_input|pending_review|completed|cancelled|)?$"),
                     repo_key: str = Query("", description="按仓库过滤"),
                     sort_order: str = Query("desc", pattern="^(desc|asc)$", description="按创建时间排序方向"),
                     mode: str = Query("default", pattern="^(default|time)$", description="default=状态优先；time=纯时间序"),
                     created_by_me: str = Query("", description="仅我创建的任务"),
-                    assignees: str = Query("", description="按创建人筛选(逗号分隔)"),
+                    assignees: str = Query("", description="按责任人筛选(逗号分隔)"),
+                    creators: str = Query("", description="按创建人筛选(逗号分隔, Issue #805)"),
                     user: dict = Depends(require_org_member)):
     """我的需求列表（需求中心·个人维度）。
 
@@ -1920,7 +2179,7 @@ async def my_issues(status: str = Query("", pattern="^(active|processing|awaitin
     （scene/stage/is_running/agent_statuses）。
     组织隔离：非个人组织只返回 org_id 匹配的 issue。
     """
-    from src.api.issues_center import _query_tasks, _build_assignee_filter
+    from src.api.issues_center import _query_tasks, _build_assignee_filter, _build_creator_filter
     from src.repo_key import to_repo_key
     from src.user.org_db import is_org_personal
     _org_id = user.get("org_id", 0)
@@ -1947,24 +2206,72 @@ async def my_issues(status: str = Query("", pattern="^(active|processing|awaitin
         clauses.append("org_id=?")
         params.append(_filter_org_id)
     _build_assignee_filter(assignees, clauses, params)
+    _build_creator_filter(creators, clauses, params)
     where = " AND ".join(clauses)
     _order_dir = "DESC" if sort_order == "desc" else "ASC"
     _order_by = f"created_at {_order_dir}"
     if mode == "default":
-        _order_by = f"CASE WHEN status='active' THEN 0 WHEN status='processing' THEN 1 ELSE 2 END, created_at {_order_dir}"
+        # Issue #926：与 issues_list / _merge_sort_items 同源（_status_order_sql），
+        # 修复旧版仅 3 桶（active/processing/else）与 Python 4 级优先序口径不一致
+        _order_by = f"{_status_order_sql()}, created_at {_order_dir}"
     issues_out = _query_tasks(where, params, _order_by, include_user_id=False)
     return {"issues": issues_out, "sort_order": sort_order, "mode": mode}
 
 
-@router.get("/{owner}/{repo}", operation_id="issues_list", summary="Repo issue list (stage/status enriched)", description="Repo issue list (unified all view) enriched with stage/status/events. Issue #542 paging: `per_page>0` enables true server-side paging (LIMIT/OFFSET, response carries total/page/per_page/has_more); default `per_page=0` returns the full list with terminal statuses (completed/cancelled) capped to the `recent_terminal` (default 30) most recent (pass `recent_terminal=0` or an explicit `status` filter for the full set).")
+_STATUS_PRIORITY = {"active": 0, "processing": 1, "awaiting_input": 2, "pending_review": 3}
+
+
+def _status_order_sql() -> str:
+    """Issue #926：default 模式状态优先序的 SQL CASE 片段（单一事实源）。
+
+    与 Python 侧 _STATUS_PRIORITY 同源派生（终态兜底 4），消除 SQL CASE /
+    _STATUS_PRIORITY / 前端映射三处口径复制导致的霰弹式同改风险。
+    """
+    _cases = " ".join(
+        f"WHEN status='{_st}' THEN {_pr}"
+        for _st, _pr in sorted(_STATUS_PRIORITY.items(), key=lambda kv: kv[1])
+    )
+    return f"CASE {_cases} ELSE 4 END"
+
+
+def _merge_sort_items(items: list[dict], mode: str, sort_order: str) -> None:
+    """Issue #926：与 SQL _order_by 对齐的就地稳定排序（issue 行 + PR 伪卡片统一合并口径）。
+
+    两次稳定排序复刻 SQL「CASE 优先级 ASC, created_at DESC/ASC」：
+    先按 created_at（方向取 sort_order），再按状态优先级（恒 ASC）稳定覆盖分组。
+    mode=time 时仅按 created_at 排序。
+    """
+    items.sort(key=lambda it: str(it.get("created_at") or ""), reverse=(sort_order == "desc"))
+    if mode != "time":
+        items.sort(key=lambda it: _STATUS_PRIORITY.get(it.get("status") or "", 4))
+
+
+def _filter_pr_items(pr_items: list[dict], q: str, statuses_set: set) -> list[dict]:
+    """Issue #926：PR 伪卡片与 issue 行同口径的服务端过滤（q / statuses）。"""
+    out = pr_items
+    if statuses_set:
+        out = [it for it in out if (it.get("status") or "pending") in statuses_set]
+    if q:
+        _needle = q.lower()
+        out = [it for it in out
+               if _needle in str(it.get("title") or "").lower()
+               or _needle in str(it.get("issue_number") or "")]
+    return out
+
+
+@router.get("/{owner}/{repo}", operation_id="issues_list", summary="Repo issue list (stage/status enriched)", description="Repo issue list (unified all view) enriched with stage/status/events. Issue #542 paging: `per_page>0` enables true server-side paging (LIMIT/OFFSET, response carries total/page/per_page/has_more); default `per_page=0` returns the full list with terminal statuses (completed/cancelled) capped to the `recent_terminal` (default 30) most recent (pass `recent_terminal=0` or an explicit `status` filter for the full set). Issue #926: PR pseudo-cards merge into the same LIMIT/OFFSET paging window (counted in total); `q` (title/number substring) and `statuses` (comma-separated multi-status) add server-side filtering; paged responses slim attachments to `attachments_count`. Issue #995: cards whose `issue_number` no longer exists on VCS are hidden by default (provider-aware batch VCS index + TTL cache + ledger `vcs_exists` flag); pass `include_deleted=1` to audit them. Each non-PR card carries `vcs_exists` (bool), `is_vcs_deleted` (bool, = !vcs_exists) and `vcs_check` (ok/unavailable; unavailable means VCS verification failed and cards are fail-open/not hidden). `id` is the ledger card id, `issue_number` is the VCS issue number — they are NOT interchangeable.")
 def list_repo_issues(owner: str, repo: str,
                      status: str = Query("", pattern="^(active|processing|awaiting_input|pending_review|completed|cancelled|)$"),
                      sort_order: str = Query("desc", pattern="^(desc|asc)$", description="按创建时间排序方向"),
                      mode: str = Query("default", pattern="^(default|time)$", description="default=状态优先；time=纯时间序"),
-                     assignees: str = Query("", description="按创建人筛选(逗号分隔)"),
+                     assignees: str = Query("", description="按责任人筛选(逗号分隔)"),
+                     creators: str = Query("", description="按创建人筛选(逗号分隔, Issue #805)"),
+                     q: str = Query("", max_length=200, description="Issue #926：标题/编号模糊搜索（服务端过滤）"),
+                     statuses: str = Query("", max_length=200, description="Issue #926：多状态筛选（逗号分隔 issue.status）"),
                      page: int = Query(1, ge=1, description="页码（per_page>0 时生效）"),
                      per_page: int = Query(0, ge=0, le=500, description="每页条数；0=不分页（默认，兼容旧前端全量+终态截断模式）"),
                      recent_terminal: int = Query(30, ge=0, description="非分页模式下终态(completed/cancelled)保留的最近条数；0=全量"),
+                     include_deleted: bool = Query(False, description="Issue #995：默认隐藏 VCS 侧已删除的台账卡片；设为 true（或 =1）可审计返回，并带 is_vcs_deleted=true / vcs_exists=false"),
                      user: dict = Depends(require_org_member)):
     """仓库 Issue 列表（归一：收编原 repo/{owner}/{repo}，复用 _query_tasks 富化 + 事件聚合）。
 
@@ -1973,52 +2280,146 @@ def list_repo_issues(owner: str, repo: str,
     - 行为对齐原 issues_list（仓库 public 读聚合，无显式仓库权限门禁）
     - Issue #542 三种模式：
       * per_page>0：真分页（COUNT + LIMIT/OFFSET，响应含 total/page/per_page/has_more）
+        Issue #926：PR 伪卡片并入同一分页窗口（issue 行窗口取 offset+per_page+PR 数，
+        与全量 PR 卡按同排序键合并后切页；total 计入 PR 卡，滚动累计与 total 一致）
       * 默认（per_page=0，无 status 过滤，recent_terminal>0）：非终态全量 + 终态最近 N 条
         （分析文档第一步"数据截断"：前端不改也能先受益，翻页再拉走 per_page）
       * recent_terminal=0 或显式 status 过滤：legacy 全量返回
+    - Issue #926：q（标题/编号 LIKE）与 statuses（逗号分隔多状态）为服务端过滤，
+      PR 伪卡片同口径过滤（statuses 匹配映射后的 task_status）。
     """
-    from src.api.issues_center import _query_tasks, _build_assignee_filter
+    from src.api.issues_center import _query_tasks, _build_assignee_filter, _build_creator_filter
     from src.user.org_db import is_org_personal
     _org_id = user.get("org_id", 0)
     _is_personal = is_org_personal(_org_id) if _org_id else True
     _filter_org_id = 0 if _is_personal else _org_id
     repo_keys = _repo_keys_of(owner, repo)
+    # Issue #926 性能补丁（2026-11-04 压测）：repo 可能同时映射 gitcode/github 两个 key
+    # （镜像仓），而 `repo_key IN (a,b)` 会让排序退化成"两个分支各自有序再归并"——
+    # 表达式索引只能逐个分支用上，最终仍建临时 B-TREE（20 万行深页 131ms，单 key 为 1ms）。
+    # 空 key 对结果零贡献，先剔掉只留有数据的 key；IN 退化为单值/少值时可走有序索引。
+    try:
+        from src.session_manager import db as _db, db_lock as _lock
+        _live = []
+        for _k in repo_keys:
+            with _lock:
+                _c = _db.cursor()
+                _c.execute("SELECT 1 FROM issue WHERE repo_key=? LIMIT 1", (_k,))
+                if _c.fetchone():
+                    _live.append(_k)
+        if _live:
+            repo_keys = _live
+    except Exception:
+        pass
+    # Issue #995：先按 provider 批量刷新 VCS 存在性并回写台账，SQL 过滤/COUNT 才能与
+    # 返回集合一致。VCS 无法核实（无 token/超时）的 repo_key 记 unavailable → fail-open，
+    # 不参与 vcs_exists 过滤（避免 VCS 抖动导致需求“消失”）。
+    _vcs_status: dict[str, dict] = {}
+    try:
+        from src.api.issue_vcs_index import refresh_vcs_existence
+        _vcs_status = refresh_vcs_existence(repo_keys) or {}
+    except Exception as _vcs_err:
+        log.warning(f"issues: refresh vcs existence failed: {_vcs_err}")
+        _vcs_status = {_k: {"status": "unavailable", "unresolved": frozenset()} for _k in repo_keys}
     placeholders = ",".join("?" * len(repo_keys))
     clauses = [f"repo_key IN ({placeholders})"]
     params: list = list(repo_keys)
+    if not include_deleted:
+        _vcs_ok = [k for k in repo_keys
+                   if (_vcs_status.get(k) or {}).get("status") == "ok"]
+        _vcs_unknown = [k for k in repo_keys
+                        if (_vcs_status.get(k) or {}).get("status") != "ok"]
+        if _vcs_ok:
+            if _vcs_unknown:
+                _ph = ",".join("?" * len(_vcs_unknown))
+                clauses.append(f"(repo_key NOT IN ({_ph}) OR COALESCE(vcs_exists, 1) != 0)")
+                params.extend(_vcs_unknown)
+            else:
+                clauses.append("COALESCE(vcs_exists, 1) != 0")
     if status:
         clauses.append("status=?")
         params.append(status)
+    # Issue #926：多状态服务端过滤（白名单校验，防注入）
+    statuses_set = set()
+    if statuses:
+        _allowed = {"active", "processing", "awaiting_input", "pending_review", "completed", "cancelled"}
+        statuses_set = {s.strip() for s in statuses.split(",") if s.strip()} & _allowed
+        if not statuses_set:
+            # Issue #926：全部为白名单外值时与 status 参数 pattern 校验（400）口径一致，
+            # 显式拒绝而非静默退化为无过滤
+            raise HTTPException(status_code=400, detail={
+                "code": 400, "message": "statuses 参数不含任何合法状态值（active/processing/awaiting_input/pending_review/completed/cancelled）"})
+        clauses.append(f"status IN ({','.join('?' * len(statuses_set))})")
+        params.extend(sorted(statuses_set))
+    # Issue #926：q 搜索（标题/编号子串，大小写不敏感）
+    if q:
+        clauses.append("(LOWER(title) LIKE ? OR CAST(issue_number AS TEXT) LIKE ?)")
+        _like = f"%{q.lower()}%"
+        params.extend([_like, _like])
     # 组织隔离
     if _filter_org_id:
         clauses.append("org_id=?")
         params.append(_filter_org_id)
     _build_assignee_filter(assignees, clauses, params)
+    _build_creator_filter(creators, clauses, params)
     where = " AND ".join(clauses)
     _order_dir = "DESC" if sort_order == "desc" else "ASC"
     _order_by = f"created_at {_order_dir}"
     if mode == "default":
-        _order_by = (f"CASE WHEN status='active' THEN 0 WHEN status='processing' THEN 1 "
-                     f"WHEN status='awaiting_input' THEN 2 WHEN status='pending_review' THEN 3 "
-                     f"ELSE 4 END, created_at {_order_dir}")
+        _order_by = f"{_status_order_sql()}, created_at {_order_dir}"
 
     _total = None
     _page_row_count = None
+    # Issue #926：PR 伪卡片先取（全量聚合，含 q/statuses 同口径过滤），
+    # 分页模式下并入统一 LIMIT/OFFSET 窗口
+    pr_items = _filter_pr_items(_query_pr_subscription_events(repo_keys), q, statuses_set)
+    for _pit in pr_items:
+        _pit.setdefault("attachments", [])
+        # Issue #805: PR 伪卡片无创建人概念（触发者语义保留 assignee），creator 置空防前端 undefined
+        _pit.setdefault("creator", "")
     if per_page > 0:
-        # ---- 真分页：COUNT + LIMIT/OFFSET ----
+        # ---- 真分页（Issue #926：PR 伪卡片并入统一窗口）----
         from src.session_manager import db, db_lock
-        try:
-            with db_lock:
-                c = db.cursor()
-                c.execute(f"SELECT COUNT(*) FROM issue WHERE {where}", params)
-                _total = c.fetchone()[0]
-        except Exception as e:
-            log.warning(f"issues: count failed: {e}")
-            _total = 0
+        # Issue #926 性能补丁（2026-11-04 压测）：q 走 `LOWER(title) LIKE '%kw%'`，前后
+        # 通配符下任何普通索引都用不上——5 万行 COUNT 74ms、20 万行约 300ms，占一次搜索
+        # 请求的大头。q 模式不返精确 total（total=null），has_more 按"本页是否满页"推断
+        # （最多多探一次空页，前端已按 has_more 终止）；无 q 时 COUNT 走索引，保持精确值。
+        if q:
+            _total = None
+        else:
+            try:
+                with db_lock:
+                    c = db.cursor()
+                    c.execute(f"SELECT COUNT(*) FROM issue WHERE {where}", params)
+                    _total = c.fetchone()[0]
+            except Exception as e:
+                log.warning(f"issues: count failed: {e}")
+                _total = 0
+            _total += len(pr_items)  # PR 卡计入 total（滚动累计口径一致）
+        _offset = (page - 1) * per_page
+        # 性能守卫（2026-11-04 压测）：default 模式第一排序键是状态优先级 CASE
+        # （_status_order_sql），无法免排序；偏移越深单页越贵（issue 表 20 万行时
+        # page=6666 达 350ms），且分页查询持 db_lock，会串行阻塞其它 DB 访问。
+        # 超过 2 万条偏移直接拒绝并提示收窄，避免个别客户端把单核吃满。
+        if _offset > 20000:
+            raise HTTPException(status_code=400, detail={
+                "code": 400,
+                "message": f"深分页超过上限（偏移 {_offset} 条 > 20000），请用 q / statuses 收窄后再翻页"})
+        # Issue #926：窗口化取数（替代深页 0..offset+per_page+pr 全前缀拉取，O(page) 而非 O(offset)）。
+        # 合并序中 issue 行的全局位次 p 满足 seq-pr ≤ p ≤ seq（pr=PR 卡总数），故页窗口
+        # [_offset, _offset+per_page) 内的 issue 行其 seq 必落在 [max(0,_offset-pr), _offset+per_page)；
+        # 本地合并列表（窗口 issue 行 + 全部 PR 卡）排序后，前缀恰有 min(_offset, pr) 条
+        # 全局位次 < _offset 的多余项，从该位置切片即得全局页窗口。
+        _pr_count = len(pr_items)
         issues = _query_tasks(where, params, _order_by, include_user_id=True,
-                              limit=per_page, offset=(page - 1) * per_page)
-        _page_row_count = len(issues)
-    elif status or recent_terminal <= 0:
+                              limit=per_page + _pr_count, offset=max(0, _offset - _pr_count))
+        _merged = list(issues) + list(pr_items)
+        _merge_sort_items(_merged, mode, sort_order)
+        _page = _merged[min(_offset, _pr_count):][:per_page]
+        issues = [it for it in _page if not it.get("is_pr_event")]
+        _page_pr = [it for it in _page if it.get("is_pr_event")]
+        _page_row_count = len(_page)
+    elif status or statuses_set or recent_terminal <= 0:
         # ---- legacy 全量（显式 status 过滤 = 调用方明确要该状态全量）----
         issues = _query_tasks(where, params, _order_by, include_user_id=True)
     else:
@@ -2039,6 +2440,9 @@ def list_repo_issues(owner: str, repo: str,
     _numbers = [str(it.get("issue_number")) for it in issues if it.get("issue_number")]
     group_map = _group_events_by_issue(repo_keys, numbers=_numbers or None)
     stage_map = _issue_stage_map(repo_keys, numbers=_numbers or None)
+    # Issue #648 性能修复：附件改为按仓库前缀一次拉全量再内存分组（原逐卡一次 OBS list，
+    # 几百卡串行 = 十几秒），返回结构不变；PR 伪卡片编号错配仍在下方置 []。
+    _attach_map = _issue_attachments_batch(repo_keys)
     for it in issues:
         _num = it.get("issue_number")
         it["number"] = _num or it.get("number")
@@ -2046,6 +2450,8 @@ def list_repo_issues(owner: str, repo: str,
         _st = stage_map.get(str(_num or "")) or {}
         it["owner_agent"] = it.get("owner_agent") or _st.get("owner_agent", "vod")
         it.setdefault("assignee", _st.get("assignee", ""))
+        # Issue #805: creator 缺失时从 issue 行兜底（如 issue_state 过渡期来源）
+        it.setdefault("creator", _st.get("creator", ""))
         it.setdefault("parent_issue_id", _st.get("parent_issue_id", ""))
         it.setdefault("is_subtask_mode", _st.get("is_subtask_mode") or 0)
         evs = group_map.get(str(_num or "")) or []
@@ -2067,21 +2473,60 @@ def list_repo_issues(owner: str, repo: str,
         # Issue #648：统一列表卡片带附件清单（无附件为 []，前端附件区直接消费）
         # PR 订阅伪卡片（is_pr_event）编号与 GitCode PR 对应，不是 issue 附件目录编号；
         # PR 号与同仓 issue 号重合时会命中错误附件目录，显式置 [] 防错配
-        it["attachments"] = [] if it.get("is_pr_event") else _issue_attachments([it.get("repo_key") or ""], _num)
+        # Issue #926 + #648 合并口径：附件清单走仓库级批量映射（_attach_map，避免逐卡 OBS list）；
+        # 分页模式瘦身——不回 attachments 清单（仅 attachments_count），计数直接取批量映射长度
+        # （无需再走 _issue_attachments_count 的 URL 预签名/元数据构造成本），前端按 count
+        # 判定 count=0 免请求直渲 / count>0 走 /issues/{id}/attachments 异步填充。
+        if it.get("is_pr_event"):
+            it["attachments"] = []
+            it["attachments_count"] = 0
+        else:
+            _att = _attach_map.get(str(_num or ""), [])
+            if per_page > 0:
+                it.pop("attachments", None)
+            else:
+                it["attachments"] = _att
+            it["attachments_count"] = len(_att)
 
-    # PR 订阅事件：从 events 表查 issue_id LIKE '#pr_%' 的记录，构造伪卡片混入列表
-    # Issue #542：分页模式下 PR 卡片只混入第 1 页（避免逐页重复）；has_more 按 issue 行数计算
-    pr_items = _query_pr_subscription_events(repo_keys)
-    # Issue #648：PR 伪卡片 attachments 兜底恒为 []（PR 号非 issue 附件目录编号，防错配）
-    for _pit in pr_items:
-        _pit.setdefault("attachments", [])
-    if _total is None or page == 1:
+    # PR 订阅事件伪卡片混入。Issue #926：分页模式已按合并序切页挑出本页 PR 卡；
+    # Issue #1816：非分页（线上全量）路径不再整块追加到末尾，PR 伪卡片与真实 Issue
+    # 同键合并重排，复用 _merge_sort_items 与 SQL/分页路径同源排序口径。
+    if per_page > 0:
+        issues.extend(_page_pr)
+    else:
         issues.extend(pr_items)
+        _merge_sort_items(issues, mode, sort_order)
+
+    # Issue #995：存在性标注——PR 伪卡片来自 PR 事件而非 issue 台账，不参与已删除过滤；
+    # 普通卡片按 repo_key 的校验结果给出 vcs_check，vcs_exists=false 即 VCS 侧已删除。
+    for _it in issues:
+        if _it.get("is_pr_event"):
+            _it["vcs_exists"] = True
+            _it["is_vcs_deleted"] = False
+            _it["vcs_check"] = "ok"
+            continue
+        _rk = _it.get("repo_key") or ""
+        _it["vcs_exists"] = bool(_it.get("vcs_exists", True))
+        _it["is_vcs_deleted"] = not _it["vcs_exists"]
+        _info = _vcs_status.get(_rk) or {}
+        _it["vcs_check"] = "unavailable"
+        if _info.get("status") == "ok":
+            _unresolved = _info.get("unresolved") or frozenset()
+            try:
+                _unknown = int(_it.get("issue_number")) in _unresolved
+            except (TypeError, ValueError):
+                _unknown = True
+            # 单卡复核 unknown（无法确认存在性）时同样标 unavailable，不冒充已完成校验。
+            _it["vcs_check"] = "unavailable" if _unknown else "ok"
 
     # Issue #542：分页模式返回服务端分页元数据；非分页模式 total 维持 len(issues)（兼容旧语义）
     if _total is not None:
         return {"issues": issues, "total": _total, "page": page, "per_page": per_page,
                 "has_more": (page - 1) * per_page + (_page_row_count or 0) < _total}
+    if per_page > 0:
+        # q 模式（不精确 total）：满页即认为还有下一页，最多多探一次空页
+        return {"issues": issues, "total": None, "page": page, "per_page": per_page,
+                "has_more": (_page_row_count or 0) >= per_page}
     return {"issues": issues, "total": len(issues)}
 
 
@@ -2127,6 +2572,9 @@ def get_issue_detail(owner: str, repo: str, number: int,
             _asg = _vi.get("assignee") or ""
             if isinstance(_asg, dict):
                 _asg = _asg.get("login") or _asg.get("username") or ""
+            # Issue #805: VCS 兜底详情透出创建人（GitCode issue 作者 login）
+            _vcs_user = _vi.get("user") or {}
+            _vcs_creator = (_vcs_user.get("login") or _vcs_user.get("username") or "") if isinstance(_vcs_user, dict) else ""
             return {
                 "number": int(number),
                 "issue_id": None,
@@ -2136,6 +2584,7 @@ def get_issue_detail(owner: str, repo: str, number: int,
                 "owner_agent": "vod",
                 "scene_id": "",
                 "assignee": _asg,
+                "creator": _vcs_creator,
                 "is_subtask_mode": 0,
                 "parent_issue_id": "",
                 "events_count": 0,

@@ -9,14 +9,96 @@ from src.api.event_store import get_issue_summary
 from src.session_manager import db, db_lock
 from src.token_service import is_auth_401_error
 
-# 本机 direct 执行的有界并发池（替代无界 threading.Thread，见 engine-selection-design.md §9.3）
-_DIRECT_POOL = ThreadPoolExecutor(
-    max_workers=int(os.environ.get("RUNTIME_MAX_CONCURRENT_TASKS", "20")),
-    thread_name_prefix="ag-direct",
+# P0 (Issue #596): _execute_agent 系列已迁移到 src.runtime.direct_executor
+# 向后兼容 re-export（现有 import from event_pipeline 仍可工作）
+from src.runtime.direct_executor import (
+    _DIRECT_POOL, _DIRECT_FUTURES, _DIRECT_FUTURES_LOCK,
+    start_direct_agent, _execute_agent, _execute_agent_inner,
 )
-# {event_seq: Future} — 供 sweeper 取消排队中的 direct 任务
-_DIRECT_FUTURES: dict[int, Future] = {}
-_DIRECT_FUTURES_LOCK = threading.Lock()
+
+_COMMENT_EVENT_TYPES = ("issue_comment", "note_hook_pr")
+
+
+def _get_issue_creator(repo_key: str, issue_number: str) -> str:
+    """Issue #1668: 读取 Issue 创建人登录名（issue.created_by，建档固化）。"""
+    num = str(issue_number or "").strip().lstrip("#")
+    if not repo_key or not num.isdigit():
+        return ""
+    try:
+        with db_lock:
+            c = db.cursor()
+            c.execute(
+                "SELECT created_by FROM issue WHERE repo_key=? AND issue_number=? "
+                "ORDER BY id LIMIT 1", (repo_key, int(num)))
+            row = c.fetchone()
+        return (row[0] or "").strip() if row else ""
+    except Exception as e:
+        log.warning(f"resolve issue creator failed repo={repo_key} issue=#{num}: {e}")
+        return ""
+
+
+def resolve_actor_account(evt: dict, repo_key: str = "") -> str:
+    """Issue #1668: 统一解析 ACCOUNT/actor（a2a_event 兜底链）。
+
+    优先级：a2a_event 为 payload.account → evt.actor → Issue creator；
+    其余事件为 evt.actor → payload.account。
+    解析为空时输出结构化告警（event_type/issue_number），**禁止回退仓库属主**。
+    结果不写入 evt 缓存：Issue 建档前解析为空不应被永久缓存（下次调用会重新查库）。
+    """
+    if not isinstance(evt, dict):
+        evt = {}
+    payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+    event_type = str(evt.get("type") or evt.get("event_type") or "")
+    issue_number = str(
+        payload.get("issue_number")
+        or evt.get("issue_id")
+        or evt.get("issue_number")
+        or ""
+    ).strip().lstrip("#")
+    if event_type == "a2a_event":
+        # a2a_event 不使用 evt.account（外部归一化可能回退成仓库属主），
+        # 严格按 payload.account → actor → Issue creator 解析。
+        account = str(payload.get("account") or evt.get("actor") or "").strip()
+        if not account:
+            account = _get_issue_creator(repo_key, issue_number)
+        fallback = "payload.account->actor->issue_creator"
+    else:
+        account = str(evt.get("actor") or payload.get("account") or "").strip()
+        fallback = "actor->payload.account"
+    if not account:
+        log.warning(
+            "ACCOUNT_MISSING "
+            + json.dumps({
+                "event_type": event_type or "unknown",
+                "issue_number": issue_number,
+                "repository": evt.get("repository", ""),
+                "repo_key": repo_key,
+                "fallback": fallback,
+                "owner_fallback": False,
+            }, ensure_ascii=False)
+        )
+    return account
+
+
+def _a2a_actor_for(evt: dict, issue_id: str, repo_key: str) -> str:
+    """Issue #1668: 解析派生 a2a_event 的触发人账号。
+
+    订阅 / PR 订阅 / VOD 重派统一走此入口：以派生 issue_id 构造临时 a2a_event，
+    按 payload.account → actor → Issue creator 解析，避免三处内联构造重复与优先级漂移。
+    """
+    payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+    return resolve_actor_account(
+        {"type": "a2a_event", "actor": evt.get("actor", ""),
+         "issue_id": issue_id, "payload": payload},
+        repo_key,
+    )
+
+
+def _payload_with_account(payload, account: str) -> dict:
+    """Issue #1668: 复制 payload 并回填解析后的 account（落库与事件 actor 保持一致）。"""
+    out = dict(payload) if isinstance(payload, dict) else {}
+    out["account"] = account
+    return out
 
 
 def _get_task_repo_token(repo_key: str) -> str:
@@ -151,7 +233,7 @@ def _is_path_b_self_loop(repo_key: str, actor: str, event_type: str, issue_id: s
 
 
 # Issue #565: bot 建单智能推荐仓级滑动窗口限流（进程内实现，不进 DB）
-_BOT_OPEN_RECOMMEND_LIMIT = 5
+_BOT_OPEN_RECOMMEND_LIMIT = 30
 _BOT_OPEN_RECOMMEND_WINDOW_SECONDS = 60.0
 _BOT_OPEN_RECOMMEND_WINDOWS: dict = {}
 
@@ -216,6 +298,46 @@ def _fail_scene_all_offline(seq: int, scene_id: str, agent_type: str, context: s
         except Exception as _e541:
             log.warning(f"_fail_scene_all_offline: failure reason lookup failed: {_e541}")
     _fail_event(seq, _reason)
+
+
+def _notify_scene_precheck_failure(repo_key: str, issue_id: str, problems: list,
+                                   trace_id: str = "") -> None:
+    """Issue #1245: webhook 侧场景预校验失败 → 在 Issue 评论原因（best-effort）。"""
+    num = _issue_num_from(issue_id)
+    if not num:
+        return
+    lines = ["场景可用性预校验未通过，已跳过流水线启动（Issue 已正常创建，无需重复建单）。", ""]
+    for p in (problems or [])[:8]:
+        node = p.get("node_tag") or "-"
+        code = p.get("reason_code") or ""
+        msg = p.get("message") or ""
+        suggestion = p.get("suggestion") or ""
+        lines.append(f"- 节点 `{node}`：{msg}（reason_code: {code}）")
+        if suggestion:
+            lines.append(f"  - 建议：{suggestion}")
+    if trace_id:
+        lines.append("")
+        lines.append(f"trace_id: {trace_id}")
+    lines.append("")
+    lines.append("修复场景配置或启动引擎后重新触发即可。")
+    body = "\n".join(lines)
+    try:
+        from src.repo_key import split_owner_repo
+        from src.token_service import get_repo_bot_token
+        owner, rname = split_owner_repo(repo_key)
+        token = get_repo_bot_token(repo_key) or ""
+        if not token:
+            log.warning(f"scene_precheck notify: no bot token for {repo_key}, skip comment")
+            return
+        if _is_github_repo(repo_key):
+            _github_post_issue_comment(owner, rname, str(num), body, token)
+        else:
+            _gitcode_post_issue_comment_ledgered(f"{owner}/{rname}", num, body, token,
+                                                 repo_key=repo_key)
+        log.info(f"scene_precheck notify: posted reason comment to {repo_key}#{num}")
+    except Exception as e:
+        log.warning(f"scene_precheck notify: comment failed for {repo_key}#{num}: {e}")
+
 
 def _scene_qa_skill(repo_key: str, scene_id: str, matches: list) -> str:
     """取指定场景 QA 节点的 skill：优先从订阅匹配列表取，查不到再读场景节点表。"""
@@ -352,15 +474,22 @@ def resolve_skill_from_pipeline(repo_key: str, agent_type: str, scene_id: str = 
     return ""
 
 
-def start_direct_agent(fn, args, name=""):
-    """提交一个本机 direct 执行任务到有界池（webhook / run_pipeline 共用）。"""
-    future = _DIRECT_POOL.submit(fn, *args)
-    # 从 args 中提取 seq（约定第一个参数是 repo_key，第二个是 seq）
-    seq = args[1] if len(args) > 1 else 0
-    if seq:
-        with _DIRECT_FUTURES_LOCK:
-            _DIRECT_FUTURES[seq] = future
-    return future
+def resolve_scene_node_skill_id(repo_key: str, agent_type: str,
+                                scene_id: str = "", user_id: int = 0) -> int:
+    """读场景节点的 skill_id（Issue #979 权威派发标识）。
+
+    节点仅存 skill_name（老场景）或节点缺失 → 返回 0（调用方按名字降级）。
+    """
+    try:
+        from src.api.pipeline_config import get_node_by_tag
+        if not scene_id:
+            return 0
+        node = get_node_by_tag(scene_id, agent_type, repo_key=repo_key, user_id=user_id)
+        if node:
+            return int(node.get("skill_id") or 0)
+    except Exception as e:
+        log.warning(f"resolve_scene_node_skill_id failed: {e}")
+    return 0
 
 
 def _task_insert_row(_cols, **kw):
@@ -439,7 +568,8 @@ def _create_direct_task(repo_key, seq, agent_type, backend, skill_name,
             exit_code=None, result_text="", errors="", stderr="",
             usage_json="{}", started_at=now, completed_at=None, created_at=now,
             pending_since=None,
-            user_gitcode_token="")
+            user_gitcode_token="",
+            trace_context="")
         with db_lock:
             c = db.cursor()
             c.execute(
@@ -508,16 +638,15 @@ def _create_failed_task(repo_key, seq, agent_type, backend, skill_name,
 
     # env_extra
     repository = evt.get("repository", "")
-    from src.repo_key import split_owner_repo as _sor
-    from src.repo_key import from_repo_key as _frk
-    _owner, _repo_name = _sor(repository)
+    # Issue #1660：REPO_OWNER/REPO_NAME 一律由 REPO_FULL_NAME 派生（缺失回退 repo_key），
+    # 禁止以触发人账号充当 REPO_OWNER；REPO_FULL_NAME 归一（剥 provider 前缀）供 runbook 拼 URL。
+    from src.repo_key import derive_repo_identity as _derive
+    _full_name, _owner, _repo_name = _derive(repository, repo_key)
     env_extra = {
-        # Issue #721: REPO_FULL_NAME 归一（剥 provider 前缀），保证下游 runbook
-        # clone URL（https://gitcode.com/$REPO_FULL_NAME.git）拼接正确；无前缀幂等。
-        "REPO_FULL_NAME": _frk(repository) or repository,
+        "REPO_FULL_NAME": _full_name,
         "REPO_OWNER": _owner,
         "REPO_NAME": _repo_name,
-        "ACCOUNT": evt.get("actor") or evt.get("account") or "",
+        "ACCOUNT": resolve_actor_account(evt, repo_key),
     }
 
     # repo_gitcode_token（按 provider 分流，用户 token 写空由运行时实时获取）
@@ -544,7 +673,8 @@ def _create_failed_task(repo_key, seq, agent_type, backend, skill_name,
             exit_code=1, result_text="", errors=_reason, stderr="",
             usage_json="{}", started_at=now, completed_at=now, created_at=now,
             pending_since=None,
-            user_gitcode_token="")
+            user_gitcode_token="",
+            trace_context="")
         with db_lock:
             c = db.cursor()
             c.execute(
@@ -681,6 +811,12 @@ def _is_pr_payload(payload: dict) -> bool:
     object_attributes 解析 → 子任务 issue_id=#0。
     改为：仅当有 pull_request/merge_request 键，或 object_attributes 含 PR 特有字段
     （source_branch/target_branch）时才判定为 PR。
+
+    分工（Issue #1802）：本函数只服务 `resolve_issue_id`——决定 Issue 编号该从
+    `object_attributes` 还是 PR 关联 issues 解析。为保证既有 issue_id 契约与 #89
+    用例不变，这里对 `source_branch` 等结构键从宽判 PR。PR_NUMBER 的实体准入另由
+    `_is_pr_entity_event` 负责（Issue 实体优先、已知 Issue 事件一律判 False），两者
+    口径不同是有意的，请勿互相复用。
     """
     if bool(payload.get("pull_request")) or bool(payload.get("merge_request")):
         return True
@@ -783,6 +919,206 @@ def _inject_bot_agent_env(env_extra: dict, repo_key: str, agent_type: str) -> No
         pass
 
 
+_PR_URL_NUMBER_RE = re.compile(r"/(?:merge_requests|pulls|pull)/(\d+)(?:[#/?]|$)")
+
+# Issue #1802 复审：URL 兜底取到的 PR 号做一次存在性校验（issue 反馈建议第 2 条）。
+# 只对 `_pr_source == "url"` 这条罕见路径生效，避免给正常 PR 事件加网络依赖。
+_PR_EXISTS_CACHE: dict = {}
+# 取值依据（MR !1145 Critical-3）：60s 与本文件既有「事件级缓存」同量级，覆盖同一事件
+# 在流水线多 agent 组装 prompt 的重复校验窗口；128 条上限对应「1 分钟内最多 128 个
+# 不同 (repo, PR) 组合」，按单仓每分钟 PR 事件量级取整（超出按 FIFO 淘汰一半）。
+_PR_EXISTS_TTL = 60.0
+_PR_EXISTS_MAX = 128
+
+
+def _pr_number_exists(repo_key: str, pr_num: str) -> bool:
+    """PR 号是否真实存在（仓库内）。仅 URL 来源调用，结果 60s 缓存。
+
+    只有明确的 404/未找到才判不存在；网络异常、无 token、其它错误一律按「存在」处理，
+    避免把一次抖动变成「PR_NUMBER 消失」的新故障。
+    """
+    if not repo_key or not str(pr_num or "").isdigit():
+        return True
+    key = (repo_key, str(pr_num))
+    now = time.time()
+    cached = _PR_EXISTS_CACHE.get(key)
+    if cached and now - cached[0] < _PR_EXISTS_TTL:
+        return cached[1]
+    exists = True
+    try:
+        from src.user.db import get_gitcode_token
+        from src.vcs.api_client import create_client
+        token = get_gitcode_token(repo_key=repo_key) or ""
+        if token:
+            resp = create_client(repo_key, token).get_pr(int(pr_num))
+            if not isinstance(resp, dict) or not resp:
+                exists = False
+            elif "error" in resp:
+                err = str(resp.get("error") or "").lower()
+                exists = not any(m in err for m in ("404", "not found", "不存在"))
+    except Exception as e:
+        log.info(f"Pipeline env: PR #{pr_num} existence check skipped ({e})")
+        exists = True
+    if len(_PR_EXISTS_CACHE) >= _PR_EXISTS_MAX:
+        for _k in list(_PR_EXISTS_CACHE.keys())[:_PR_EXISTS_MAX // 2]:
+            _PR_EXISTS_CACHE.pop(_k, None)
+    _PR_EXISTS_CACHE[key] = (now, exists)
+    return exists
+
+
+def _numeric_value(value) -> str:
+    """返回去 # 前缀后的纯数字字符串；非数字/空返回空串。"""
+    text = str(value or "").strip().lstrip("#")
+    return text if text.isdigit() else ""
+
+
+def _pr_number_from_url(*values) -> str:
+    """从 PR/MR 结构化 URL（.../merge_requests/<N>、.../pulls/<N>）提取编号。"""
+    for value in values:
+        match = _PR_URL_NUMBER_RE.search(str(value or ""))
+        if match and match.group(1) != "0":
+            return match.group(1)
+    return ""
+
+
+# Issue #1802：PR/MR 实体事件白名单。只有这些事件才允许从对象结构里取 PR 号；
+# Issue 实体的 object_attributes.iid 是 Issue 自身编号，永不作 PR 号来源。
+# 直接复用 src/api/routing.py 的 PR_EVENT_TYPES（单一事实源）；历史别名
+# pr_opened/pr_updated/pr_closed/pr_merged/pr_comment 由下方 "pr_" 前缀统一兜住，
+# 不再维护第二份清单（避免后续漂移）。
+_PR_ENTITY_EVENT_TYPES = set(PR_EVENT_TYPES)
+
+# payload 中 PR/MR 实体的结构特征（GitLab MR hook 的 object_attributes 含这些键；
+# Issue hook 的 object_attributes 不含）。
+_PR_OBJECT_ATTR_KEYS = ("source_branch", "target_branch", "merge_status")
+
+# PR 评论事件别名（canonical = note_hook_pr；兼容历史/外部事件名）。
+_NOTE_HOOK_EVENT_TYPES = {"note_hook_pr", "pr_comment"}
+
+
+def _noteable_type(payload: dict) -> str:
+    """取 object_attributes.noteable_type 归一化小写；缺失/非法返回空串。"""
+    if not isinstance(payload, dict):
+        return ""
+    obj_attrs = payload.get("object_attributes")
+    if not isinstance(obj_attrs, dict):
+        return ""
+    return str(obj_attrs.get("noteable_type") or "").strip().lower()
+
+
+def _is_pr_entity_event(event_type: str, payload: dict) -> bool:
+    """Issue #1802：判定事件实体是否为 PR/MR。
+
+    准入 = 事件类型白名单 **或** payload 带 PR/MR 实体结构特征。目的是把
+    「Issue 事件的 object_attributes.iid」挡在 PR 号候选链之外，避免 Issue 编号
+    被当成不存在的 PR 编号注入。
+
+    Issue 实体优先：`object_attributes.noteable_type == Issue` 一律判 False，
+    不再被 note_hook_pr 等事件白名单短路。已知 Issue 事件（`ISSUE_EVENT_TYPES`）
+    即使携带 `source_branch` 等结构键也判 False——此处是 PR_NUMBER 的严格准入，
+    与 `_is_pr_payload`（服务 `resolve_issue_id`、对结构键从宽判 PR）分工不同。
+    """
+    noteable = _noteable_type(payload)
+    if noteable == "issue":
+        return False
+    et = str(event_type or "").strip().lower()
+    if et in _PR_ENTITY_EVENT_TYPES:
+        return True
+    if et.startswith(("pull_request", "merge_request", "pr_")):
+        return True
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("pull_request"), dict) or isinstance(payload.get("merge_request"), dict):
+        return True
+    if noteable in ("mergerequest", "pullrequest"):
+        return True
+    if et in ISSUE_EVENT_TYPES:
+        # 已知 Issue 实体事件：object_attributes 属于 Issue 自身，结构键不可作 PR 依据
+        return False
+    obj_attrs = payload.get("object_attributes")
+    if isinstance(obj_attrs, dict) and any(k in obj_attrs for k in _PR_OBJECT_ATTR_KEYS):
+        return True
+    return False
+
+
+def _as_payload_dict(value) -> dict:
+    """把 events.payload（可能是 JSON 字符串）归一为 dict；非法值返回空 dict。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_pr_number(evt: dict, payload: dict, event_type: str) -> tuple[str, str]:
+    """Issue #1579：统一 PR 号解析链，note_hook_pr 与普通事件共用同一来源。
+
+    返回 (PR 号, 来源)。来源：payload（结构化字段，含 URL 兜底）；失败返回 ("", "")。
+    note_hook_pr 不使用 object_attributes.iid：Note Hook 中该字段是评论自身 id，
+    误用会把评论号当成 PR 号；改为从 object_attributes.url（.../merge_requests/<N>）
+    等结构化 URL 兜底。仅消费结构化字段，不从事件标题猜号——真实事件标题是 MR/Issue
+    标题（如 `fix: #1412 ...`），不含 `note_hook_pr #<N>` 标记。
+
+    Issue #1802：按事件实体类型设准入闸门。payload.pr_number / evt._pr_sub_pr_number
+    是显式 PR 号来源，始终可信；pull_request / merge_request / object_attributes
+    等对象结构来源只对 PR/MR 实体事件开放。Issue Hook 的 object_attributes 就是
+    该 Issue 自身，其 iid 即 Issue 编号，不得落入 PR 号候选链。
+    """
+    payload = _as_payload_dict(payload)
+    merge_req = payload.get("merge_request")
+    pull_req = payload.get("pull_request")
+    obj_attrs = payload.get("object_attributes")
+    merge_req = merge_req if isinstance(merge_req, dict) else {}
+    pull_req = pull_req if isinstance(pull_req, dict) else {}
+    obj_attrs = obj_attrs if isinstance(obj_attrs, dict) else {}
+
+    candidates = [
+        payload.get("pr_number"),
+        evt.get("_pr_sub_pr_number"),
+    ]
+    # 单次解析只判定一次实体类型，避免重复解析（Issue #1802 复审）
+    is_pr_entity = _is_pr_entity_event(event_type, payload)
+    if is_pr_entity:
+        if str(event_type or "").strip().lower() in _NOTE_HOOK_EVENT_TYPES:
+            candidates.extend([
+                merge_req.get("iid"),
+                merge_req.get("number"),
+                pull_req.get("iid"),
+                pull_req.get("number"),
+            ])
+            # noteable_type=Issue 时 noteable_iid 是 Issue 编号，永不作 PR 号来源
+            if _noteable_type(payload) != "issue":
+                candidates.append(obj_attrs.get("noteable_iid"))
+        else:
+            candidates.extend([
+                pull_req.get("number"),
+                pull_req.get("iid"),
+                merge_req.get("number"),
+                merge_req.get("iid"),
+                obj_attrs.get("iid"),
+            ])
+    for value in candidates:
+        num = _numeric_value(value)
+        if num:
+            return num, "payload"
+
+    if is_pr_entity:
+        url_num = _pr_number_from_url(
+            obj_attrs.get("url"),
+            merge_req.get("web_url"),
+            merge_req.get("url"),
+            pull_req.get("web_url"),
+            pull_req.get("url"),
+        )
+        if url_num:
+            return url_num, "url"
+    return "", ""
+
+
 def _inject_issue_pr_env(env_extra: dict, evt: dict, repo_key: str) -> None:
     """Issue #528：ISSUE_NUMBER/PR_NUMBER 仅注入纯数字值。
 
@@ -797,6 +1133,16 @@ def _inject_issue_pr_env(env_extra: dict, evt: dict, repo_key: str) -> None:
     前两来源均空时依次尝试 payload.pull_request.number（GitHub/GitCode）→
     payload.merge_request.number（GitLab MR）→ payload.object_attributes.iid
     （GitLab hook），沿用 lstrip("#").isdigit() 校验。
+
+    Issue #1579：note_hook_pr 与普通事件统一走 `_extract_pr_number` 解析链——
+    payload 结构化字段优先（含 Note Hook noteable_iid），缺失时从
+    object_attributes.url / merge_request、pull_request 的 URL（.../merge_requests/<N>）
+    兜底；不从事件标题猜号。解析失败注入 PR_NUMBER_PARSE_FAILED=1 并告警，
+    禁止用 ISSUE_NUMBER 顶替。
+
+    Issue #1802：无真实关联 PR 时静默不注入 PR_NUMBER（不写占位值）。
+    仅 PR/MR 实体事件解析失败保留 PR_NUMBER_PARSE_FAILED=1 告警；Issue 实体事件
+    本就不该有 PR，不写告警，避免把「Issue 无 PR」误报成解析故障。
     """
     _issue_num = str(evt.get("issue_id", "") or (evt.get("payload", {}) or {}).get("issue_number", "") or "").lstrip("#")
     if _issue_num.isdigit():
@@ -819,18 +1165,21 @@ def _inject_issue_pr_env(env_extra: dict, evt: dict, repo_key: str) -> None:
         env_extra["GRAPE_ISSUE_ID"] = _card_id
     elif _issue_num:
         log.info(f"Pipeline env: non-numeric issue_id '{_issue_num}', skip ISSUE_NUMBER/GRAPE_ISSUE_ID injection (Issue #528)")
-    _payload = evt.get("payload", {}) or {}
-    _pr_raw = (_payload.get("pr_number", "")
-               or evt.get("_pr_sub_pr_number", "")
-               or (( _payload.get("pull_request", {}) or {}).get("number", "") if isinstance(_payload.get("pull_request"), dict) else "")
-               or ((_payload.get("merge_request", {}) or {}).get("number", "") if isinstance(_payload.get("merge_request"), dict) else "")
-               or ((_payload.get("object_attributes", {}) or {}).get("iid", "") if isinstance(_payload.get("object_attributes"), dict) else "")
-               or "")
-    _pr_num = str(_pr_raw).lstrip("#")
-    if _pr_num.isdigit():
+    _payload = _as_payload_dict(evt.get("payload", {}))
+    _event_type = str(evt.get("type", "") or evt.get("event_type", "") or "")
+    _pr_num, _pr_source = _extract_pr_number(evt, _payload, _event_type)
+    if _pr_num and _pr_source == "url" and not _pr_number_exists(repo_key, _pr_num):
+        log.warning(f"Pipeline env: PR #{_pr_num} resolved from event URL does not exist "
+                    f"(issue=#{_issue_num or '-'} repo={repo_key}); skip PR_NUMBER injection")
+        _pr_num, _pr_source = "", ""
+    if _pr_num:
         env_extra["PR_NUMBER"] = _pr_num
-    elif _pr_num:
-        log.info(f"Pipeline env: non-numeric pr_number '{_pr_num}', skip PR_NUMBER injection (Issue #528)")
+        if _pr_source == "url":
+            log.info(f"Pipeline env: PR #{_pr_num} resolved from event URL (Issue #1579)")
+    elif _is_pr_entity_event(_event_type, _payload):
+        log.warning(f"Pipeline env: {_event_type or 'pr'} PR number parse failed "
+                    f"(issue=#{_issue_num or '-'}, title={evt.get('title', '') or '-'})")
+        env_extra["PR_NUMBER_PARSE_FAILED"] = "1"
 
 
 def _norm_issue_id(s) -> str:
@@ -893,6 +1242,16 @@ def resolve_issue_id(payload: dict) -> str:
     # A2A payload 用 issue_number 字段
     num = payload.get("issue_number", "")
     if num:
+        # Issue #755：跨仓转交 payload 沿用源仓单号时（编号 == carried_context.source_issue_number），
+        # 若 carried_context 显式标记了 target_issue_number（真实落地单号）则以其为准——
+        # 下游任务注入的 ISSUE_NUMBER 即命中目标仓 VCS 真实 Issue（非 404）。
+        # 仅当 payload 单号被显式标记为源单号才替换，避免污染同仓正常 A2A。
+        _cc = payload.get("carried_context")
+        if isinstance(_cc, dict):
+            _tgt = str(_cc.get("target_issue_number", "") or "").strip().lstrip("#")
+            _src = str(_cc.get("source_issue_number", "") or "").strip().lstrip("#")
+            if _tgt.isdigit() and _src == str(num).strip().lstrip("#") and _tgt != _src:
+                return f"#{_tgt}"
         return _norm_issue_id(num)
     # Issue 类事件（issue_comment 等）顶层 issue 对象
     obj = payload.get("issue", {})
@@ -1241,11 +1600,9 @@ def _dispatch_pr_subscription_extra(repo_key: str, evt: dict, event_type: str, m
         _extra_evt["_pr_sub_scene_id"] = scene_id
         _extra_evt["_pr_sub_skill"] = qa_skill
         _extra_evt["_pr_sub_engine_ids"] = qa_engine_ids
-        # 提取 PR 号用于回帖
-        _payload = evt.get("payload", {}) or {}
-        _pr_obj = _payload.get("pull_request", {}) or _payload.get("merge_request", {}) or {}
-        _obj_attrs = _payload.get("object_attributes", {}) or {}
-        _pr_num = _pr_obj.get("number", _pr_obj.get("iid", "")) or _obj_attrs.get("iid", "")
+        # 提取 PR 号用于回帖（统一走 _extract_pr_number，Issue 实体 iid 不作 PR 号来源）
+        _payload = _as_payload_dict(evt.get("payload", {}))
+        _pr_num, _ = _extract_pr_number(_extra_evt, _payload, event_type)
         if _pr_num:
             _extra_evt["_pr_sub_pr_number"] = _pr_num
         # 构造伪 issue_id（带 scene_id 区分）
@@ -1253,12 +1610,13 @@ def _dispatch_pr_subscription_extra(repo_key: str, evt: dict, event_type: str, m
         # 创建事件
         from src.api.event_store import append_event
         _title = f"PR 订阅 QA: {scene_id}"
+        _a2a_actor = _a2a_actor_for(evt, _pseudo_id, repo_key)
         seq = append_event(
             repo_key=repo_key, event_type="a2a_event",
             title=_title, issue_id=_pseudo_id, source="a2a",
-            agent_type="qa", actor=evt.get("actor", ""),
+            agent_type="qa", actor=_a2a_actor,
             summary=f"PR 订阅并行: scene={scene_id} → qa",
-            payload=evt.get("payload", {}), status="pending",
+            payload=_payload_with_account(evt.get("payload"), _a2a_actor), status="pending",
             scene_id=scene_id,
             entity_type="pull_request",
         )
@@ -1287,23 +1645,14 @@ def _dispatch_pr_subscription_extra(repo_key: str, evt: dict, event_type: str, m
                                    0, qa_skill, _engine_id, _pseudo_id,
                                    pool_engine_ids=_pool_ids or "")
         else:
-            _kind = runtime_execution_kind(_engine_id)
-            if _kind == EXEC_MODE_DIRECT:
-                _extra_evt["_skill_path"] = qa_skill
-                _extra_evt["_skill_id"] = 0
-                _direct_tid = _create_direct_task(repo_key, seq, "qa", _be, qa_skill,
-                                    qa_skill, _engine_id, _extra_evt, _pseudo_id, skill_id=0)
-                start_direct_agent(_execute_agent, (
-                    repo_key, seq, "qa", _be, qa_skill, _extra_evt, _engine_id, _direct_tid
-                ))
-            else:
-                _pool_ids = get_scene_pool_engine_ids(scene_id, "qa", repo_key=repo_key)
-                if _pool_ids is None:
-                    _fail_scene_all_offline(seq, scene_id, "qa", "Pipeline PR sub else-branch", repo_key=repo_key)
-                    return
-                _enqueue_pipeline_task(repo_key, seq, "qa", _be, qa_skill, _extra_evt,
-                                       0, qa_skill, _engine_id, _pseudo_id,
-                                       pool_engine_ids=_pool_ids or "")
+            # P0 (Issue #596): direct 路径改走 enqueue_task，由 local_claimer 认领执行
+            _pool_ids = get_scene_pool_engine_ids(scene_id, "qa", repo_key=repo_key)
+            if _pool_ids is None:
+                _fail_scene_all_offline(seq, scene_id, "qa", "Pipeline PR sub else-branch", repo_key=repo_key)
+                return
+            _enqueue_pipeline_task(repo_key, seq, "qa", _be, qa_skill, _extra_evt,
+                                   0, qa_skill, _engine_id, _pseudo_id,
+                                   pool_engine_ids=_pool_ids or "")
     except Exception as e:
         log.warning(f"Pipeline: PR subscription extra dispatch failed: {e}")
 
@@ -1318,7 +1667,6 @@ def _dispatch_pr_subscription_redispatch(evt: dict, seq: int, scene_id: str) -> 
     """
     try:
         from src.session_manager import db, db_lock
-        import json as _json
 
         repo_key = evt.get("repo_key", "") or ""
 
@@ -1343,13 +1691,10 @@ def _dispatch_pr_subscription_redispatch(evt: dict, seq: int, scene_id: str) -> 
         qa_skill = qa_node["skill"]
         qa_engine_ids = qa_node.get("engine_runtime_ids", [])
 
-        # 提取 PR 号
-        _payload = evt.get("payload", {}) or {}
-        if isinstance(_payload, str):
-            _payload = _json.loads(_payload)
-        _pr_obj = _payload.get("pull_request", {}) or _payload.get("merge_request", {}) or {}
-        _obj_attrs = _payload.get("object_attributes", {}) or {}
-        _pr_num = _pr_obj.get("number", _pr_obj.get("iid", "")) or _obj_attrs.get("iid", "")
+        # 提取 PR 号（统一走 _extract_pr_number，Issue 实体 iid 不作 PR 号来源）
+        event_type = str(evt.get("type", "") or evt.get("event_type", "") or "")
+        _payload = _as_payload_dict(evt.get("payload", {}))
+        _pr_num, _ = _extract_pr_number(evt, _payload, event_type)
 
         # 伪 issue_id（跟 _dispatch_pr_subscription_extra 一致）
         _pseudo_id = f"#pr_{_pr_num}_{scene_id}" if _pr_num else ""
@@ -1389,23 +1734,14 @@ def _dispatch_pr_subscription_redispatch(evt: dict, seq: int, scene_id: str) -> 
                                    0, qa_skill, _engine_id, _pseudo_id,
                                    pool_engine_ids=_pool_ids or "")
         else:
-            _kind = runtime_execution_kind(_engine_id)
-            if _kind == EXEC_MODE_DIRECT:
-                _extra_evt["_skill_path"] = qa_skill
-                _extra_evt["_skill_id"] = 0
-                _direct_tid = _create_direct_task(repo_key, seq, "qa", _be, qa_skill,
-                                    qa_skill, _engine_id, _extra_evt, _pseudo_id, skill_id=0)
-                start_direct_agent(_execute_agent, (
-                    repo_key, seq, "qa", _be, qa_skill, _extra_evt, _engine_id, _direct_tid
-                ))
-            else:
-                _pool_ids = get_scene_pool_engine_ids(scene_id, "qa", repo_key=repo_key)
-                if _pool_ids is None:
-                    _fail_scene_all_offline(seq, scene_id, "qa", "Pipeline PR sub else-branch", repo_key=repo_key)
-                    return
-                _enqueue_pipeline_task(repo_key, seq, "qa", _be, qa_skill, _extra_evt,
-                                       0, qa_skill, _engine_id, _pseudo_id,
-                                       pool_engine_ids=_pool_ids or "")
+            # P0 (Issue #596): direct 路径改走 enqueue_task，由 local_claimer 认领执行
+            _pool_ids = get_scene_pool_engine_ids(scene_id, "qa", repo_key=repo_key)
+            if _pool_ids is None:
+                _fail_scene_all_offline(seq, scene_id, "qa", "Pipeline PR sub else-branch", repo_key=repo_key)
+                return
+            _enqueue_pipeline_task(repo_key, seq, "qa", _be, qa_skill, _extra_evt,
+                                   0, qa_skill, _engine_id, _pseudo_id,
+                                   pool_engine_ids=_pool_ids or "")
 
         # 重派成功：把事件状态改回 running（重派前可能是 failed）
         from src.api.event_store import update_event_status
@@ -1505,12 +1841,13 @@ def _dispatch_subscription_agent(repo_key: str, evt: dict, event_type: str,
             _sub_title = f"A2A (订阅): {agent_type}"
         # Issue #252: 订阅事件继承原事件实体类型
         _sub_entity_type = "pull_request" if event_type in PR_EVENT_TYPES else ("issue" if event_type in ISSUE_EVENT_TYPES else "")
+        _a2a_actor = _a2a_actor_for(evt, issue_id, repo_key)
         seq = append_event(
             repo_key=repo_key, event_type="a2a_event",
             title=_sub_title, issue_id=issue_id, source="a2a",
-            agent_type=agent_type, actor=evt.get("actor", ""),
+            agent_type=agent_type, actor=_a2a_actor,
             summary=f"订阅触发: {event_type} → {agent_type}（主路由: {main_agent}）",
-            payload=evt.get("payload", {}), status="pending",
+            payload=_payload_with_account(evt.get("payload"), _a2a_actor), status="pending",
             entity_type=_sub_entity_type,
         )
         log.info(f"Pipeline subscription: event created seq={seq} agent={agent_type}")
@@ -1523,23 +1860,77 @@ def _dispatch_subscription_agent(repo_key: str, evt: dict, event_type: str,
             _fail_event(seq, f"订阅派发失败：无可用引擎（agent={agent_type}），请检查引擎在线状态")
             return
         _be = engine_name(engine_id) or backend
-        kind = runtime_execution_kind(engine_id)
-        if kind == EXEC_MODE_DIRECT:
-            evt["_skill_path"] = skill_path
-            evt["_skill_id"] = skill_id
-            _direct_tid = _create_direct_task(repo_key, seq, agent_type, _be, skill_name,
-                                skill_path, engine_id, evt, issue_id, skill_id=skill_id)
-            start_direct_agent(_execute_agent, (
-                repo_key, seq, agent_type, _be, skill_name, evt, engine_id, _direct_tid,
-            ), name=f"sub-{agent_type}-{seq}")
-        else:
-            from src.runtime.engine_select import _repo_user_id
-            _sub_uid = _repo_user_id(repo_key, issue_creator=evt.get("actor", ""))
-            _enqueue_pipeline_task(repo_key, seq, agent_type, _be, skill_name, evt,
-                                   skill_id, skill_path, engine_id, issue_id, user_id=_sub_uid)
+        # P0 (Issue #596): direct 路径改走 enqueue_task，由 local_claimer 认领执行
+        from src.runtime.engine_select import _repo_user_id
+        _sub_uid = _repo_user_id(repo_key, issue_creator=evt.get("actor", ""))
+        _enqueue_pipeline_task(repo_key, seq, agent_type, _be, skill_name, evt,
+                               skill_id, skill_path, engine_id, issue_id, user_id=_sub_uid)
         log.info(f"Pipeline subscription: dispatched seq={seq} agent={agent_type} mode={kind}")
     except Exception as e:
         log.warning(f"Pipeline subscription dispatch failed: {e}")
+
+
+def _evaluate_skill_scope(skill_name: str, repo_key: str, skill_id: int = 0,
+                          node_tag: str = "", scene_id: str = "") -> dict:
+    """派发门禁统一 scope 判定（Issue #1758）：直接调用单一判官。"""
+    from src.api.scene_skill_scope import evaluate
+    return evaluate({"skill": skill_name, "skill_id": skill_id,
+                     "tag": node_tag or "", "id": node_tag or ""},
+                    repo_key, "repo", scene_id=scene_id)
+
+
+def _fail_skill_resolve_event(repo_key: str, skill_name: str, scene_id: str,
+                              agent_type: str, reason: str,
+                              issue_id: str = "", seq: int = 0,
+                              scope_info: dict | None = None) -> dict:
+    """派发前技能解析失败 fail-fast（Issue #657）。
+
+    - seq>0（事件已创建）→ 走 _fail_event 同款通路：既有事件置 failed、
+      agent_tasks 同步 failed（result 带 [skill_resolve_failed] 前缀 + diag）；
+    - seq=0（事件尚未创建）→ 落 skill_resolve_failed 错误事件
+      （status=failed，result 带 [skill_resolve_failed] 前缀文案，
+      含场景/节点/技能名/原因）。
+
+    返回 result 字典（调用方直接 return，不再派发 → 替代
+    pending_self_report 1800s timeout_failed 静默超时）。
+    """
+    _scope = scope_info or {}
+    _skill_scope = _scope.get("actual_scope") or ""
+    _scene_scope = _scope.get("expected_scope") or "repo"
+    _rebind = list(_scope.get("rebind_candidates") or [])
+    _result = {"seq": seq, "event_type": "skill_resolve_failed", "skill": skill_name,
+               "repo_key": repo_key, "ok": False, "status": "failed",
+               "skill_resolve_failed": True,
+               "skill_scope": _skill_scope, "scene_scope": _scene_scope,
+               "rebind_candidates": _rebind}
+    _msg = f"[skill_resolve_failed] {reason}"
+    try:
+        if seq:
+            _fail_event(seq, _msg, diag={
+                "code": "skill_resolve_failed", "skill": skill_name,
+                "scene_id": scene_id, "agent_type": agent_type,
+                "skill_scope": _skill_scope, "scene_scope": _scene_scope,
+                "rebind_candidates": _rebind,
+                "reason": reason[:300]})
+        else:
+            from src.api.event_store import append_event
+            from src.vcs.event_types import SKILL_RESOLVE_FAILED
+            _seq = append_event(
+                repo_key=repo_key, event_type=SKILL_RESOLVE_FAILED,
+                title=f"技能解析失败: {skill_name}",
+                issue_id=issue_id, agent_type=agent_type, source="pipeline",
+                summary=reason[:200],
+                payload={"skill": skill_name, "scene_id": scene_id,
+                         "agent_type": agent_type, "reason": reason[:500],
+                         "skill_scope": _skill_scope, "scene_scope": _scene_scope,
+                         "rebind_candidates": _rebind},
+                status="failed", result=_msg, scene_id=scene_id)
+            _result["seq"] = _seq or 0
+    except Exception as e:
+        log.warning(f"Pipeline: _fail_skill_resolve_event failed: {e}")
+    log.warning(f"Pipeline: skill resolve failed (fail-fast), skill={skill_name}, "
+                f"scene={scene_id}, agent={agent_type}: {reason[:200]}")
+    return _result
 
 
 def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
@@ -1561,6 +1952,15 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
         _o_acc, _ = split_owner_repo(evt["repository"])
         evt["account"] = _o_acc
     event_type = evt.get("type", "unknown")
+
+    # Issue #996：变更类事件补齐文件清单（payload 优先，provider API 兜底）
+    from src.vcs.event_types import FILE_EVENT_TYPES
+    if event_type in FILE_EVENT_TYPES:
+        try:
+            from src.vcs.files_enrich import enrich_event_files
+            enrich_event_files(evt, repo_key)
+        except Exception as _fe:
+            log.warning(f"Pipeline: files enrich failed type={event_type} repo={repo_key}: {_fe}")
 
     log.info(f"Pipeline: start, raw_type={event_header}, source={source}, repo={evt['repository']}")
 
@@ -1810,7 +2210,7 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
         except Exception as e:
             log.warning(f"Pipeline: outbound ledger issue_opened check failed (allow-through): {e}")
     # 2.0c Issue #565: bot 建单推荐仓级滑动窗口限流——放行后、路由判定前。
-    # 同 repo_key 60s 内最多 5 条 bot 建单进推荐（防 bot 批量建单打爆模型调用），
+    # 同 repo_key 60s 内最多 _BOT_OPEN_RECOMMEND_LIMIT 条 bot 建单进推荐（防 bot 批量建单打爆模型调用），
     # 超限记 event_skipped(bot_open_recommend_rate_limited) 并终止（进程内 dict，不进 DB）。
     # 「## 父任务」子任务开单是多任务流水线内部通道，不占推荐配额。
     if event_type == "issue_opened" and _is_bot_actor:
@@ -2203,6 +2603,20 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
             from src.api.session_store import get_issue_stage as _gis
             _st_sre = _gis(repo_key, _rid_sre)
             if _st_sre and _st_sre.get("stage") == "qa":
+                # Issue #1573: PR 合并视同审核通过——qa 阶段 pending_review 时用户直接合并
+                # PR 会将卡片永久留在待审核列；此处先恢复 processing，失败降级不阻断后续推进。
+                try:
+                    from src.api.session_store import get_issue_status as _gist
+                    if _gist(repo_key, _rid_sre) == "pending_review":
+                        _num_sre = str(_rid_sre).lstrip("#")
+                        if _num_sre.isdigit():
+                            from src.api.issues_center import _resume_issue_waiting
+                            if _resume_issue_waiting(repo_key, int(_num_sre)):
+                                log.info(f"Pipeline: PR merged treated as review pass, "
+                                         f"pending_review→processing for {_rid_sre}")
+                except Exception as _resume_e:
+                    log.warning(f"Pipeline: PR merged resume pending_review failed "
+                                f"for {_rid_sre}: {_resume_e}")
                 set_issue_stage(repo_key, _rid_sre, "sre", "sre")
                 log.info(f"Pipeline: PR merged skip QA, advance stage qa→sre for {_rid_sre}")
 
@@ -2243,12 +2657,35 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
                             _sender3 = _snd.get("username") or _snd.get("login") or ""
                     except Exception:
                         pass
+                    # Issue #805: 提取创建人（creator）——优先 payload 原生 user，逐级兜底：
+                    # object_attributes/user → issue/user → VCS 详情（仅 open 类事件，避免每事件一次 API）
+                    # → sender。创建人建档固化（created_by 仅空补写），不随 assignee 流转变化。
+                    _creator3 = ""
+                    try:
+                        _cu3 = _o3.get("user") if isinstance(_o3.get("user"), dict) else None
+                        if not _cu3:
+                            _ci3 = _p3.get("issue") or {}
+                            _cu3 = _ci3.get("user") if isinstance(_ci3, dict) and isinstance(_ci3.get("user"), dict) else None
+                        if _cu3:
+                            _creator3 = _cu3.get("username") or _cu3.get("login") or ""
+                    except Exception:
+                        pass
+                    if not _creator3 and _act3 in ("open", "create", "opened", "created"):
+                        try:
+                            _st_v, _data_v = fetch_issue_via_vcs(repo_key, int(_num3))
+                            _u_v = (_data_v or {}).get("user") or {}
+                            if isinstance(_u_v, dict):
+                                _creator3 = _u_v.get("username") or _u_v.get("login") or ""
+                        except Exception:
+                            pass
+                    if not _creator3:
+                        _creator3 = _sender3
                     _t3 = str(_o3.get("title", "") or "") if isinstance(_o3, dict) else ""
                     if not _t3:
                         _t3 = evt.get("title", "") or ""
                     ensure_issue_task(repo_key, int(_num3), title=_t3, assignee=_asg3,
-                                      event_type=event_type, sender=_sender3)
-                    log.info(f"Pipeline: ensure task #{_num3} assignee={_asg3 or _sender3 or '(owner)'}")
+                                      event_type=event_type, sender=_sender3, creator=_creator3)
+                    log.info(f"Pipeline: ensure task #{_num3} assignee={_asg3 or _sender3 or '(owner)'} creator={_creator3 or '(unknown)'}")
     except Exception as _e:
         log.warning(f"Pipeline: task-center sync failed: {_e}")
 
@@ -2338,16 +2775,32 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
         skill_id = 0
         skill_path = skill_name
         _issue_scene = evt["_pr_sub_scene_id"]
+        # Issue #979: 节点 skill_id 权威优先；同时补传 user_id（此前 PR 订阅
+        # 只传 repo_key，个人同名技能被静默跳过落到 official）
+        _sub_sid = resolve_scene_node_skill_id(repo_key, "qa", scene_id=_issue_scene,
+                                               user_id=_issue_scene_uid)
         try:
-            from src.user.db import resolve_skill_id, get_skill_by_id
-            _sid = resolve_skill_id(skill_name, repo_key=repo_key)
-            if _sid:
-                skill_id = _sid
-                _sk = get_skill_by_id(_sid)
-                if _sk:
-                    skill_path = _sk.get("skill_path") or skill_name
-        except Exception:
-            pass
+            from src.user.db import resolve_skill_dispatch
+            _res = resolve_skill_dispatch(skill_name, _sub_sid, repo_key=repo_key,
+                                          user_id=_issue_scene_uid,
+                                          scene_id=_issue_scene, node_tag="qa")
+            skill_id = _res["skill_id"]
+            if _res.get("skill_name"):
+                skill_name = _res["skill_name"]
+            if _res.get("skill_path"):
+                skill_path = _res["skill_path"]
+        except Exception as _se979:
+            log.warning(f"Pipeline (PR-sub): skill dispatch resolve failed: {_se979}")
+        # Issue #657/#1758: 派发前技能 scope 校验（单一判官）——显式 skill_id
+        # 同样需要 scope 校验；user scope 或查询异常 → fail-fast 落错误事件。
+        _ev_sub = _evaluate_skill_scope(
+            skill_name, repo_key, skill_id=_sub_sid,
+            node_tag=agent_type, scene_id=_issue_scene)
+        if not _ev_sub["ok"]:
+            return _fail_skill_resolve_event(
+                repo_key, skill_name, _issue_scene, agent_type,
+                _ev_sub["reason"], issue_id=_pre_issue_id or "",
+                scope_info=_ev_sub)
         backend = ""  # PR 订阅不走 agent_session，backend 置空让 pick_engine 自动选
         log.info(f"Pipeline (PR-sub): skill from scene nodes: {skill_name} sid={skill_id} (scene={_issue_scene})")
     # Issue 级场景优先：scene 非 default 时，用 issue scene 的 skill 覆盖 session 的 skill
@@ -2364,12 +2817,26 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
         if _pipe_skill:
             skill_name = _pipe_skill
             # 同步更新 skill_id 和 skill_path，否则执行时仍用旧 skill_id 查到旧 skill
-            from src.user.db import resolve_skill_id, get_skill_by_id, get_skill_path
-            _new_sid = resolve_skill_id(_pipe_skill, repo_key=repo_key, user_id=_issue_scene_uid)
-            if _new_sid:
-                skill_id = _new_sid
-                _sk = get_skill_by_id(_new_sid)
-                skill_path = (_sk.get("skill_path") or _pipe_skill) if _sk else _pipe_skill
+            # Issue #979: 节点 skill_id 权威优先（三档同名锁定用户选择的档位），
+            # 无 id/失效 → 名字降级（user→repo→official）+ warning
+            from src.user.db import resolve_skill_dispatch
+            _node_sid = resolve_scene_node_skill_id(repo_key, agent_type, scene_id=_issue_scene,
+                                                    user_id=_issue_scene_uid)
+            _res = resolve_skill_dispatch(_pipe_skill, _node_sid, repo_key=repo_key,
+                                          user_id=_issue_scene_uid,
+                                          scene_id=_issue_scene, node_tag=agent_type)
+            # Issue #657/#1758: 单一判官校验（显式 skill_id 仍需 scope 校验）
+            _ev_pipe = _evaluate_skill_scope(
+                _pipe_skill, repo_key, skill_id=_node_sid,
+                node_tag=agent_type, scene_id=_issue_scene)
+            if not _ev_pipe["ok"]:
+                return _fail_skill_resolve_event(
+                    repo_key, _pipe_skill, _issue_scene, agent_type,
+                    _ev_pipe["reason"], issue_id=_pre_issue_id or "",
+                    scope_info=_ev_pipe)
+            if _res["skill_id"]:
+                skill_id = _res["skill_id"]
+                skill_path = _res.get("skill_path") or _pipe_skill
             else:
                 skill_path = _pipe_skill
                 skill_id = 0
@@ -2387,6 +2854,19 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
                 skill_name = _pipe_skill
                 backend = backend or ""
                 log.info(f"Pipeline (plugin): skill for {agent_type}={_pipe_skill} (scene={_issue_scene})")
+                # Issue #657/#1758: 派发前技能 scope 校验（单一判官）——显式 skill_id
+                # 同样需要 scope 校验，不再按“id 显式绑定即授权”跳过。
+                _fb_sid = resolve_scene_node_skill_id(
+                    repo_key, agent_type, scene_id=_issue_scene,
+                    user_id=_issue_scene_uid)
+                _ev_fb = _evaluate_skill_scope(
+                    _pipe_skill, repo_key, skill_id=_fb_sid,
+                    node_tag=agent_type, scene_id=_issue_scene)
+                if not _ev_fb["ok"]:
+                    return _fail_skill_resolve_event(
+                        repo_key, _pipe_skill, _issue_scene, agent_type,
+                        _ev_fb["reason"], issue_id=_pre_issue_id or "",
+                        scope_info=_ev_fb)
         if not skill_name and not _is_scene_recommend:
             # 推荐模式不需要 skill（用 build_scene_recommender_prompt 内置 prompt），
             # 跳过 fallback 的 no_agent_session 检查，直接走引擎选择 → 广播入队
@@ -2441,9 +2921,8 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
         issue_id = _resolve_event_issue_id(evt, repo_key)
     # PR 订阅：用 PR 号 + scene_id 构造伪 issue_id 参与去重（区分不同场景）
     if not issue_id and evt.get("_pr_sub_scene_id"):
-        pr_obj = payload.get("pull_request", {}) or payload.get("merge_request", {}) or {}
-        obj_attrs = payload.get("object_attributes", {}) or {}
-        pr_num = pr_obj.get("number", pr_obj.get("iid", "")) or obj_attrs.get("iid", "")
+        # 统一走 _extract_pr_number：Issue 实体 iid 不作 PR 号来源（Issue #1802 复审）
+        pr_num, _ = _extract_pr_number(evt, _as_payload_dict(payload), event_type)
         if pr_num:
             _sub_scene = evt["_pr_sub_scene_id"]
             issue_id = f"#pr_{pr_num}_{_sub_scene}"
@@ -2506,13 +2985,13 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
     # 评论是人操作、频率低，被「同 (issue,agent) 有 running 事件」的 dedup 挡掉会导致评论丢失；
     # 改为始终新建事件 + 入队（agent_tasks），由 issue_agent_session 的串行执行自然排队，
     # 待当前事件终态后再跑，不丢弃。bot 自评回声/系统回帖已在上游过滤，不会因豁免循环触发。
-    if issue_id and agent_type and event_type not in ("a2a_event", "issue_comment"):
+    if issue_id and agent_type and event_type not in (("a2a_event",) + _COMMENT_EVENT_TYPES):
         # 方案 A/C（duplicate-issue-opened-event-fix-design.md）：
         # - A：event_active_guard 唯一约束原子抢占（跨进程互斥，替代依赖进程内 db_lock 的
         #   "同 (repo,issue,agent) 无 running 事件" SELECT）；
         # - C：近 60s 同类事件（含已终态）也视为重复，处理 webhook 重发/终态后二次投递。
         # 解决 GitCode/GitHub 双 webhook 或 create_task 同步补发 + 真实 webhook 并发双投。
-        from src.api.event_store import append_skipped_event, _utc_now_str
+        from src.api.event_store import append_skipped_event, _utc_now_str, find_recent_same_event
         try:
             with db_lock:
                 _dc = db.cursor()
@@ -2530,11 +3009,10 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
                     result["skipped"] = "duplicate_active_task"
                     return result
                 # ② 近窗去重：同 (repo,issue,agent) 且同 event_type 60s 内已存在（含已终态）→ 跳过
-                _dc.execute(
-                    "SELECT seq FROM events WHERE repo_key=? AND issue_id=? AND agent_type=? "
-                    "AND event_type=? AND created_at >= ? ORDER BY seq DESC LIMIT 1",
-                    (repo_key, issue_id or "#0", agent_type, event_type, _utc_now_str(-60)))
-                if _dc.fetchone():
+                # 时间口径必须与 events.created_at 的写入口径一致（MySQL=CST 墙钟 /
+                # SQLite=UTC），见 time_utils.db_now_str。用 _utc_now_str(-60) 会在 MySQL
+                # 下把窗口放大成 8h+，PR 评论等 webhook 事件被静默判重吞掉（Issue #1487 衍生）
+                if find_recent_same_event(repo_key, issue_id or "#0", agent_type, event_type, 60):
                     log.info(f"Pipeline: dedup skip — recent {event_type} event within 60s "
                              f"for (issue,agent)=({issue_id},{agent_type})")
                     append_skipped_event(repo_key, event_type,
@@ -2578,6 +3056,18 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
     else:
         # a2a_event 或无 issue_id/agent_type：直接写入（无需 dedup）
         from src.api.event_store import append_event
+        _comment_cid = ""
+        _idem_key = ""
+        if event_type in ("issue_comment", "note_hook_pr"):
+            try:
+                from src.repo_key import parse_repo_key
+                from src.outbound_ledger import extract_event_content_id
+                _provider = parse_repo_key(repo_key)[0] if repo_key else ""
+                _comment_cid = extract_event_content_id(_provider, payload)
+                if _comment_cid:
+                    _idem_key = f"comment:{_comment_cid}"
+            except Exception as _ike:
+                log.warning(f"Pipeline: comment idempotency key build failed: {_ike}")
         _seq = append_event(
             repo_key=repo_key,
             event_type=event_type,
@@ -2591,7 +3081,14 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
             status="pending",
             scene_id=_scene_id_for_event,
             entity_type=_entity_type,
+            idempotency_key=_idem_key,
         )
+        if _seq < 0:
+            from src.api.event_store import append_skipped_event
+            append_skipped_event(repo_key, event_type, "duplicate_comment_delivery",
+                                 detail=_comment_cid, issue_id=issue_id or "#0")
+            result["skipped"] = "duplicate_comment_delivery"
+            return result
     seq = _seq
     # WAL checkpoint 在 db_lock 释放后执行（避免阻塞其他需要 db_lock 的操作）
     if seq and issue_id and agent_type and event_type != "a2a_event":
@@ -2606,6 +3103,45 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
                    "backend": backend, "skill_name": skill_name,
                    "repo_key": from_repo_key(repo_key), "ok": True, "issue_id": issue_id,
                    "repository": evt["repository"]})
+
+    # Issue #1245: webhook issue_opened 场景可用性预校验（不拒单，只不启动流水线）。
+    # 事件已落库 → 失败时置 failed（含 reason_code）+ 评论原因，与 _fail_scene_all_offline 同款终态路径。
+    # 身份口径：webhook 的建单人 = actor（issue 创建者），不是场景 owner（_issue_scene_uid）。
+    # 用 actor 解析其 grape uid 作为 user 档归属基准，避免建单人≠场景 owner 时误判。
+    if event_type == "issue_opened" and _issue_scene:
+        _pc_user = {"username": actor}
+        try:
+            from src.runtime.engine_select import _repo_user_id
+            _pc_uid = _repo_user_id(repo_key, issue_creator=actor)
+            if _pc_uid:
+                _pc_user["id"] = _pc_uid
+        except Exception as _uid_err:
+            log.warning(f"Pipeline: resolve precheck actor uid failed (Issue #1245): {_uid_err}")
+        try:
+            from src.api.scene_precheck import precheck_scene
+            _precheck = precheck_scene(_issue_scene, repo_key, _pc_user)
+        except Exception as _pc_err:
+            # fail-open：仅预校验本身异常放行；后续失败终态副作用不得被此 try 吞掉
+            log.warning(f"Pipeline: scene precheck failed, allow dispatch (Issue #1245): {_pc_err}")
+            _precheck = None
+        if _precheck and not _precheck.get("ok"):
+            from src.api.scene_precheck import problem_reason_codes, summarize_problems
+            _pc_problems = _precheck.get("problems") or []
+            _pc_codes = problem_reason_codes(_pc_problems)
+            _pc_summary = summarize_problems(_pc_problems)
+            _reason = (f"场景可用性预校验未通过（{','.join(_pc_codes) or 'unknown'}）："
+                       f"{_pc_summary}（scene={_issue_scene}, agent={agent_type}）")
+            log.warning(f"Pipeline: scene precheck blocked dispatch seq={seq}: {_reason}")
+            _create_failed_task(repo_key, seq, agent_type, backend or "", skill_name,
+                                skill_path, skill_id, evt, issue_id, runtime_id or 0)
+            _fail_event(seq, _reason, diag={
+                "code": _pc_codes[0] if _pc_codes else "scene_precheck_failed",
+                "phase": "scene_precheck",
+                "scene_id": _issue_scene,
+            })
+            _notify_scene_precheck_failure(
+                repo_key, issue_id or "", _pc_problems, _precheck.get("trace_id") or "")
+            return result
 
     # 执行分派：从引擎集合选引擎（专属→全局→本机，engine-selection-design.md v2）；
     # 选中 remote → 入队该引擎（queue_remote）；选中本机 → direct 就地执行。
@@ -2797,22 +3333,18 @@ def run_pipeline(raw_body: bytes, headers: dict, account: str = "",
     kind = runtime_execution_kind(engine_id)
     try:
         # Issue #372 §12.7: dispatch 段包 try/except，异常时 _fail_event 释放 guard
-        if kind != EXEC_MODE_DIRECT and _be and skill_name and seq > 0:
+        # P0 (Issue #596): direct 路径改走 enqueue_task，由 local_claimer 认领执行
+        if _be and skill_name and seq > 0:
             _enqueue_pipeline_task(repo_key, seq, agent_type, _be, skill_name, evt,
                                    skill_id, skill_path, engine_id, issue_id,
                                    pool_engine_ids=_pool_engine_ids, user_id=_issue_scene_uid,
                                    is_scene_recommend=_is_scene_recommend)
         elif _be and seq > 0 and (skill_name or _is_scene_recommend):
-            # 智能推荐模式 skill_name 可为空（纯 prompt）
-            evt["_skill_path"] = skill_path  # 供 prompt 构建使用（skill_id 解析出的真实路径）
-            evt["_skill_id"] = skill_id
-            # 先创建 agent_tasks + 设 started_at，防 sweeper 在排队期间误杀
-            _direct_tid = _create_direct_task(repo_key, seq, agent_type, _be, skill_name,
-                                skill_path, engine_id, evt, issue_id, skill_id=skill_id)
-            start_direct_agent(_execute_agent, (
-                repo_key, seq, agent_type, _be, skill_name, evt, engine_id, _direct_tid,
-            ), name=f"ag-{agent_type}-{seq}")
-            log.info(f"Pipeline: started agent execution, seq={seq}, repo={repo_key}, agent={agent_type}")
+            _enqueue_pipeline_task(repo_key, seq, agent_type, _be, skill_name, evt,
+                                   skill_id, skill_path, engine_id, issue_id,
+                                   pool_engine_ids=_pool_engine_ids, user_id=_issue_scene_uid,
+                                   is_scene_recommend=_is_scene_recommend)
+            log.info(f"Pipeline: enqueued agent task, seq={seq}, repo={repo_key}, agent={agent_type}")
     except Exception as _de:
         log.warning(f"Pipeline: dispatch exception for seq={seq}: {_de}")
         _fail_event(seq, f"pipeline dispatch exception: {_de}")
@@ -3155,6 +3687,233 @@ def _fail_event(seq: int, reason: str, exit_code: int = 1, diag: dict = None):
         log.warning(f"Pipeline: _fail_event failed for seq={seq}: {e}")
 
 
+# 排队派发重入锁（Issue #1667 审查修复④）：
+# 终态钩子 → drain → 派发失败 _fail_event → 再次终态 → 钩子 的递归链在此短路；
+# 同一进程内并发终态回调也只会有一路执行 drain（其余跳过，排队行仍由原子抢占保证仅派发一次）。
+_A2A_DRAIN_LOCK = threading.Lock()
+# 仍视为「前序未结束」的状态：排队事件只在这些前序终态后才应派发。
+_A2A_PRIOR_ACTIVE = ("running", "dispatched", "queued")
+
+
+def _claim_and_dispatch_queued(qseq: int, repo_key: str, agent_type: str, issue_id: str,
+                               payload: dict, qinfo: dict, prior_seq: int) -> bool:
+    """原子抢占一条排队事件（queued→running）并派发；返回是否成功派发。"""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        with db_lock:
+            c = db.cursor()
+            c.execute(
+                "UPDATE events SET status='running', started_at=? "
+                "WHERE seq=? AND status='queued'", (now_iso, qseq))
+            claimed = c.rowcount == 1
+            if claimed:
+                qinfo["dispatched_at"] = now_iso
+                payload["_a2a_queue"] = qinfo
+                c.execute("UPDATE events SET payload=? WHERE seq=?",
+                          (json.dumps(payload, ensure_ascii=False), qseq))
+            db.commit()
+    except Exception as _ce:
+        log.warning(f"a2a queue drain: claim failed queue_seq={qseq}: {_ce}")
+        return False
+    if not claimed:
+        return False
+    dispatch_info = qinfo.get("dispatch") or {}
+    if not isinstance(dispatch_info, dict):
+        dispatch_info = {}
+    skill_id = dispatch_info.get("skill_id") or 0
+    try:
+        skill_id = int(skill_id)
+    except Exception:
+        skill_id = 0
+    runtime_id = dispatch_info.get("runtime_id") or 0
+    try:
+        runtime_id = int(runtime_id)
+    except Exception:
+        runtime_id = 0
+    _issue_number = str(payload.get("issue_number") or (issue_id or "")).lstrip("#")
+    evt = dispatch_info.get("evt") or {}
+    if not isinstance(evt, dict):
+        evt = {}
+    try:
+        from src.api.a2a_dispatch import run_a2a_dispatch
+        result = run_a2a_dispatch(
+            repo_key, qseq, agent_type or "", evt,
+            skill_name=dispatch_info.get("skill_name") or (agent_type or ""),
+            skill_id=skill_id,
+            skill_path=dispatch_info.get("skill_path") or "",
+            runtime_id=runtime_id,
+            backend=dispatch_info.get("backend") or "",
+            issue_number=_issue_number,
+            repository=payload.get("repository") or "",
+            ref_seq=int(payload.get("ref_seq") or 0),
+        )
+        if not isinstance(result, dict) or result.get("status") == "failed" or not result.get("seq"):
+            _reason = (result or {}).get("error") if isinstance(result, dict) else ""
+            _fail_event(qseq, f"A2A 排队派发失败（queue_seq={qseq}，前序 seq={prior_seq}）: "
+                              f"{str(_reason or 'dispatch returned no task')[:200]}",
+                        diag={"code": "a2a_queue_dispatch_failed",
+                              "phase": "queue_drain", "ref_seq": prior_seq})
+            return False
+        log.info(f"a2a queue drain: dispatched queue_seq={qseq} "
+                 f"agent={agent_type} prior_seq={prior_seq}")
+        return True
+    except Exception as _de:
+        log.warning(f"a2a queue drain: dispatch exception queue_seq={qseq}: {_de}")
+        try:
+            _fail_event(qseq, f"A2A 排队派发异常（queue_seq={qseq}，前序 seq={prior_seq}）: "
+                              f"{str(_de)[:150]}",
+                        diag={"code": "a2a_queue_dispatch_exception",
+                              "phase": "queue_drain", "ref_seq": prior_seq})
+        except Exception:
+            pass
+        return False
+
+
+def _parse_queued_row(row):
+    """把 events 行解析为 (qseq, repo_key, agent_type, issue_id, payload, qinfo, linked_seq)。"""
+    qseq, repo_key, agent_type, issue_id, payload_raw = row
+    if not qseq or not repo_key:
+        return None
+    try:
+        payload = json.loads(payload_raw or "{}")
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    qinfo = payload.get("_a2a_queue") or {}
+    if not isinstance(qinfo, dict):
+        qinfo = {}
+    try:
+        _linked_seq = int(qinfo.get("existing_seq") or 0)
+    except Exception:
+        _linked_seq = 0
+    return qseq, repo_key, agent_type, issue_id or "", payload, qinfo, _linked_seq
+
+
+def drain_queued_a2a(prior_seq: int) -> list:
+    """Issue #1667：前序 A2A 事件终态后，派发等待在其后的排队 A2A 事件。
+
+    queue=true 的请求在命中活跃事件时先落一条 status='queued' 的 a2a_event
+    （payload._a2a_queue.existing_seq 关联前序事件），本函数在前序事件进入终态时
+    取出这些排队事件，原子置 running 并复用 run_a2a_dispatch 派发。
+
+    - 原子 UPDATE（status='queued' → 'running'）保证并发终态回调下「仅派发一次」；
+    - 派发失败 → _fail_event 置 failed（不无限重试，避免排障黑洞）；
+    - 查询按前序事件的 (repo, issue, agent) 收窄（不再全仓扫描，审查修复④）；
+    - 重入锁保证 drain 期间由 _fail_event 触发的二次终态钩子不递归；
+    - 无排队记录或查询失败 → 返回空列表，不影响终态写入主流程。
+    """
+    if not prior_seq:
+        return []
+    if not _A2A_DRAIN_LOCK.acquire(blocking=False):
+        log.info(f"a2a queue drain: another drain in progress, skip prior_seq={prior_seq}")
+        return []
+    dispatched = []
+    try:
+        with db_lock:
+            c = db.cursor()
+            c.execute("SELECT repo_key, issue_id, agent_type FROM events WHERE seq=? LIMIT 1",
+                      (prior_seq,))
+            _prior = c.fetchone()
+        if not _prior:
+            return []
+        _prior_repo, _prior_issue, _prior_agent = _prior[0] or "", _prior[1] or "", _prior[2] or ""
+        if not _prior_repo:
+            return []
+        _clauses = ["repo_key=?", "event_type='a2a_event'", "status='queued'"]
+        _params = [_prior_repo]
+        if _prior_issue:
+            _clauses.append("issue_id=?")
+            _params.append(_prior_issue)
+        if _prior_agent:
+            _clauses.append("agent_type=?")
+            _params.append(_prior_agent)
+        with db_lock:
+            c = db.cursor()
+            c.execute(
+                "SELECT seq, repo_key, agent_type, issue_id, payload FROM events WHERE "
+                + " AND ".join(_clauses) + " ORDER BY seq ASC", tuple(_params))
+            rows = c.fetchall() or []
+        for row in rows:
+            parsed = _parse_queued_row(row)
+            if not parsed:
+                continue
+            qseq, repo_key, agent_type, issue_id, payload, qinfo, _linked_seq = parsed
+            if _linked_seq != int(prior_seq):
+                continue
+            if _claim_and_dispatch_queued(qseq, repo_key, agent_type, issue_id,
+                                          payload, qinfo, prior_seq):
+                dispatched.append(qseq)
+        return dispatched
+    except Exception as _e:
+        log.warning(f"a2a queue drain: query/dispatch failed prior_seq={prior_seq}: {_e}")
+        return dispatched
+    finally:
+        _A2A_DRAIN_LOCK.release()
+
+
+def reconcile_queued_a2a(repo_key: str = "") -> list:
+    """Issue #1667：排队滞留兜底对账扫描（Spec 风险表要求）。
+
+    覆盖两类 drain 钩子触达不到的场景（审查修复①）：
+    - 前序事件经直接 SQL 写终态的旁路（runtime/service 任务级联、issues admin 确认）；
+    - 「活跃判定 → 排队落库」之间的竞态窗口：前序在间隙内完成，排队行落库时
+      已无「终态回调」可触发。
+
+    谓词：queued 事件的 `_a2a_queue.existing_seq` 指向的事件**不再活跃**
+    （不在 running/dispatched/queued，或已不存在）→ 立即按 drain 同样的原子抢占派发。
+    """
+    if not _A2A_DRAIN_LOCK.acquire(blocking=False):
+        log.info("a2a queue reconcile: another drain/reconcile in progress, skip")
+        return []
+    try:
+        with db_lock:
+            c = db.cursor()
+            if repo_key:
+                c.execute(
+                    "SELECT seq, repo_key, agent_type, issue_id, payload FROM events "
+                    "WHERE repo_key=? AND event_type='a2a_event' AND status='queued' "
+                    "ORDER BY seq ASC", (repo_key,))
+            else:
+                c.execute(
+                    "SELECT seq, repo_key, agent_type, issue_id, payload FROM events "
+                    "WHERE event_type='a2a_event' AND status='queued' ORDER BY seq ASC")
+            rows = c.fetchall() or []
+        parsed_rows = [p for p in (_parse_queued_row(r) for r in rows) if p]
+        if not parsed_rows:
+            return []
+        _prior_seqs = sorted({p[6] for p in parsed_rows if p[6]})
+        _prior_status = {}
+        if _prior_seqs:
+            _ph = ",".join("?" * len(_prior_seqs))
+            with db_lock:
+                c = db.cursor()
+                c.execute(f"SELECT seq, status FROM events WHERE seq IN ({_ph})",
+                          tuple(_prior_seqs))
+                for _s, _st in (c.fetchall() or []):
+                    _prior_status[int(_s)] = _st or ""
+        dispatched = []
+        for qseq, _repo, agent_type, issue_id, payload, qinfo, _linked_seq in parsed_rows:
+            if not _linked_seq:
+                # 无关联前序（历史/异常行）：无法判定，交由人工排障，不盲目派发
+                continue
+            _pst = _prior_status.get(_linked_seq)
+            if _pst in _A2A_PRIOR_ACTIVE:
+                continue
+            if _claim_and_dispatch_queued(qseq, _repo, agent_type, issue_id,
+                                          payload, qinfo, _linked_seq):
+                dispatched.append(qseq)
+        if dispatched:
+            log.info(f"a2a queue reconcile: dispatched {len(dispatched)} stranded queued "
+                     f"event(s) repo={repo_key or '*'}")
+        return dispatched
+    except Exception as _e:
+        log.warning(f"a2a queue reconcile failed repo={repo_key or '*'}: {_e}")
+        return []
+    finally:
+        _A2A_DRAIN_LOCK.release()
+
+
 # _pool_only_local_direct（方案B/方案A self-run 兜底）已随 self-run 块一并移除
 # （local-claimer 设计第二个 PR）。本机 direct 引擎的发现逻辑由
 # src/runtime/local_claimer.py 的 _local_direct_engine_ids 承接。
@@ -3274,17 +4033,20 @@ def _enqueue_pipeline_task(repo_key, seq, agent_type, backend, skill_name, evt,
         _fail_event(seq, f"入队失败：prompt 构建异常 {str(e)[:150]}")
         return
 
-    from src.prompt_builder import _resolve_server_url
-    from src.repo_key import split_owner_repo as _sor2
-    from src.repo_key import from_repo_key as _frk2
-    _owner2, _repo_name2 = _sor2(repository)
+    from src.prompt_builder import resolve_task_server_env
+    # Issue #1660：REPO_OWNER/REPO_NAME 由 REPO_FULL_NAME 派生（缺失回退 repo_key 并告警），
+    # REPO_FULL_NAME 归一（剥 provider 前缀）与 owner/name 同源口径。
+    from src.repo_key import derive_repo_identity as _derive2
+    _full_name2, _owner2, _repo_name2 = _derive2(repository, repo_key)
     env_extra = {
-        # Issue #721: REPO_FULL_NAME 归一（剥 provider 前缀），与 REPO_OWNER/REPO_NAME 口径一致。
-        "REPO_FULL_NAME": _frk2(repository) or repository,
+        "REPO_FULL_NAME": _full_name2,
         "REPO_OWNER": _owner2,
         "REPO_NAME": _repo_name2,
-        "ACCOUNT": evt.get("actor") or evt.get("account") or "",
-        "GRAPE_SERVER_URL": _resolve_server_url(runtime_id),
+        "ACCOUNT": resolve_actor_account(evt, repo_key),
+        # Issue #1577：GRAPE_SERVER_URL 承载业务 API 基址（issues/git-repo 全量端点），
+        # worker runtime / A2A 回连基址由 RUNTIME_SERVER_URL 独立承载（语义拆分）。
+        # 统一复用 resolve_task_server_env，与 build_task_env / chat 入队同源，防双实现漂移。
+        **resolve_task_server_env(runtime_id),
     }
     # 注入场景环境变量（scene_id / work_branch / custom_fields；值不暴露在 prompt 文本里）
     # Issue #427：PR 订阅任务（evt 带 _pr_sub_scene_id）场景按订阅场景注入——
@@ -3387,7 +4149,227 @@ def _resolve_scene_id(repo_key: str, issue_id: str = "") -> str:
             scene_id = (row[0] if row else "") or ""
         except Exception:
             scene_id = ""
+    # Issue #1745 复审修复：绑定的场景已被删除时，不注入幽灵 scene_id（scenes detail 必 404），
+    # 回退仓库默认场景；也不可用则按「未判定=空串」返回，与 reconcile 侧同源。
+    if scene_id and not _scene_binding_valid(repo_key, scene_id):
+        log.warning(f"[scene-env] resolved scene no longer resolvable "
+                    f"(scene={scene_id} repo={repo_key}); falling back to dev_scene")
+        scene_id = _repo_dev_scene(repo_key) or ""
+        if scene_id and not _scene_binding_valid(repo_key, scene_id):
+            scene_id = ""
     return scene_id
+
+
+def _issue_authoritative_scene(repo_key: str, issue_id: str = ""):
+    """Issue 真实归属场景（`issues detail.scene_id` 同源，Issue #1745）。
+
+    与 `_resolve_scene_id` 的区别：只读真实绑定（issue_state → issue 单表），
+    空时**不**回退仓库默认场景，用于识别 `GRAPE_SCENE_ID` 与 Issue 归属的
+    不一致（诊断/执行前校正）。PR 订阅伪 id（`#pr_<PR号>_<scene_id>`）由
+    `get_issue_bound_scene` 统一解析，不在此处重复手写。
+
+    返回值三态（Issue #1745 复审修复）：
+    - 非空字符串：Issue 已绑定该场景（权威真值）；
+    - 空字符串：查询成功且确认 Issue 未绑定场景（调用方按「未选定=空串」处理）；
+    - `None`：查询异常/缺少 issue_id，**未判定**——调用方必须跳过校正，
+      不得把正确的 GRAPE_SCENE_ID 误清空。
+    """
+    _iid = str(issue_id or "")
+    if not _iid:
+        return None
+    try:
+        from src.api.session_store import get_issue_bound_scene
+        _sid, _ = get_issue_bound_scene(repo_key, _iid)
+    except Exception:
+        log.warning(f"[scene-env] authoritative scene lookup failed: "
+                    f"issue={_iid} repo={repo_key}")
+        return None
+    if not _sid:
+        return ""
+    # Issue #1745 复审修复：绑定场景已删除时不得继续注入幽灵 scene_id
+    # （agent 拿它调 scenes detail 必 404，症状与原报障相同）→ 按「未绑定」处理。
+    if not _scene_binding_valid(repo_key, _sid):
+        log.warning(f"[scene-env] issue binding points to a deleted scene "
+                    f"(scene={_sid} issue={_iid} repo={repo_key}); treat as unbound")
+        return ""
+    return _sid
+
+
+def _scene_binding_valid(repo_key: str, scene_id: str) -> bool:
+    """绑定场景是否「显式失效」（Issue #1745 复审，MR !1145 Critical-1）。
+
+    只判一种情况：`devops_pipeline_scene` 里**存在该场景行但已全部 is_active=0**
+    （软删除/停用）→ 失效。**行不存在不算失效**：存量绑定可能来自
+    pipelines.json 内置场景、官方场景市场，或尚未落库的 Task Center 选择，
+    沿用 #568「issue 绑定即注入」的既有契约，避免 GRAPE_SCENE_ID 静默丢失。
+    查询异常一律按有效处理，不因 DB 抖动误清空场景。
+    """
+    if not scene_id:
+        return False
+    try:
+        from src.session_manager import db, db_lock
+        with db_lock:
+            rows = db.cursor().execute(
+                "SELECT is_active FROM devops_pipeline_scene "
+                "WHERE scene_id=? AND (repo_key=? OR repo_key='')",
+                (scene_id, repo_key or "")).fetchall()
+    except Exception as e:
+        log.warning(f"[scene-env] scene activity check failed (treat as valid): "
+                    f"scene={scene_id} repo={repo_key}: {e}")
+        return True
+    if not rows:
+        return True
+    return any((r[0] if r else 0) for r in rows)
+
+
+def _repo_dev_scene(repo_key: str):
+    """仓库默认开发场景（managed_repos.dev_scene）；查询异常返回 None（未判定）。"""
+    if not repo_key:
+        return None
+    try:
+        from src.session_manager import db, db_lock
+        with db_lock:
+            row = db.cursor().execute(
+                "SELECT dev_scene FROM managed_repos WHERE repo_key=?", (repo_key,)).fetchone()
+        return (row[0] if row else "") or ""
+    except Exception as e:
+        log.warning(f"[scene-env] dev_scene lookup failed for {repo_key}: {e}")
+        return None
+
+
+def scene_env_mismatch_diagnostic(injected: str, authoritative: str) -> str:
+    """场景注入值与 Issue 真实归属不一致时的可操作诊断（Issue #1745，不阻断）。"""
+    return (
+        "场景环境诊断：GRAPE_SCENE_ID 与 Issue 真实归属场景不一致，"
+        f"注入值={injected or '(空)'}，真实值={authoritative or '(空)'}。"
+        "请以 `grape issues detail` 返回的 scene_id 为准执行 "
+        "`grape scenes detail --scene_id <真实值>` 重取节点后重试；"
+        "仅当真实场景确实不含目标节点时才进入待确认。"
+    )
+
+
+_PR_SUB_ISSUE_ID_RE = re.compile(r"^#?pr_\d+_")
+_PR_SUB_PROMPT_MARKERS = ("本任务来自 PR 订阅场景", "## PR 审查任务")
+
+
+def _pr_subscription_state(issue_id: str = "", event_seq: int = 0,
+                           event_type: str = "", title: str = "",
+                           prompt: str = ""):
+    """判定任务是否属于 PR 订阅场景，返回三态（Issue #1745 复审修复）。
+
+    - `True`：确认是 PR 订阅任务；
+    - `False`：确认不是（普通 Issue/A2A/评论任务）；
+    - `None`：未判定（events 查询异常/事件行缺失），调用方应保守跳过校正。
+
+    命中路径（Issue #427 语义）：
+    1. issue_id 为 PR 订阅伪 id（`#pr_<PR号>_<scene_id>`）；
+    2. event_type 为 PR 事件类型（PR 关联 Issue 的主路由订阅任务）；
+    3. 事件标题为「PR 订阅」派发（真实关联 Issue 号 + a2a_event 的既有形态）；
+    4. 关联 events 行的 event_type / title 命中 2/3；
+    5. 事件行不可用（event_seq=0/缺失）时，回退任务 prompt 快照中的订阅标记。
+    """
+    if _PR_SUB_ISSUE_ID_RE.match(str(issue_id or "")):
+        return True
+    try:
+        from src.api.routing import PR_EVENT_TYPES
+    except Exception:
+        return None
+    if (event_type or "") in PR_EVENT_TYPES:
+        return True
+    if str(title or "").startswith("PR 订阅"):
+        return True
+    if any(_m in str(prompt or "") for _m in _PR_SUB_PROMPT_MARKERS):
+        return True
+    if event_seq:
+        try:
+            from src.session_manager import db, db_lock
+            with db_lock:
+                _row = db.cursor().execute(
+                    "SELECT event_type, title FROM events WHERE seq=?",
+                    (event_seq,)).fetchone()
+        except Exception:
+            log.warning(f"[scene-env] events lookup failed for seq={event_seq}, "
+                        f"skip scene reconcile conservatively")
+            return None
+        if not _row:
+            log.warning(f"[scene-env] events row missing for seq={event_seq}, "
+                        f"skip scene reconcile conservatively")
+            return None
+        if (_row[0] or "") in PR_EVENT_TYPES:
+            return True
+        if str(_row[1] or "").startswith("PR 订阅"):
+            return True
+        return False
+    return False
+
+
+def _is_pr_subscription_task(issue_id: str = "", event_seq: int = 0,
+                             event_type: str = "", title: str = "",
+                             prompt: str = "") -> bool:
+    """判断任务是否属于 PR 订阅场景（Issue #427 语义，Issue #1745 唯一判定入口）。
+
+    保守口径：未判定（`None`）也视为 PR 订阅/需保留订阅场景，避免 PR 订阅任务被
+    误校正为 Issue 场景而重现 #427。详见 `_pr_subscription_state` 三态说明。
+    """
+    return _pr_subscription_state(
+        issue_id, event_seq, event_type, title, prompt) is not False
+
+
+def reconcile_task_scene_env(task_id: str, env: dict) -> str:
+    """执行前用 Issue 归属场景校正任务快照中的 GRAPE_SCENE_ID（Issue #1745）。
+
+    worker 执行前拉取服务端最新 env（`GET /runtimes/{id}/tasks/{task_id}/env`），
+    此前只同步 AK/SK 与会话 token，`GRAPE_SCENE_ID` 仍是入队时快照。跨场景转交后，
+    转交前入队的任务（或重派沿用了源事件场景的任务）会拿到源场景。此处在执行前按
+    `agent_tasks → issue 当前归属场景`（`get_issue_bound_scene`，与
+    `issues detail.scene_id` 同源且不回退 dev_scene）重算并覆盖陈旧快照；
+    PR 订阅任务保持订阅场景语义不校正；Issue 未绑定场景时按「未选定=空串」口径处理；
+    PR 订阅判定未定（events 查询异常/事件行缺失）或 Issue 归属查询异常时一律跳过，
+    不覆盖快照，避免误清空正确的 GRAPE_SCENE_ID。
+
+    返回校正后的 scene_id（无需校正时为快照原值）。
+    """
+    if not isinstance(env, dict):
+        return ""
+    _snapshot = str(env.get("GRAPE_SCENE_ID") or "")
+    try:
+        from src.session_manager import db, db_lock
+        with db_lock:
+            _row = db.cursor().execute(
+                "SELECT repo_key, issue_id, event_seq, event_type, prompt "
+                "FROM agent_tasks WHERE id=?",
+                (task_id,)).fetchone()
+    except Exception:
+        return _snapshot
+    if not _row:
+        return _snapshot
+    _repo_key = _row[0] or ""
+    _issue_id = _row[1] or ""
+    _event_seq = _row[2] or 0
+    _event_type = _row[3] or ""
+    _prompt = _row[4] or ""
+    if not _repo_key or not _issue_id:
+        return _snapshot
+    if _pr_subscription_state(_issue_id, _event_seq, _event_type,
+                              prompt=_prompt) is not False:
+        return _snapshot
+    _authoritative = _issue_authoritative_scene(_repo_key, _issue_id)
+    if _authoritative is None:
+        return _snapshot
+    if not _authoritative:
+        # Issue #1745 复审修复：未绑定场景时与 DIRECT(`_resolve_scene_id`) 同源，
+        # 回退仓库默认场景（dev_scene），不再把快照清成空串——否则同一任务
+        # 本机执行拿 dev_scene、远端 worker 拿空串，出现口径分裂。
+        _dev = _repo_dev_scene(_repo_key)
+        if _dev is None:
+            return _snapshot
+        _authoritative = _dev
+    if _authoritative != _snapshot:
+        env["GRAPE_SCENE_ID"] = _authoritative
+        log.info(scene_env_mismatch_diagnostic(_snapshot, _authoritative) +
+                 f" [scene-env reconcile] task={task_id} issue={_issue_id} repo={_repo_key}")
+        return _authoritative
+    return _snapshot
 
 
 def _inject_scene_env(env_extra: dict, repo_key: str, issue_id: str = "",
@@ -3404,16 +4386,24 @@ def _inject_scene_env(env_extra: dict, repo_key: str, issue_id: str = "",
       issue_id 会解析为真实 Issue 编号，场景被误判为 Issue 场景，订阅场景 custom_fields
       （口令/IP 等）全部丢失；显式传入订阅场景（evt._pr_sub_scene_id）短路 issue_id
       解析。空串/未传 → 回退现有 _resolve_scene_id 逻辑，普通任务零破坏。
+      Issue #1745：普通 Issue/A2A 重派不得再把事件行旧 scene_id 作为 override
+      （跨场景转交后事件行仍是源场景），否则会覆盖 Issue 当前归属场景。
     """
     try:
-        scene_id = scene_id_override or _resolve_scene_id(repo_key, issue_id)
+        _override = (scene_id_override or "").strip()
+        if _override:
+            _authoritative = _issue_authoritative_scene(repo_key, issue_id)
+            if _authoritative and _override != _authoritative:
+                log.info(scene_env_mismatch_diagnostic(_override, _authoritative) +
+                         f" [scene-env inject] issue={issue_id} repo={repo_key}; "
+                         f"PR subscription overrides are expected")
+        scene_id = _override or _resolve_scene_id(repo_key, issue_id)
         env_extra["GRAPE_SCENE_ID"] = scene_id
         if not scene_id:
             return
         from src.session_manager import db, db_lock
         from src.scene_custom_env import is_upper_name, is_reserved_name, normalize_scope
         import json as _json
-        from src.config import log
         # 读 advanced_options 的 custom_fields
         with db_lock:
             c = db.cursor()
@@ -3439,7 +4429,6 @@ def _inject_scene_env(env_extra: dict, repo_key: str, issue_id: str = "",
                 continue
             env_extra[name] = str(f.get("value", ""))
     except Exception as _e:
-        from src.config import log
         log.warning(f"inject scene env failed: {_e}")
 
 
@@ -3540,14 +4529,18 @@ def build_task_env(repo_key: str, agent_type: str, issue_id: str, runtime_id: in
     import json as _json
     env = {}
     # ── 仓库/服务地址基础四项 ──
-    from src.repo_key import split_owner_repo as _sor
-    _owner, _repo_name = _sor(repo_key)
-    env["REPO_FULL_NAME"] = _repo_name and f"{_owner}/{_repo_name}" or repo_key
+    # Issue #1660：REPO_FULL_NAME/OWNER/NAME 统一由派生入口产出；重派只有 repo_key，
+    # 以其无前缀全名作为 REPO_FULL_NAME 事实源（不再出现 REPO_NAME 为空却回退带前缀全名）。
+    from src.repo_key import derive_repo_identity as _derive_env
+    from src.repo_key import from_repo_key as _from_rk_env
+    _full_name, _owner, _repo_name = _derive_env(_from_rk_env(repo_key), repo_key)
+    env["REPO_FULL_NAME"] = _full_name or repo_key
     env["REPO_OWNER"] = _owner
     env["REPO_NAME"] = _repo_name
     env["ACCOUNT"] = account
-    from src.prompt_builder import _resolve_server_url
-    env["GRAPE_SERVER_URL"] = _resolve_server_url(runtime_id)
+    from src.prompt_builder import resolve_task_server_env
+    # Issue #1577：GRAPE_SERVER_URL=业务 API 基址，RUNTIME_SERVER_URL=worker runtime 基址。
+    env.update(resolve_task_server_env(runtime_id))
     # ── 场景环境（work_branch / scene_id / custom_fields / linked_repos）──
     try:
         from src.runtime.repogit import _read_scene_work_branch
@@ -3587,7 +4580,8 @@ def get_prompt_context(repo_key: str) -> str:
 
 
 def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_name: str,
-                                evt: dict, issue_id: str, prompt: str) -> str:
+                                evt: dict, issue_id: str, prompt: str,
+                                engine_name: str = "") -> str:
     """组件4：direct 端统一物化 project-info / skill / knowledge 到工位 ws 下。
 
     替代旧的「占位符替换为服务端绝对路径（仓库级 project-info 原件 / 全局 SKILLS_DIR）」，
@@ -3641,6 +4635,8 @@ def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_n
     #    + 官方技能包回退 + 降级标注（evt._skill_materialize / prompt 降级说明），不静默空注入。
     skill_dir = os.path.join(ws, ".skills")
     try:
+        _primary_meta = {}  # Issue #1635：记录主渠道技能来源（skill_id/scope）
+
         def _skill_primary():
             _skill_local = ""  # 本地技能根目录（非空则 copytree）
             from src.user.db import get_skill_by_id, get_skill_path
@@ -3648,6 +4644,8 @@ def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_n
             if _skill_id:
                 _sk = get_skill_by_id(_skill_id)
                 if _sk:
+                    _primary_meta["skill_id"] = int(_skill_id)
+                    _primary_meta["scope"] = _sk.get("scope") or ""
                     _okey = _sk.get("file_path") or ""
                     if _okey:
                         # OBS 技能：zip 根 = {skill_name}/，原子解压到 ws/.skills/
@@ -3662,7 +4660,10 @@ def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_n
             else:
                 from src.config import resolve_official_skill_path as _resolve_skill_path
                 _real_skill_md = _resolve_skill_path(skill_name or "")
-                if not _real_skill_md:
+                if _real_skill_md:
+                    # review：按名命中官方路径须置 scope=official，否则漂移校验被跳过
+                    _primary_meta["scope"] = "official"
+                else:
                     _sp = evt.get("_skill_path", "") or ""
                     if _sp and os.path.isfile(_sp):
                         _real_skill_md = _sp
@@ -3694,9 +4695,13 @@ def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_n
                 except Exception:
                     return None
 
+            # Issue #1635 review：_primary_meta 由 _skill_primary() 执行时才写入，
+            # 参数在调用前求值会恒得空值；改为传取值 callable，primary 执行后再解析。
             _mat = materialize_skill_with_fallback(
                 skill_dir, skill_name, _skill_primary,
-                agent_type=agent_type, agent_type_fallback=_agent_type_checker_resolver)
+                agent_type=agent_type, agent_type_fallback=_agent_type_checker_resolver,
+                scope=lambda: _primary_meta.get("scope") or "",
+                skill_type=agent_type, skill_id=lambda: _primary_meta.get("skill_id") or 0)
             # 降级标注写入 evt（_execute_agent_inner 落事件 agent_logs）
             evt["_skill_materialize"] = _mat
             if _mat.get("status") in ("fallback", "degraded"):
@@ -3720,6 +4725,30 @@ def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_n
             else:
                 log.info(f"direct skill materialize {skill_name}: ok")
         prompt = prompt.replace("{{SKILL_DIR}}", skill_dir)
+        # Issue #887：direct 端执行前一致性校验（fail-fast 判定落 evt，_execute_agent
+        # 拒绝派发引擎）+ 来源标注（agent_logs）。绑定未物化且本地缓存存在其它技能 →
+        # ok=False（缓存不得覆盖绑定，拒绝执行）。键为 SKILL_CONSISTENCY_KEY 契约常量
+        # （scheduler direct 端同键消费，物化后判定，口径一致）。
+        # Issue #887（QA 复审修复）：direct 端同样扫描引擎原生技能目录
+        # （engine_skill_dirs，按 engine_name 推导后端），与 worker 门
+        # （agent._skill_consistency_gate）扫描口径对齐——绑定未物化、工位 .skills
+        # 为空、残留落在引擎原生缓存（seq=46108 变体）时不再静默放行。
+        # scheduler direct 端消费同一 evt 判定，一并覆盖。
+        _extra_dirs: list[str] = []
+        try:
+            from src.runtime.agent import _backend_for_engine
+            from src.runtime.os_adapter import engine_skill_dirs as _esd
+            _extra_dirs = _esd(_backend_for_engine(engine_name))
+        except Exception as _ede:
+            log.warning(f"direct skill consistency: engine skill dirs resolve "
+                        f"failed for engine '{engine_name}': {_ede}")
+        try:
+            from src.runtime.skill_materialize import (verify_skill_execution_consistency,
+                                                        SKILL_CONSISTENCY_KEY)
+            evt[SKILL_CONSISTENCY_KEY] = verify_skill_execution_consistency(
+                skill_name or "", skill_dir, extra_scan_dirs=_extra_dirs)
+        except Exception as _sc_e:
+            log.warning(f"direct skill consistency verify failed: {_sc_e}")
     except Exception as e:
         log.warning(f"direct skill materialize failed for {skill_name}: {e}")
         evt["_skill_materialize"] = {"status": "degraded", "detail": str(e), "skill_dir": ""}
@@ -3735,7 +4764,7 @@ def _materialize_direct_workdir(ws: str, repo_key: str, agent_type: str, skill_n
 
 
 def _submit_direct_linked_prs(env_extra: dict, repo_key: str, issue_id: str,
-                              repo_gitcode_token: str = ""):
+                              repo_gitcode_token: str = "", task_id: str = ""):
     """Issue #242: direct 模式 coding agent 完成后，向关联仓库提交 PR。
 
     与 worker 端 _submit_linked_repo_prs 等价：遍历 GRAPE_LINKED_WORKTREES，
@@ -3777,94 +4806,130 @@ def _submit_direct_linked_prs(env_extra: dict, repo_key: str, issue_id: str,
             _log.warning(f"direct linked PR: skip invalid worktree: rk={_rk} dir={_wt_dir}")
             continue
 
-        # 0. 分支护栏：检查当前分支是否是 feat/issue-{N}，禁止直推基线分支
-        from src.runtime.repogit import ensure_feature_branch
-        ensure_feature_branch(_wt_dir, _wt_branch, _base_branch, logger=_log)
-
-        try:
-            # 1. git identity（防 commit 被拒）
-            _sp.run(["git", "-C", _wt_dir, "config", "user.name", _bot_name],
-                    capture_output=True, text=True, timeout=10)
-            _sp.run(["git", "-C", _wt_dir, "config", "user.email",
-                     f"{_bot_name}@noreply.git.com"],
-                    capture_output=True, text=True, timeout=10)
-
-            # 2. stage 未提交改动
-            _sp.run(["git", "-C", _wt_dir, "add", "-A"],
-                    capture_output=True, text=True, timeout=60)
-            _r_diff = _sp.run(["git", "-C", _wt_dir, "diff", "--cached", "--quiet"],
-                              capture_output=True, text=True, timeout=30)
-            _has_staged = _r_diff.returncode != 0
-
-            # 3. 检查是否有领先于 base 分支的提交
-            _r_ahead = _sp.run(
-                ["git", "-C", _wt_dir, "rev-list", "--count",
-                 f"origin/{_base_branch}..HEAD"],
-                capture_output=True, text=True, timeout=15)
-            _ahead = 0
-            if _r_ahead.returncode == 0:
-                try:
-                    _ahead = int((_r_ahead.stdout or "0").strip() or "0")
-                except ValueError:
-                    _ahead = 0
-            else:
-                _ahead = 1  # origin/{base} 不存在 → 保守认为有改动
-
-            if not _has_staged and _ahead == 0:
-                _log.info(f"direct linked PR: no changes in {_rk}, skip")
-                _results.append({"repo_key": _rk, "status": "skipped", "reason": "no changes"})
+        # Issue #993（M1）：分支级写租约须先于 ensure_feature_branch 获取（其可能写分支）。
+        # 与 worker 端共用 branch_lease 上下文，租约获取/释放生命周期不再各写一遍。
+        from src.runtime import branch_guard as _branch_guard
+        with _branch_guard.branch_lease(
+                _rk, _wt_branch, task_id=str(task_id or "")) as _lease:
+            if not _lease.get("ok"):
+                _log.warning(f"direct linked PR: branch lease blocked {_rk}:{_wt_branch}: "
+                             f"{_lease.get('message')}")
+                _results.append({"repo_key": _rk, "status": "blocked",
+                                 "reason": _lease.get("reason", "branch_locked"),
+                                 "message": _lease.get("message", "")})
                 continue
 
-            # 4. commit staged changes
-            if _has_staged:
-                _msg = f"feat: #{_issue_num} linked repo changes"
-                _r_commit = _sp.run(["git", "-C", _wt_dir, "commit", "-m", _msg],
-                                    capture_output=True, text=True, timeout=60)
-                if _r_commit.returncode != 0:
-                    _log.warning(f"direct linked PR: commit failed {_rk}: {(_r_commit.stderr or '')[:200]}")
-                    _results.append({"repo_key": _rk, "status": "failed", "reason": "commit failed"})
+            try:
+                # 0. 分支护栏：检查当前分支是否是 feat/issue-{N}，禁止直推基线分支
+                from src.runtime.repogit import ensure_feature_branch
+                ensure_feature_branch(_wt_dir, _wt_branch, _base_branch, logger=_log)
+
+                # 1. git identity（防 commit 被拒）
+                _sp.run(["git", "-C", _wt_dir, "config", "user.name", _bot_name],
+                        capture_output=True, text=True, timeout=10)
+                _sp.run(["git", "-C", _wt_dir, "config", "user.email",
+                         f"{_bot_name}@noreply.git.com"],
+                        capture_output=True, text=True, timeout=10)
+
+                # 2. stage 未提交改动
+                _sp.run(["git", "-C", _wt_dir, "add", "-A"],
+                        capture_output=True, text=True, timeout=60)
+                _r_diff = _sp.run(["git", "-C", _wt_dir, "diff", "--cached", "--quiet"],
+                                  capture_output=True, text=True, timeout=30)
+                _has_staged = _r_diff.returncode != 0
+
+                # 3. 检查是否有领先于 base 分支的提交
+                _r_ahead = _sp.run(
+                    ["git", "-C", _wt_dir, "rev-list", "--count",
+                     f"origin/{_base_branch}..HEAD"],
+                    capture_output=True, text=True, timeout=15)
+                _ahead = 0
+                if _r_ahead.returncode == 0:
+                    try:
+                        _ahead = int((_r_ahead.stdout or "0").strip() or "0")
+                    except ValueError:
+                        _ahead = 0
+                else:
+                    _ahead = 1  # origin/{base} 不存在 → 保守认为有改动
+
+                if not _has_staged and _ahead == 0:
+                    _log.info(f"direct linked PR: no changes in {_rk}, skip")
+                    _results.append({"repo_key": _rk, "status": "skipped", "reason": "no changes"})
                     continue
 
-            # 5. push（token 经 http.extraheader 注入）
-            # R20.26.3: 关联仓库独立获取 token
-            from src.repo import Repo
-            _linked_token = Repo(_rk).bot_token
-            if not _linked_token:
-                _log.warning(f"direct linked PR: no token for {_rk}, skip push")
-                _results.append({"repo_key": _rk, "status": "failed", "reason": "no token (expired or not configured)"})
-                continue
-            _r_push = repogit._run_git(
-                ["-C", _wt_dir, "push", "origin", f"HEAD:refs/heads/{_wt_branch}"],
-                token=_linked_token, timeout=120)
-            if _r_push is None or _r_push.returncode != 0:
-                _err = (_r_push.stderr[:300] if _r_push else "git exec failed") if _r_push else "git exec failed"
-                _log.warning(f"direct linked PR: push failed {_rk}: {_err}")
-                _results.append({"repo_key": _rk, "status": "failed", "reason": f"push: {_err[:100]}"})
-                continue
+                # Issue #752（M2）：commit 前冲突标记推送守卫（与 worker 端 _submit_linked_repo_prs
+                # 同口径）：暂存硬命中阻断提交/推送；软命中告警不阻断。
+                # 保真告警不在推送口（PR #874 审查修正）：agent 正常编码必然修改功能文件，
+                # 推送口告警全是噪声；保真校验保留在清理口（同函数尾部 cleanup 段）。
+                try:
+                    from src.runtime.worktree_guard import scan_staged_files
+                    _g = scan_staged_files(_wt_dir)
+                    if _g.get("hard"):
+                        _log.warning(f"direct linked PR: conflict markers in staged files, "
+                                     f"BLOCKED push {_rk}: {_g['hard']}")
+                        _results.append({"repo_key": _rk, "status": "blocked",
+                                         "reason": f"conflict markers in staged files: "
+                                                   f"{list(_g['hard'].keys())[:5]}"})
+                        continue
+                    if _g.get("soft"):
+                        _log.warning(f"direct linked PR: soft conflict markers (allowed) {_rk}: {_g['soft']}")
+                except Exception as _ge:
+                    _log.warning(f"direct linked PR: worktree guard failed {_rk}: {_ge}")
 
-            # 6. create PR
-            from src.vcs.api_client import create_pr_for_repo
-            _pr_title = f"feat: #{_issue_num} linked repo ({_rk})"
-            _pr_body = (f"跨仓库需求开发 PR（Issue #{_issue_num}）\n\n"
-                        f"由 coding agent 自动提交，关联主仓库 {repo_key}。\n\n"
-                        f"Closes #{_issue_num}")
-            _pr_result = create_pr_for_repo(
-                repo_key=_rk, token=_linked_token,
-                title=_pr_title, head=_wt_branch, base=_base_branch,
-                body=_pr_body)
-            if isinstance(_pr_result, dict) and "error" not in _pr_result:
-                _pr_num = _pr_result.get("number") or ""
-                _pr_url = _pr_result.get("html_url") or ""
-                _log.info(f"direct linked PR: created #{_pr_num} for {_rk}: {_pr_url}")
-                _results.append({"repo_key": _rk, "status": "created",
-                                 "pr_number": _pr_num, "pr_url": _pr_url})
-            else:
-                _err = _pr_result.get("error", "unknown") if isinstance(_pr_result, dict) else "unknown"
-                _log.warning(f"direct linked PR: create_pr failed {_rk}: {_err}")
-                _results.append({"repo_key": _rk, "status": "failed", "reason": f"PR create: {_err}"})
-        except Exception as e:
-            _log.warning(f"direct linked PR: error for {_rk}: {e}")
-            _results.append({"repo_key": _rk, "status": "error", "reason": str(e)[:200]})
+                # 4. commit staged changes
+                if _has_staged:
+                    _msg = f"feat: #{_issue_num} linked repo changes"
+                    _r_commit = _sp.run(["git", "-C", _wt_dir, "commit", "-m", _msg],
+                                        capture_output=True, text=True, timeout=60)
+                    if _r_commit.returncode != 0:
+                        _log.warning(f"direct linked PR: commit failed {_rk}: {(_r_commit.stderr or '')[:200]}")
+                        _results.append({"repo_key": _rk, "status": "failed", "reason": "commit failed"})
+                        continue
+
+                # 5. push（token 经 http.extraheader 注入）
+                # R20.26.3: 关联仓库独立获取 token
+                from src.repo import Repo
+                _linked_token = Repo(_rk).bot_token
+                if not _linked_token:
+                    _log.warning(f"direct linked PR: no token for {_rk}, skip push")
+                    _results.append({"repo_key": _rk, "status": "failed", "reason": "no token (expired or not configured)"})
+                    continue
+                # Issue #993（M2）：direct 自动推送路径统一走 branch_guard.guarded_push。
+                _push = _branch_guard.guarded_push(
+                    _rk, _wt_branch, _wt_dir, token=_linked_token,
+                    run_git=repogit._run_git)
+                if not _push.get("ok"):
+                    _log.warning(f"direct linked PR: push blocked/failed {_rk}:{_wt_branch}: "
+                                 f"{_push.get('message')}")
+                    _status = "blocked" if _push.get("stage") == "preflight" else "failed"
+                    _results.append({"repo_key": _rk, "status": _status,
+                                     "reason": _push.get("reason", "guard_blocked"),
+                                     "message": _push.get("message", "")})
+                    continue
+
+                # 6. create PR
+                from src.vcs.api_client import create_pr_for_repo
+                _pr_title = f"feat: #{_issue_num} linked repo ({_rk})"
+                _pr_body = (f"跨仓库需求开发 PR（Issue #{_issue_num}）\n\n"
+                            f"由 coding agent 自动提交，关联主仓库 {repo_key}。\n\n"
+                            f"Closes #{_issue_num}")
+                _pr_result = create_pr_for_repo(
+                    repo_key=_rk, token=_linked_token,
+                    title=_pr_title, head=_wt_branch, base=_base_branch,
+                    body=_pr_body)
+                if isinstance(_pr_result, dict) and "error" not in _pr_result:
+                    _pr_num = _pr_result.get("number") or ""
+                    _pr_url = _pr_result.get("html_url") or ""
+                    _log.info(f"direct linked PR: created #{_pr_num} for {_rk}: {_pr_url}")
+                    _results.append({"repo_key": _rk, "status": "created",
+                                     "pr_number": _pr_num, "pr_url": _pr_url})
+                else:
+                    _err = _pr_result.get("error", "unknown") if isinstance(_pr_result, dict) else "unknown"
+                    _log.warning(f"direct linked PR: create_pr failed {_rk}: {_err}")
+                    _results.append({"repo_key": _rk, "status": "failed", "reason": f"PR create: {_err}"})
+            except Exception as e:
+                _log.warning(f"direct linked PR: error for {_rk}: {e}")
+                _results.append({"repo_key": _rk, "status": "error", "reason": str(e)[:200]})
 
     _created = [r for r in _results if r.get("status") == "created"]
     _skipped = [r for r in _results if r.get("status") == "skipped"]
@@ -3899,6 +4964,15 @@ def _cleanup_direct_workdir(repo_key: str, agent_type: str, issue_id: str = ""):
                 _token = Repo(repo_key).bot_token
             except Exception:
                 pass
+            # Issue #752（M2）：清理前保真校验（与 worker 端 _cleanup_task_workdir 同口径）
+            try:
+                from src.runtime.worktree_guard import verify_fidelity
+                _fid_dr = verify_fidelity(ws)
+                if not _fid_dr.get("baseline_missing") and (_fid_dr.get("modified") or _fid_dr.get("removed")):
+                    log.warning(f"direct workdir cleanup fidelity alarm {repo_key}/{agent_type}: "
+                                f"modified={_fid_dr.get('modified')} removed={_fid_dr.get('removed')}")
+            except Exception as _fe:
+                log.warning(f"direct cleanup fidelity check failed: {_fe}")
             repogit.remove_issue_worktree_if_pushed(repo_key, agent_type, _num, token=_token)
             # Issue #242: 清理关联仓库 worktree（coding agent 多仓库）
             # 关联 worktree 路径由 repogit.issue_dir_for(repo_key, "coding", issue_num) 推导，
@@ -3920,53 +4994,6 @@ def _cleanup_direct_workdir(repo_key: str, agent_type: str, issue_id: str = ""):
             _shutil.rmtree(ws, ignore_errors=True)
     except Exception as e:
         log.warning(f"direct workdir cleanup failed for {repo_key}/{agent_type}: {e}")
-
-
-def _execute_agent(repo_key: str, seq: int, agent_type: str,
-                   backend: str, skill_name: str, evt: dict, runtime_id: int = 0,
-                   task_id: str = ""):
-    """后台执行 Agent：构建 prompt → stream_agent → 更新 event（result/status/agent_log）
-    
-    顶层 try/except 兜底：防止线程内未捕获异常导致事件永久卡在 running
-    （如 runtime_instance_name / skill 加载 / stream_agent 启动前崩溃）。
-    """
-    try:
-        _execute_agent_inner(repo_key, seq, agent_type, backend, skill_name, evt, runtime_id, task_id)
-    except Exception as e:
-        import traceback
-        _tb = traceback.format_exc()
-        log.error(f"Exec agent: [Agent:{agent_type}|repo:{repo_key}] UNHANDLED CRASH: {e}\n{_tb}")
-        from datetime import datetime, timezone
-        try:
-            from src.api.event_store import update_event_complete
-            update_event_complete(seq, "failed", exit_code=1,
-                                  completed_at=datetime.now(timezone.utc).isoformat(),
-                                  result=f"执行崩溃：{e}")
-            if task_id:
-                from src.runtime.service import update_task_status
-                update_task_status(task_id, "failed", exit_code=1, result_text=f"执行崩溃：{e}")
-            else:
-                _update_direct_task(seq, "failed", exit_code=1, result_text=f"执行崩溃：{e}")
-        except Exception:
-            pass
-    finally:
-        # 清理 Future 记录
-        with _DIRECT_FUTURES_LOCK:
-            _DIRECT_FUTURES.pop(seq, None)
-        # Issue-45 M2：direct 会话结束 → 会话级临时 token 即时失效
-        try:
-            from src.api.auth_token import revoke_session_token
-            revoke_session_token(task_id or f"d_{seq}")
-        except Exception as e:
-            log.warning(f"Exec agent: revoke session token failed: {e}")
-        # 任务级工位清理（direct 端）：轻文件 + 确认已 push 的 worktree
-        try:
-            _cleanup_direct_workdir(
-                repo_key, agent_type,
-                evt.get("issue_id", "") or (evt.get("payload") or {}).get("issue_number", "") or ""
-            )
-        except Exception:
-            pass
 
 
 def _extract_deploy_url(result_text: str) -> str:
@@ -4070,743 +5097,162 @@ def register_scene_deploy_url(repo_key: str, issue_id: str, result_text: str) ->
     return ""
 
 
-def _execute_agent_inner(repo_key: str, seq: int, agent_type: str,
-                         backend: str, skill_name: str, evt: dict, runtime_id: int = 0,
-                         task_id: str = ""):
-    """_execute_agent 的实际逻辑（被顶层 try/except 包裹）。"""
-    from src.runtime.executor import stream_devops_agent
-    from src.prompt_builder import build_devops_agent_prompt
-    from src.api.event_store import (
-        update_event_config, update_event_status, update_event_complete, evaluate_agent_output, _extract_tool_command,
-        append_skipped_event,
-    )
-    from src.runtime.instances import runtime_instance_name
+# ===== Issue #1545: agent 产出回帖策略（阻止引擎报错文本外泄到 Issue/PR） =====
+_ERROR_TEXT_PATTERNS = (
+    "model not found", "model_not_found", "traceback (most recent call last)",
+    "econnrefused", "etimedout", "rate limit", "quota exceeded",
+    "sockettimeout", "upstream", "bad gateway", "service unavailable",
+)
+_RESULT_POST_POLICY_WARNED = False
 
-    # 引擎实例名（`{type}-{device}`，与 UI 同源）；查不到回退类型名
-    inst_name = runtime_instance_name(runtime_id) or backend or ""
 
-    # direct 执行开始 → 更新 task status 为 running（direct 路径无 worker task_start 调用）
-    if task_id:
-        try:
-            from src.runtime.service import update_task_status
-            update_task_status(task_id, "running")
-            log.info(f"direct exec: task {task_id} status -> running")
-            # Write back actual runtime_id for plugin broadcast self-run tasks
-            # (task created with runtime_id=0 for broadcast, but executed locally)
-            if runtime_id and runtime_id > 0:
-                from src.session_manager import db as _sdb, db_lock as _sdl
-                with _sdl:
-                    c = _sdb.cursor()
-                    c.execute("UPDATE agent_tasks SET runtime_id=? WHERE id=? AND (runtime_id IS NULL OR runtime_id=0)", (runtime_id, task_id))
-                    _sdb.commit()
-                log.info(f"direct exec: task {task_id} runtime_id -> {runtime_id}")
-        except Exception as e:
-            log.warning(f"direct exec: failed to update task {task_id} to running: {e}")
+def _looks_like_error_text(text: str) -> bool:
+    """Issue #1545 B1：判断文本是否为引擎/上游报错文本（固定规则集，不得增删）。"""
+    t = text or ""
+    lower = t.lower()
+    if re.search(r"http\s*[45]\d\d", t, re.IGNORECASE):
+        return True
+    if any(p in lower for p in _ERROR_TEXT_PATTERNS):
+        return True
+    if t.lstrip().startswith("\u274c"):
+        return True
+    if "exit_code=" in lower:
+        return True
+    if "http 401" in lower or "http 403" in lower:
+        return True
+    return False
 
-    from src.repo_key import from_repo_key
-    repository = evt.get("repository", from_repo_key(repo_key))
-    issue_id = evt.get("issue_id", "") or evt.get("payload", {}).get("issue_number", "") or ""
-    ws = get_agent_workdir(repo_key, agent_type, issue_id)
-    os.makedirs(ws, exist_ok=True)
 
-    # 读取上次的 oc_session_id（用于延续对话上下文）——Issue 级执行会话优先，回退 repo 级
-    # 注意：有关联 Issue 时只用该 Issue 自己的会话（每 Issue 独立 session，见 vod-agent-hang-rootcause-fix.md 方案 A）；
-    #       repo 级 session 仅用于无关联 Issue（push/#0）。
-    repo_name = repo_key
-    oc_session_id = ""
-    issue_session_id = ""
-    _has_issue = bool(_issue_num_from(issue_id))
+def _result_post_policy() -> str:
+    """Issue #1545 B2：读取 GRAPE_RESULT_POST_POLICY（strict 默认 / clean / off）。
+
+    非法值回落 strict，进程内只告警一次；有效值不缓存，便于运行时与测试切换。
+    """
+    global _RESULT_POST_POLICY_WARNED
+    raw = (os.environ.get("GRAPE_RESULT_POST_POLICY") or "").strip().lower()
+    if raw in ("strict", "clean", "off"):
+        return raw
+    if raw and not _RESULT_POST_POLICY_WARNED:
+        log.warning(f"invalid GRAPE_RESULT_POST_POLICY={raw!r}, fallback to strict")
+        _RESULT_POST_POLICY_WARNED = True
+    return "strict"
+
+
+def _parse_task_errors(raw):
+    """把 agent_tasks.errors 原始值解析为列表（兼容历史纯字符串）。"""
+    if not raw:
+        return []
     try:
-        if _has_issue:
-            from src.api.session_store import get_or_create_issue_session, guard_issue_session_pointer
-            _isess = get_or_create_issue_session(repo_key, agent_type, issue_id)
-            issue_session_id = _isess.get("id") or ""
-            # session 引擎守卫：backend 即本次引擎名，跨引擎指针弃用（防 hermes resume
-            # opencode 会话号静默挂死）；引擎未知 → 放行。
-            oc_session_id = guard_issue_session_pointer(_isess, backend or "")
-        # 无关联 Issue 任务不执行（push 忽略），不再回退读 repo 级 runtime_session_id。
-    except Exception:
-        pass
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return [str(raw)]
+    if isinstance(parsed, list):
+        return parsed
+    return [parsed]
 
-    log.info(f"Exec agent: [Agent:{agent_type}|repo:{repo_name}] type={agent_type}, backend={inst_name}, skill={skill_name}, oc_session={oc_session_id[:20] if oc_session_id else 'none'}")
 
-    # 获取 bot token（按 provider 分流：GitHub 仓库用 get_github_token，其他用 get_repo_token_with_refresh）
-    repo_gitcode_token = ""
+def _record_post_suppressed(task_id, seq, repo_key, issue_number, agent_type, reason, raw_text):
+    """Issue #1545 C1/C2：把一次结果回帖抑制留痕写入 agent_tasks.errors。
+
+    复用既有 errors JSON 去重追加通路，不新增列。幂等键 = 同 issue + raw_text 前 200 字；
+    DB 异常只告警，绝不影响任务终态与主流程。
+    """
     try:
-        if repo_key.startswith("github:"):
-            from src.user.db import get_github_token
-            repo_gitcode_token = get_github_token(repo_key=repo_key) or ""
-        else:
-            from src.user.db import get_repo_token_with_refresh
-            repo_gitcode_token = get_repo_token_with_refresh(repo_key=repo_key) or ""
-    except Exception as e:
-        log.warning(f"Exec agent: get bot token failed: {e}")
-    log.info(f"Exec agent: bot_token={'set' if repo_gitcode_token else 'none'} (provider={'github' if repo_key.startswith('github:') else 'gitcode'})")
-
-    # R20.25.4: 获取 user_token 用于脱敏（路径 B 仓库的 host 用户 token，agent 可能复述）
-    _user_token_for_redact = ""
-    try:
-        from src.user.db import get_host_user_id
-        _host_uid = get_host_user_id(repo_key)
-        if _host_uid > 0:
-            from src.auth.grape_account_db import get_grape_account_by_id
-            _host_acc = get_grape_account_by_id(_host_uid)
-            if _host_acc and _host_acc.get("username"):
-                if repo_key.startswith("github:"):
-                    from src.api.deps import get_user_github_token_with_refresh
-                    _user_token_for_redact = get_user_github_token_with_refresh(_host_acc["username"], _host_uid) or ""
-                else:
-                    from src.api.deps import get_user_token_with_refresh
-                    _user_token_for_redact = get_user_token_with_refresh(_host_acc["username"], _host_uid) or ""
-    except Exception:
-        pass
-
-    # Agent 显示名（注入 AGENT_NAME 环境变量，skill 中 [$AGENT_NAME] 使用）
-    agent_name = get_agent_display_name(agent_type)
-
-    try:
-        from src.prompt_builder import build_devops_agent_prompt
-        evt["repo_key"] = repo_key
-        evt["issue_id"] = issue_id
-        # 智能推荐等入队时已构建 prompt 的任务（local_claimer 认领的广播任务）：
-        # 优先复用任务行已落库的 prompt，禁止重建——重建会用 skill_name→agent_type
-        # fallback 拼出技能 prompt（{{SKILL_DIR}}），把推荐器 prompt 替换掉，
-        # 导致 agent 按技能剧本跑而非输出 scene_id JSON，且后置「智能推荐器」
-        # prompt 识别条件永远失配（scene_id 落库/VOD 重派全断，2026-10-21 实锤）。
-        # 与 worker 执行路径对齐（worker 直接用任务行 prompt）。
-        _reused_prompt = ""
-        if task_id:
-            try:
-                from src.session_manager import db as _pdb, db_lock as _pdl
-                with _pdl:
-                    c = _pdb.cursor()
-                    c.execute("SELECT prompt FROM agent_tasks WHERE id=?", (task_id,))
-                    _pr = c.fetchone()
-                    _reused_prompt = (_pr[0] or "").strip() if _pr else ""
-            except Exception as _pe:
-                log.warning(f"Exec agent: read task prompt failed: {_pe}")
-        if _reused_prompt:
-            prompt = _reused_prompt
-            log.info(f"Exec agent: reuse enqueued task prompt ({len(prompt)} chars, task={task_id}), skip rebuild")
-        else:
-            prompt = build_devops_agent_prompt(evt, [], "", [skill_name] if skill_name else [agent_type],
-                                  skill_path=evt.get("_skill_path", ""), runtime_id=runtime_id, agent_type=agent_type)
-        # 直接模式（direct）：组件4 统一物化 project-info / skill / knowledge 到 ws 内
-        # （替代旧的「占位符替换为服务端绝对路径：仓库级 project-info 原件 / 全局 SKILLS_DIR」），
-        # 使 direct 端与 worker 端 cwd 布局一致，后续 bwrap 锁只需挂 ws。
-        prompt = _materialize_direct_workdir(
-            ws, repo_key, agent_type, skill_name, evt, issue_id, prompt
-        )
-        log.info(f"Exec agent: prompt built, {len(prompt)} chars, skill={skill_name or agent_type}: {prompt[:2000]}")
-        # 回写 prompt 到 agent_tasks（direct 模式创建时 prompt 为空，此处补写）
-        log.info(f"Exec agent: prompt writeback check: task_id={task_id!r}, prompt_len={len(prompt)}")
-        if task_id and prompt:
-            try:
-                from src.session_manager import db as _wdb, db_lock as _wdl
-                with _wdl:
-                    c = _wdb.cursor()
-                    c.execute("UPDATE agent_tasks SET prompt=? WHERE id=? AND prompt=''", (prompt, task_id))
-                    _wdb.commit()
-                log.info(f"Exec agent: prompt writeback OK for task={task_id}, rows={c.rowcount}")
-            except Exception as _pe:
-                log.warning(f"Exec agent: prompt writeback failed for task={task_id}: {_pe}")
-    except Exception as e:
-        log.warning(f"Exec agent: prompt build failed: {e}")
-        _prompt_skip_iid = evt.get("issue_id", "") or evt.get("payload", {}).get("issue_number", "")
-        if _prompt_skip_iid and not str(_prompt_skip_iid).startswith("#"):
-            _prompt_skip_iid = f"#{_prompt_skip_iid}"
-        append_skipped_event(repo_key, evt.get("type", ""), "prompt_build_failed", str(e),
-                             issue_id=_prompt_skip_iid)
-        _fail_event(seq, f"执行失败：prompt 构建异常 {str(e)[:150]}")
-        return
-
-    exec_account = evt.get("account") or repository
-    if not repo_gitcode_token:
-        log.warning(f"Exec agent: [Agent:{agent_type}|repo:{repo_name}] no bot token available, agent will fail on API calls")
-
-    # 记录执行配置（执行完成有产出后统一写入 event）
-    started_at = datetime.utcnow().isoformat()
-    log.info(f"Exec agent: [Agent:{agent_type}|repo:{repo_name}] spawning {inst_name}")
-
-    exit_code = -1
-    final_text = ""
-    new_oc_session_id = ""
-    _exec_done_errors = []  # R20.8a.1: done 事件 errors 用于 401 标记
-    _exec_done_stderr = ""
-    tool_uses = []
-    agent_logs = []
-    # Issue #564：技能物化降级标注落入事件 agent_logs（不静默空注入）
-    try:
-        _sk_mat = evt.get("_skill_materialize") or {}
-        if _sk_mat.get("status") in ("fallback", "degraded"):
-            agent_logs.append({
-                "time": datetime.utcnow().isoformat(),
-                "type": "skill_materialize",
-                "msg": f"skill materialize {_sk_mat.get('status')}: {_sk_mat.get('detail')}",
-            })
-    except Exception:
-        pass
-    # Issue #721: REPO_FULL_NAME 统一 from_repo_key 归一（剥 provider 前缀），与下方
-    # REPO_OWNER/REPO_NAME（#94 split_owner_repo）口径一致，保证下游 runbook clone URL
-    # （https://gitcode.com/$REPO_FULL_NAME.git）不会拼出 gitcode:owner/repo 形式的错误地址。
-    from src.repo_key import from_repo_key as _frk721
-    env_extra = {
-        "REPO_FULL_NAME": _frk721(repository) or repository,
-        "REPO_OWNER": (exec_account or repository).split("/", 1)[0],
-        "REPO_NAME": (exec_account or repository).rsplit("/", 1)[-1],
-        "ACCOUNT": evt.get("actor") or exec_account or "",
-    }
-    # Issue #94（weekly-09）：direct 分支 exec_account 可能带平台前缀全名（gitcode:<owner>/<repo>，
-    # 来自 local_claimer task.account），naive split 会得到 gitcode:<owner> → git-repo/repos 404。
-    # 统一用 split_owner_repo 剥前缀，与入队（484/2829/3134）口径一致，REPO_OWNER/REPO_NAME 无前缀。
-    from src.repo_key import split_owner_repo as _sor_env
-    _repo_owner_env, _repo_name_env = _sor_env(exec_account or repository)
-    env_extra["REPO_OWNER"] = _repo_owner_env
-    env_extra["REPO_NAME"] = _repo_name_env
-    # 注入场景环境变量（scene_id / work_branch / custom_fields；direct 模式同样注入，保持与 worker 模式一致）
-    # Issue #427：PR 订阅 direct 派发（evt 带 _pr_sub_scene_id）同样按订阅场景注入
-    try:
-        from src.runtime.repogit import _read_scene_work_branch
-        _wb = _read_scene_work_branch(repo_key, issue_id)
-        if _wb:
-            env_extra["GRAPE_WORK_BRANCH"] = _wb
-    except Exception:
-        pass
-    _inject_scene_env(env_extra, repo_key, issue_id, agent_type,
-                      scene_id_override=evt.get("_pr_sub_scene_id", ""))
-    # Issue #242: 注入关联仓库列表（coding agent 读取后初始化多仓库 worktree）
-    try:
-        _linked_repos = _read_scene_linked_repos(repo_key, issue_id)
-        if _linked_repos:
-            env_extra["GRAPE_LINKED_REPOS"] = json.dumps(_linked_repos, ensure_ascii=False)
-            # Issue #466: 关联仓 token 随 env 分发（worker 端本地无库，纯本地解析必为空）
-            _inject_linked_repo_tokens(env_extra, env_extra["GRAPE_LINKED_REPOS"])
-    except Exception:
-        pass
-    # Issue #573：BOT_USERNAME/AGENT_NAME 注入全部 devops agent（原仅 coding 注 BOT_USERNAME）；
-    # direct 路径 agent_name 参数仍同步传 stream_devops_agent（幂等同值）。
-    _inject_bot_agent_env(env_extra, repo_key, agent_type)
-    # 事件级扩展环境变量（如 onboarding 的 ONBOARDING_RESULT / ONBOARDING_TARGET）
-    _ext = evt.get("_env_extra") or {}
-    if isinstance(_ext, dict):
-        env_extra.update(_ext)
-    _inject_issue_pr_env(env_extra, evt, repo_key)
-
-    # git worktree（coding/qa/sre，direct 模式；见 multi-issue-isolation-design.md §3.4.1）
-    # P2（vcs-env-token-boundary-audit）：不再把 GIT_ASKPASS 路径注入 agent env——
-    # agent 侧 git 操作统一走 `grape git`（服务端 git-credential 会话凭据），不依赖 askpass env。
-    try:
-        from src.runtime import repogit
-        _gnum = repogit.issue_num_from(issue_id)
-        if repogit.is_git_agent(agent_type) and _gnum and issue_session_id:
-            _wb = env_extra.get("GRAPE_WORK_BRANCH", "")
-            _wt = repogit.ensure_issue_worktree(repo_key, agent_type, _gnum,
-                                                token=repo_gitcode_token, work_branch=_wb)
-    except Exception as e:
-        log.warning(f"Exec agent: git worktree ensure failed: {e}")
-
-    # Issue #242: 关联仓库 worktree 初始化（direct 模式 coding/sre agent 多仓库并行操作）
-    # 与 worker 端 _execute_task 中的逻辑等价：遍历 GRAPE_LINKED_REPOS → ensure_linked_repo_worktrees
-    # → 注入 GRAPE_LINKED_WORKTREES（供 _submit_linked_repo_prs 消费 / SRE 构建部署消费）
-    # Issue #466: 传 env（含 GRAPE_LINKED_REPO_TOKENS）——direct 端虽连库，但 env 优先口径与 worker 一致
-    try:
-        from src.runtime import repogit
-        _linked_repos_env_dr = env_extra.get("GRAPE_LINKED_REPOS", "")
-        if _linked_repos_env_dr and agent_type in ("coding", "sre", "qa"):
-            import json as _json_lr_dr
-            _linked_repos_list_dr = _json_lr_dr.loads(_linked_repos_env_dr) if _linked_repos_env_dr else []
-            if _linked_repos_list_dr:
-                _gnum_lr = repogit.issue_num_from(issue_id)
-                _wt_list_dr = repogit.ensure_linked_repo_worktrees(
-                    _linked_repos_list_dr, agent_type, _gnum_lr,
-                    token=repo_gitcode_token, env=env_extra)
-                if _wt_list_dr:
-                    env_extra["GRAPE_LINKED_WORKTREES"] = _json_lr_dr.dumps(
-                        [{"repo_key": w["repo_key"], "branch": w["branch"], "dir": w["worktree_dir"]}
-                         for w in _wt_list_dr], ensure_ascii=False)
-                    log.info(f"Exec agent: linked repos: {len(_wt_list_dr)} worktrees initialized for issue={_gnum_lr} agent={agent_type}")
-    except Exception as e:
-        log.warning(f"Exec agent: linked repos worktree init failed: {e}")
-
-    # Issue-45 M2：direct 会话签发会话级临时 token（session_key=task_id 或 d_{seq}）
-    try:
-        from src.api.auth_token import issue_session_token
-        if repo_key and agent_type:
-            env_extra["GRAPE_SESSION_TOKEN"] = issue_session_token(
-                session_key=task_id or f"d_{seq}",
-                repo_key=repo_key, agent_type=agent_type, user_id=0)
-            # CLI 命令按 token 作用域过滤：agent 持 tk_ 会话 token → 只暴露 dual+session_only 命令
-            # （见 grape-cli-mode-filter-design.md；避免 agent 打 user_only 接口 403 重试）
-            env_extra["GRAPE_CLI_MODE"] = "WORKER"
-    except Exception as e:
-        log.warning(f"Exec agent: issue session token failed: {e}")
-
-    # 用量采集（审计 2026-10-17）：DIRECT 模式跑在主控进程里，以前一条 token 都不记；
-    # 有 agent_tasks 行 → run_kind='task'，归属自动反查，幂等键与 worker 侧一致。
-    from src.observability.master_usage import for_task as _master_for_task
-    _mu = _master_for_task(task_id, backend, cwd=ws, session_id=oc_session_id, seq=seq,
-                           repo_key=repo_key, agent_type=agent_type,
-                           engine_id=int(runtime_id or 0))
-    _mu.start()
-
-    try:
-        for evt_type, data in stream_devops_agent(
-            prompt, ws, session_id=oc_session_id, event_type=evt.get("type", ""),
-            backend_name=backend, account=exec_account, bot_token=repo_gitcode_token,
-            agent_name=agent_name,
-            agent_label=f"[Agent:{agent_type}|repo:{repo_name}|engine:{inst_name}]",
-            env_extra=env_extra,
-            repo_key=repo_key,
-        ):
-            # 写库兜底脱敏：即使上游 executor 已脱敏，此处再防御一次（agent 可能在 text/result 复述 token）
-            _msg = str(data)[:500]
-            # R20.25.2: 脱敏覆盖所有注入的 token 值（repo_gitcode_token + user_token）
-            if repo_gitcode_token:
-                _msg = _msg.replace(repo_gitcode_token, "[REDACTED]")
-            if _user_token_for_redact:
-                _msg = _msg.replace(_user_token_for_redact, "[REDACTED]")
-            agent_logs.append({"time": datetime.utcnow().isoformat(), "type": evt_type, "msg": _msg})
-            # 实时推送：direct 模式复用 worker 的 report_messages（落库 task_messages + fanout SSE）
-            # 让前端「实时日志」面板在 hermes 执行期间就能看到逐步输出，不用等执行完成
-            _mu.feed(evt_type, data)
-            if task_id and evt_type != "done":
-                try:
-                    from src.runtime.service import report_messages
-                    report_messages(task_id, [{"type": evt_type, "data": data}])
-                except Exception as _re:
-                    log.warning(f"direct report_messages failed (task={task_id}): {_re}")
-            if evt_type == "done":
-                d = data
-                exit_code = d.get("exit_code", -1)
-                final_text = d.get("text", "")
-                new_oc_session_id = d.get("oc_session_id", "")
-                # R20.8a.1: 保存 errors/stderr 用于 401 标记
-                _exec_done_errors = d.get("errors") or []
-                _exec_done_stderr = d.get("stderr") or ""
-                log.info(f"Agent done: [Agent:{agent_type}|repo:{repo_name}] exit={exit_code}, text_len={len(final_text)}, new_oc_session={new_oc_session_id[:20] if new_oc_session_id else 'none'}")
-                # 智能推荐完成处理：解析 scene_id → 持久化 → 重派 VOD
-                if agent_type == "vod" and final_text and issue_id:
-                    _task_prompt = ""
-                    try:
-                        from src.session_manager import db as _rdb, db_lock as _rdb_lock
-                        with _rdb_lock:
-                            c = _rdb.cursor()
-                            c.execute("SELECT prompt FROM agent_tasks WHERE id=?", (task_id,))
-                            _trow = c.fetchone()
-                            _task_prompt = _trow[0] if _trow else ""
-                    except Exception:
-                        pass
-                    # 判断是否为智能推荐任务：prompt 含"智能推荐器"且无 {{SKILL_DIR}}
-                    if _task_prompt and "智能推荐器" in _task_prompt and "{{SKILL_DIR}}" not in _task_prompt:
-                        try:
-                            import re as _re
-                            _rec_scene = ""
-                            # 优先解析 JSON
-                            try:
-                                from src.api.event_store import parse_agent_output_json
-                                _scene_out = parse_agent_output_json(final_text) or {}
-                                _rec_scene = _scene_out.get("scene_id", "") or ""
-                            except Exception:
-                                pass
-                            # 正则兜底
-                            if not _rec_scene:
-                                _m_rec = _re.search(r'"scene_id"\s*:\s*"([^"]*)"', final_text)
-                                _rec_scene = _m_rec.group(1) if _m_rec else ""
-                            if _rec_scene:
-                                from src.api.session_store import set_issue_scene
-                                from src.runtime.engine_select import _repo_user_id
-                                _vod_uid = _repo_user_id(repo_key, issue_creator=evt.get("actor", ""))
-                                set_issue_scene(repo_key, issue_id, _rec_scene, scene_user_id=_vod_uid)
-                                log.info(f"智能推荐完成: scene_id={_rec_scene} set for {issue_id}")
-                                # 重派 VOD（用匹配场景的 vod 技能）
-                                from src.api.pipeline_config import get_first_node, get_pipeline_config
-                                _vod_node = get_first_node(_rec_scene, repo_key=repo_key)
-                                if not _vod_node:
-                                    _pcfg = get_pipeline_config(_rec_scene, repo_key=repo_key)
-                                    _nodes = (_pcfg or {}).get("nodes", [])
-                                    if _nodes:
-                                        _vod_node = _nodes[0]
-                                if _vod_node:
-                                    _vod_skill = _vod_node.get("skill", "vod")
-                                    log.info(f"智能推荐完成: redispatch VOD with skill={_vod_skill} for {issue_id}")
-                                    _redispatch_vod_after_recommend(repo_key, issue_id, _vod_skill, evt, runtime_id)
-                                else:
-                                    log.warning(f"智能推荐完成: no vod node for scene={_rec_scene}, skip redispatch")
-                            else:
-                                log.info(f"智能推荐完成: no scene_id for {issue_id}, pipeline terminated")
-                        except Exception as _se:
-                            log.warning(f"智能推荐完成处理失败: {_se}")
-            elif evt_type == "error":
-                log.warning(f"Agent error: [Agent:{agent_type}|repo:{repo_name}] {data}")
-            elif evt_type == "step_start":
-                log.info(f"[agent {agent_type}|repo:{repo_name}] {data}")
-            elif evt_type == "tool_use":
-                tool_uses.append(data if isinstance(data, dict) else {})
-                log.info(f"[agent {agent_type}|repo:{repo_name}] TOOL: {str(data)[:160]}")
-            elif evt_type == "text":
-                log.info(f"[agent {agent_type}|repo:{repo_name}] TEXT: {str(data)[:160]}")
-            elif evt_type == "reasoning":
-                log.info(f"[agent {agent_type}|repo:{repo_name}] REASONING: {str(data)[:160]}")
-            else:
-                log.info(f"[agent {agent_type}|repo:{repo_name}] {evt_type}: {str(data)[:160]}")
-    except Exception as e:
-        log.warning(f"Exec agent failed: [Agent:{agent_type}|repo:{repo_name}] {e}")
-
-    # 用量落台账（流结束后）：放 here 是因为引擎进程已退出、账本已落盘；
-    # finish 自身幂等 + 吞异常，绝不影响下面的终态/会话回写。
-    try:
-        _mu.finish(session_id=new_oc_session_id)
-    except Exception as _ue:      # 用量是观测数据，任何异常都不该影响任务终态
-        log.warning(f"Exec agent: usage finish failed (task={task_id}): {_ue}")
-
-    # 更新 oc_session_id（持久化对话上下文）——仅写回 Issue 级执行会话
-    # repo 级 devops_agent_session.runtime_session_id 已废弃（无消费方），不再回写。
-    # 同步记录 session_engine（本次执行引擎），供消费端跨引擎守卫比对。
-    if new_oc_session_id and new_oc_session_id != oc_session_id:
-        try:
-            if issue_session_id:
-                from src.api.session_store import update_issue_session
-                update_issue_session(issue_session_id, runtime_session_id=new_oc_session_id,
-                                     session_engine=backend or "")
-        except Exception as e:
-            log.warning(f"Exec agent: failed to update oc_session_id: {e}")
-
-    # ── 单信号收尾（C，stream-end-finalize-single-signal-design.md）──
-    # 引擎流结束即终态触发点；stream_ended 仅作仪器记录，不再按技能类型区分/门控。
-    if task_id:
-        try:
-            from src.runtime.service import set_task_signal
-            set_task_signal(task_id, "stream_ended")
-        except Exception as _e:
-            log.warning(f"Exec agent: set stream_ended failed for {task_id}: {_e}")
-
-    # 判定 Agent 是否有明确答复产出
-    has_output, result_text = evaluate_agent_output(agent_type, tool_uses, final_text)
-    # R20.25.1: 脱敏覆盖所有注入的 token 值（repo_gitcode_token + user_token）
-    if result_text:
-        if repo_gitcode_token:
-            result_text = result_text.replace(repo_gitcode_token, "[REDACTED]")
-        if _user_token_for_redact:
-            result_text = result_text.replace(_user_token_for_redact, "[REDACTED]")
-    # 若 Agent 已显式 self_report（结构化结论），以其为权威（产物而非闸门）
-    if task_id:
-        try:
-            from src.runtime.service import get_task
-            _t = get_task(task_id) or {}
-            if _t.get("self_reported") == 1 and _t.get("result_text"):
-                import json as _json
-                _stored = _t.get("result_text") or ""
-                _sd = None
-                try:
-                    _sd = _json.loads(_stored)
-                except Exception:
-                    _sd = None
-                if _sd and isinstance(_sd, dict) and (_sd.get("actions") or _sd.get("conclusion")):
-                    result_text = _stored
-        except Exception as _e:
-            log.warning(f"Exec agent: self-reported result merge failed for {task_id}: {_e}")
-    completed_at = datetime.utcnow().isoformat()
-    duration = None
-    try:
-        s = datetime.fromisoformat(started_at)
-        e = datetime.fromisoformat(completed_at)
-        duration = round((e - s).total_seconds(), 1)
-    except Exception:
-        pass
-
-    # 有产出 → 更新该 event（写入配置 + 结果 + 结论 + 执行日志）
-    # exit_code < 0 表示进程被信号终止（如 -15=SIGTERM, -9=SIGKILL），
-    # 但 has_output=True 说明 Agent 已完成业务产出（PR/测试/评论/结构化 conclusion），
-    # 信号终止常发生在引擎完成输出后的进程清理阶段，不应判为失败。
-    if exit_code == 0 or (has_output and exit_code < 0):
-        new_status = "completed"
-        # R21.7.1: agent 完成后立即更新 devops_agent_session status='idle'
-        # 缩小 session 兜底误拦窗口（R21.7.4: status=idle → 兜底查询不命中 → 无误拦）
-        try:
-            with db_lock:
-                c = db.cursor()
+        _rec = {
+            "error_code": "RESULT_POST_SUPPRESSED",
+            "policy": _result_post_policy(),
+            "reason": reason,
+            "agent_type": agent_type or "",
+            "issue_number": str(issue_number or ""),
+            "raw_text": (raw_text or "")[:500],
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        _idem_key = (raw_text or "")[:200]
+        _where_col = ""
+        _where_val = None
+        _existing = None
+        with db_lock:
+            c = db.cursor()
+            if task_id:
+                c.execute("SELECT errors FROM agent_tasks WHERE id=?", (task_id,))
+                row = c.fetchone()
+                if row:
+                    _where_col, _where_val, _existing = "id", task_id, _parse_task_errors(row[0])
+            elif seq is not None:
                 c.execute(
-                    "UPDATE devops_agent_session SET status='idle' "
-                    "WHERE repo_key=? AND status='active'",
-                    (repo_key,)
-                )
+                    "SELECT errors FROM agent_tasks WHERE event_seq=? "
+                    "ORDER BY created_at DESC LIMIT 1", (seq,))
+                row = c.fetchone()
+                if row:
+                    _where_col, _where_val, _existing = "event_seq", seq, _parse_task_errors(row[0])
+            else:
+                # 无任务上下文（系统通知等）→ 按 repo_key + issue 兜底定位最近任务
+                _issue_num = str(issue_number or "").lstrip("#")
+                c.execute(
+                    "SELECT id, errors FROM agent_tasks WHERE repo_key=? AND "
+                    "(issue_id=? OR issue_id=? OR issue_id LIKE ?) "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (repo_key or "", str(issue_number or ""), _issue_num, f"%{_issue_num}%"))
+                row = c.fetchone()
+                if row:
+                    _where_col, _where_val, _existing = "id", row[0], _parse_task_errors(row[1])
+            if _where_col and _existing is not None:
+                for e in _existing:
+                    if (isinstance(e, dict) and e.get("error_code") == "RESULT_POST_SUPPRESSED"
+                            and (e.get("raw_text") or "")[:200] == _idem_key
+                            and str(e.get("issue_number") or "") == _rec["issue_number"]):
+                        return
+                _existing = [e for e in _existing if str(e).strip()]
+                _existing.append(_rec)
+                if len(_existing) > 5:
+                    _existing = _existing[:1] + _existing[1:][-4:]
+                c.execute(f"UPDATE agent_tasks SET errors=? WHERE {_where_col}=?",
+                          (json.dumps(_existing, ensure_ascii=False), _where_val))
                 db.commit()
-        except Exception:
-            pass
-        if exit_code < 0:
-            log.info(f"Exec agent: seq={seq} exit_code={exit_code} but has_output=True, mark completed (signal death after work done)")
-        # ── 假完成硬门槛（issue-P5，关卡B）──
-        # 引擎 exit 0 不再是成功的充分条件：devops 类任务（issue/coding/qa/sre）还须有
-        # 可信产出证据之一，否则降级 failed（防模型流挂死/空 end_turn 静默收场标绿）：
-        #   证据1 self_reported==1 且有 result_text —— grape tasks complete 服务端盖章自报；
-        #   证据2 执行日志（tool_uses，实际执行过的命令）中有真实写操作：
-        #         POST .../comments（评论）/ POST .../pulls（PR）/ POST /api/a2a（A2A交棒）。
-        # 注意只看执行证据，不看 agent 文字自述（思考里"打算交棒"不算做过）。
-        # vod 等非 devops agent（智能推荐路径）不加门槛，避免误伤。
-        if exit_code == 0 and agent_type in ("issue", "coding", "qa", "sre") and not has_output:
-            _self_ok = False
-            if task_id:
-                try:
-                    from src.runtime.service import get_task as _gt
-                    _trow = _gt(task_id) or {}
-                    _self_ok = (_trow.get("self_reported") == 1 and bool(_trow.get("result_text")))
-                except Exception:
-                    _self_ok = False
-            _write_action = False
-            if not _self_ok:
-                for _tu in (tool_uses or []):
-                    _cmd = _tu.get("cmd", "") if isinstance(_tu, dict) else str(_tu)
-                    _cmd = _extract_tool_command(_tu) if (not isinstance(_cmd, str) or "POST" not in _cmd.upper()) else _cmd
-                    _up = _cmd.upper()
-                    # A2A 有两种形态：直接 curl POST /api/a2a，或 grape CLI 的 `grape a2a handoff`
-                    # （CLI 内部才发 POST，命令字符串里没有 POST 关键字，须单独匹配）
-                    if (("POST" in _up and any(k in _up for k in ("/COMMENTS", "/PULLS", "MERGE_REQUESTS")))
-                            or ("A2A HANDOFF" in _up) or ("POST" in _up and "/API/A2A" in _up)):
-                        _write_action = True
-                        break
-            if not (_self_ok or _write_action):
-                new_status = "failed"
-                log.warning(f"Exec agent: seq={seq} exit_code=0 but no verified output "
-                            f"(self_reported={_self_ok}, write_action={_write_action}), "
-                            f"demoting to failed (fake completion guard)")
-    else:
-        new_status = "failed"
-    # R20.8a.1: direct 模式 401 标记——不经过 fail_task，需在此补充标记
-    # 基于 done 事件的 errors/stderr 字段判断，不扫 final_text
-    if exit_code != 0 and repo_key:
-        _exec_err_detail = " ".join(str(e) for e in _exec_done_errors) + " " + str(_exec_done_stderr)
-        if _exec_err_detail.strip():
-            _err_lower = _exec_err_detail.lower()
-            _is_401 = is_auth_401_error(_err_lower)
-            if _is_401:
-                try:
-                    from src.token_service import detect_and_mark_expired
-                    _pipeline_error_code = detect_and_mark_expired(repo_key) or ""
-                    if _pipeline_error_code:
-                        log.warning(f"Exec agent: token expired during direct exec (error_code={_pipeline_error_code}), repo={repo_key}")
-                except Exception as _pe:
-                    log.warning(f"Exec agent: post-exec 401 detect failed: {_pe}")
-    # Issue #403：瞬时上游抖动自动重试（判定层收口，direct 执行路径）。
-    # new_status 判定完成后、终态写入（任务+事件）之前拦截：可重试（瞬时分类
-    # ∧ 无写操作证据 ∧ attempts 未耗尽）则退避 requeue 并跳过终态写入。
-    _retry_info = {}
-    if new_status == "failed" and task_id:
-        try:
-            from src.runtime.transient_retry import retry_transient_task
-            _err_txt = " ".join(str(e) for e in (_exec_done_errors or [])) + " " + str(_exec_done_stderr or "")
-            if retry_transient_task(task_id, exit_code, _err_txt, has_output=has_output,
-                                    tool_uses=tool_uses, result_text=result_text or ""):
-                log.info(f"Exec agent: seq={seq} transient retry scheduled, skip terminal write")
                 return
-        except Exception as _e:
-            log.warning(f"Exec agent: transient retry check failed for seq={seq}: {_e}")
-    # Issue #403：耗尽/不可重试判死 → 分类失败摘要写 result_text（区分上游抖动
-    # vs 配置错误 + 重试次数 + 原始错误摘要）。非重试场景（无 #403 记录）零变化。
-    if new_status == "failed" and task_id and not (result_text or "").strip():
-        try:
-            from src.runtime.service import _task_errors_json
-            from src.runtime.transient_retry import format_stream_failure_result
-            _retries = [e for e in _task_errors_json(task_id)
-                        if isinstance(e, dict) and e.get("error_code") in
-                        ("TRANSIENT_RETRY_EXHAUSTED", "TRANSIENT_RETRY")]
-            if _retries:
-                _ex = next((e for e in _retries
-                            if e.get("error_code") == "TRANSIENT_RETRY_EXHAUSTED"), _retries[-1])
-                _retry_info = {"class": _ex.get("error_class") or "",
-                               "attempts": _ex.get("attempts") or len(_retries),
-                               "max": _ex.get("max") or len(_retries)}
-                result_text = format_stream_failure_result(
-                    _retry_info["class"], _retry_info["attempts"], _retry_info["max"],
-                    _ex.get("reason") or "", exit_code=exit_code,
-                    errors=_exec_done_errors)
-        except Exception as _e:
-            log.warning(f"Exec agent: failure summary build failed for seq={seq}: {_e}")
-    # Issue #494：失败收口归因双写——done 事件的 errors 必须落 agent_tasks.errors
-    # （旧路径只写 status/exit_code/result_text，超时失败 errors 与 stderr 双空，
-    # 用户只看到 failed/exit_code=-1 无任何原因）。同时 result_text 为空时构造
-    # 可读失败摘要透出到事件 result（前端失败原因卡片数据源）。
-    _fail_errors_json = None
-    if new_status == "failed" and _exec_done_errors:
-        try:
-            from src.agent.failure_attribution import failure_summary
-            if not (result_text or "").strip():
-                result_text = failure_summary(_exec_done_errors, exit_code)
-        except Exception as _e:
-            log.warning(f"Exec agent: failure attribution summary failed for seq={seq}: {_e}")
-            if not (result_text or "").strip():
-                result_text = f"任务失败（exit_code={exit_code}）"
-        # 合并而非覆盖：保留 #403 transient retry 等已写入的诊断记录
-        try:
-            _merged = []
-            if task_id:
-                from src.runtime.service import _task_errors_json
-                _merged = [e for e in (_task_errors_json(task_id) or [])
-                           if str(e).strip()]
-            for _e in _exec_done_errors:
-                _s = str(_e).strip()[:500]
-                if _s and _s not in _merged:
-                    _merged.append(_s)
-            if _merged:
-                _fail_errors_json = json.dumps(_merged)
-        except Exception as _e:
-            log.warning(f"Exec agent: errors merge for seq={seq} failed: {_e}")
-    if task_id:
-        from src.runtime.service import update_task_status
-        if _fail_errors_json is not None:
-            update_task_status(task_id, new_status, exit_code=exit_code,
-                               result_text=result_text, errors=_fail_errors_json)
-        else:
-            update_task_status(task_id, new_status, exit_code=exit_code, result_text=result_text)
-    else:
-        _update_direct_task(seq, new_status, exit_code=exit_code,
-                            result_text=result_text, errors=_fail_errors_json)
-    update_event_config(seq, inst_name, skill_name, started_at)
-    update_event_complete(seq, new_status, exit_code=exit_code, duration=duration,
-                          agent_logs=agent_logs, completed_at=completed_at, result=result_text)
-    log.info(f"Exec agent: seq={seq} -> {new_status}, duration={duration}s, logs={len(agent_logs)}, result={result_text[:80]}\n")
+        log.warning(f"record_post_suppressed: no task row for {repo_key}#{issue_number}")
+    except Exception as e:
+        log.warning(f"record_post_suppressed failed: {e}")
 
-    # Issue #242: coding agent 成功完成后，向关联仓库提交 PR（direct 模式）
-    # 遍历 GRAPE_LINKED_WORKTREES，对每个有改动的关联仓库 worktree 执行 push + create_pr_for_repo
-    if new_status == "completed" and agent_type == "coding" and env_extra.get("GRAPE_LINKED_WORKTREES"):
-        try:
-            _submit_direct_linked_prs(env_extra, repo_key, issue_id, repo_gitcode_token)
-        except Exception as _le:
-            log.warning(f"Exec agent: direct linked PR submit failed: {_le}")
 
-    # 多任务模式：父任务 Issue Agent 完成后 → stage=done（不 A2A coding，子任务由 webhook 自动触发）
-    if new_status == "completed" and agent_type == "issue" and issue_id:
-        try:
-            from src.api.session_store import is_subtask_mode_enabled, set_issue_stage
-            if is_subtask_mode_enabled(repo_key, issue_id):
-                set_issue_stage(repo_key, issue_id, "done", "issue")
-                log.info(f"Multi-task mode: parent issue {issue_id} stage=done (subtasks will trigger independently)")
-        except Exception as _e:
-            log.warning(f"Multi-task mode stage=done check failed: {_e}")
+def _apply_agent_result_policy(result_text: str, structured_conclusion: str, plain_text: str,
+                               task_id, seq, repo_key, issue_number, agent_type):
+    """Issue #1545 A3/B3：对 agent 产出套用回帖策略。
 
-    # 执行完成 → 自动回帖到 Issue（仅 sre 等有实质产出的 Agent，且有关联 Issue）
-    # PR 订阅的伪 issue_id（#pr_123_scene_id）不是真实 Issue，跳过 Issue 回帖
-    if new_status == "completed" and result_text and issue_id and not evt.get("_pr_sub_pr_number"):
-        _issue_num = _issue_num_from(issue_id)
-        if _issue_num and repo_gitcode_token:
-            try:
-                _post_result_to_issue(repository, _issue_num, result_text, repo_gitcode_token, agent_type, repo_key)
-            except Exception as _pe:
-                # R20.3.2: _post_result_to_issue 失败时 append RESULT_POST_FAILED
-                log.warning(f"Exec agent: post result to issue failed: {_pe}")
-                if task_id:
-                    try:
-                        with db_lock:
-                            c = db.cursor()
-                            c.execute("SELECT errors FROM agent_tasks WHERE id=?", (task_id,))
-                            _row = c.fetchone()
-                            _errs = []
-                            if _row and _row[0]:
-                                try:
-                                    _errs = json.loads(_row[0])
-                                    if not isinstance(_errs, list):
-                                        _errs = [str(_errs)]
-                                except (json.JSONDecodeError, TypeError):
-                                    _errs = [str(_row[0])]
-                            _has_rpf = any(isinstance(e, dict) and e.get("error_code") == "RESULT_POST_FAILED" for e in _errs)
-                            if not _has_rpf:
-                                _errs.append({"error_code": "RESULT_POST_FAILED", "message": "result posted but issue comment failed"})
-                                # 首条保护式（同 UC7-3 家族）：头部诊断不被挤掉
-                                _errs = _errs[:1] + _errs[1:][-4:] if len(_errs) > 5 else _errs
-                                c.execute("UPDATE agent_tasks SET errors=? WHERE id=?", (json.dumps(_errs), task_id))
-                                db.commit()
-                    except Exception:
-                        pass
-                # R20.3.3: 回帖失败不影响 task 状态（task 仍标记 completed）
-    # PR 订阅场景 → 回帖到 PR 评论
-    if new_status == "completed" and result_text and evt.get("_pr_sub_pr_number"):
-        _pr_num = str(evt["_pr_sub_pr_number"])
-        if _pr_num and repo_gitcode_token:
-            _post_result_to_pr(repository, _pr_num, result_text, repo_gitcode_token, agent_type, repo_key)
-
-    # SRE 完成后 → 从 result_text 提取部署 URL 并写入 managed_repos.deploy_url
-    # Issue #468: 登记逻辑抽为共享函数 register_sre_deploy_url，与远程 worker
-    # complete_task() 收尾路径统一调用（根治双路径钩子清单不同步缺陷）
-    if new_status == "completed" and agent_type == "sre" and result_text:
-        try:
-            register_sre_deploy_url(repo_key, result_text)
-        except Exception as _e:
-            log.warning(f"SRE deploy_url extraction failed: {_e}")
-        # Issue #482: 场景级登记——按 issue 绑定 scene_id 更新
-        # devops_pipeline_scene.deploy_url（无绑定/失败不影响收尾主流程）
-        try:
-            register_scene_deploy_url(repo_key, issue_id, result_text)
-        except Exception as _e:
-            log.warning(f"scene deploy_url register failed: {_e}")
-
-    # Issue #656: 末节点完成后 → issue 级自动结单（全部节点 completed + 无阻断
-    # → stage=done / status=completed / completed_at 落库 + 联动关闭 VCS Issue；
-    # failed 阻断回退 pending_review 保留人工 confirm done 路径）。
-    # 泛化原 Issue #51 仅 sre 硬编码的收尾入口：函数自带 stage/末节点守卫，非末节点 noop。
-    if new_status == "completed" and issue_id and agent_type:
-        try:
-            from src.api.issues_center import auto_finalize_issue_on_last_node
-            _fin = auto_finalize_issue_on_last_node(repo_key, issue_id, agent_type, source="exec")
-            if _fin not in ("noop:not_last_node", "noop:not_issue", "noop:terminal"):
-                log.info(f"Exec agent: issue finalize result={_fin} issue={issue_id}")
-        except Exception as _e:
-            log.warning(f"Exec agent: issue auto-finalize failed: {_e}")
-
-    # 子任务 SRE 完成后 → 登记完成情况到父 Issue
-    if new_status == "completed" and agent_type == "sre" and issue_id:
-        try:
-            from src.api.session_store import get_parent_issue, get_subtask_issues
-            _parent = get_parent_issue(repo_key, issue_id)
-            if _parent and repo_gitcode_token:
-                _parent_num = _issue_num_from(_parent)
-                _sub_num = _issue_num_from(issue_id)
-                if _parent_num and _sub_num:
-                    _post_subtask_completion_to_parent(repository, _sub_num, _parent_num, result_text, repo_gitcode_token, repo_key=repo_key)
-                    # 检查所有子任务是否全部完成
-                    _subs = get_subtask_issues(repo_key, _parent)
-                    _all_done = all(s.get("stage") == "done" or s.get("issue_id") == issue_id for s in _subs)
-                    if _all_done and len(_subs) > 0:
-                        _post_all_subtasks_done(repository, _parent_num, _subs, repo_gitcode_token, repo_key=repo_key)
-        except Exception as _e:
-            log.warning(f"Subtask completion post failed: {_e}")
-
-    # 执行完成 → 同步 agent 结果到任务会话（用户「去对话」可见 agent 澄清/报告）
-    # 独立于 _post_result_to_issue：agent 可能自己用 curl 发了 Issue 评论，
-    # 但 task conversation 仍需写入才能在 Chat 页展示。
-    if new_status == "completed" and result_text and issue_id:
-        _issue_num = _issue_num_from(issue_id)
-        if _issue_num:
-            try:
-                from src.repo_key import to_repo_key
-                from src.session_manager import db as _db, db_lock as _dl, add_message as _am
-                _rk = to_repo_key(repo_key)
-                with _dl:
-                    _c = _db.cursor()
-                    _c.execute("SELECT conversation_id FROM issue WHERE repo_key=? AND issue_number=? AND conversation_id!='' LIMIT 1",
-                               (_rk, _issue_num))
-                    _row = _c.fetchone()
-                if _row and _row[0]:
-                    _am(_row[0], "agent", f"[{agent_type.upper()} Agent] {result_text[:3000]}")
-                    log.info(f"Exec agent: synced result to task conversation {_row[0]} (issue #{_issue_num})")
-            except Exception as _e:
-                log.warning(f"Exec agent: sync to task conversation failed: {_e}")
-
-    # 执行完成 → 从 GitCode Issue 拉取 agent 发的评论，同步到任务会话
-    # （agent 通过技能 curl 直接在 Issue 上发的澄清追问等评论，上面 result_text 同步的是
-    #   结构化输出摘要，不含 Issue 上的实际评论内容；此处补拉 Issue 评论去重写入会话）
-    if new_status == "completed" and issue_id:
-        _issue_num = _issue_num_from(issue_id)
-        if _issue_num and repo_gitcode_token:
-            _sync_issue_comments_to_conversation(repo_key, _issue_num, repo_gitcode_token, agent_type, repository)
+    返回应当发布的文本；返回空串表示抑制（已留痕）。仅 agent_result=True 时调用。
+    """
+    _policy = _result_post_policy()
+    if _policy == "off":
+        # 修复（2026-11-09）：off 的语义是「关闭抑制、恢复照贴」，原实现记录 policy_off 后
+        # 返回空串＝照样全量抑制，与开关含义相反（QA 复核发现）。
+        return structured_conclusion or (plain_text or "")[:3000]
+    if _policy == "strict" and not structured_conclusion:
+        _record_post_suppressed(task_id, seq, repo_key, issue_number, agent_type,
+                                "strict_no_conclusion", result_text)
+        log.info(f"Exec agent: suppress result comment by policy=strict (no structured conclusion) "
+                 f"({repo_key}#{issue_number})")
+        return ""
+    if _policy == "clean" and not structured_conclusion and _looks_like_error_text(plain_text):
+        _record_post_suppressed(task_id, seq, repo_key, issue_number, agent_type,
+                                "clean_error_text", result_text)
+        log.info(f"Exec agent: suppress result comment by policy=clean (error text) "
+                 f"({repo_key}#{issue_number})")
+        return ""
+    # Issue #1545 B3：无结构化 conclusion 时沿用既有 3000 字截断，避免长正文整段外发。
+    return structured_conclusion or (plain_text or "")[:3000]
 
 
 def _post_result_to_issue(repository: str, issue_number, result_text: str, bot_token: str, agent_type: str,
-                          repo_key: str = ""):
+                          repo_key: str = "", *, agent_result: bool, task_id: str = "", seq=None):
     """Agent 执行完成后，将结果作为评论发回 VCS Issue。
 
     根据 repo_key provider 分流 GitHub/GitCode。
     方案 B：先 GET Issue 评论列表，若已有 agent 发的评论则跳过系统回帖，
     避免与 agent 自己发的评论重复（"一鱼两吃"问题）。
     agent 忘了发评论时系统补发，保证 Issue 不会静悄悄。
+
+    Issue #1545：`agent_result` 必填以区分「agent 产出」（True，套用回帖策略，
+    阻止引擎/上游报错文本外泄）与「系统通知」（False，行为完全不变）。
     """
     if not repository or not issue_number or not bot_token:
         return
@@ -4828,14 +5274,26 @@ def _post_result_to_issue(repository: str, issue_number, result_text: str, bot_t
             _conclusion = _parsed["conclusion"]
     except Exception:
         pass
+    _structured_conclusion = _conclusion
+    _plain_text = ""
     # conclusion 提取失败时：保留有效 result_text（纯文本），避免思考过程/JSON 块泄漏到 Issue 评论；
     # result_text 为空或纯 JSON 时无内容可发，直接跳过回帖（Issue #679：不发占位文案）
     if not _conclusion:
         _stripped = (result_text or "").replace("<!-- grape-auto-comment -->", "").strip()
         if _stripped and not _stripped.startswith("{") and not _stripped.startswith("["):
+            _plain_text = _stripped
             _conclusion = _stripped[:3000]
         else:
+            if agent_result and (result_text or "").strip():
+                _record_post_suppressed(task_id, seq, repo_key, issue_number, agent_type,
+                                        "no_conclusion", result_text)
             log.info(f"Exec agent: skip system comment, no conclusion or valid text to post to {repository}/issues/{issue_number}")
+            return
+    if agent_result:
+        _conclusion = _apply_agent_result_policy(
+            result_text, _structured_conclusion, _plain_text,
+            task_id, seq, repo_key, issue_number, agent_type)
+        if not _conclusion:
             return
 
     # 根据 repo_key provider 分流
@@ -4942,11 +5400,14 @@ def _post_all_subtasks_done(repository: str, parent_issue_num: str, subtasks: li
 
 
 def _post_result_to_pr(repository: str, pr_number: str, result_text: str, bot_token: str,
-                        agent_type: str, repo_key: str = ""):
+                        agent_type: str, repo_key: str = "", *, agent_result: bool,
+                        task_id: str = "", seq=None):
     """PR 订阅场景：Agent 执行完成后，将结果作为评论发回 PR。
 
     GitCode: POST /repos/{owner}/{repo}/pulls/{pr_number}/comments
     GitHub:  POST /repos/{owner}/{repo}/issues/{pr_number}/comments（PR 共用 Issue 评论 API）
+
+    Issue #1545：`agent_result` 必填以区分「agent 产出」与「系统通知」，语义同 Issue 回帖。
     """
     if not repository or not pr_number or not bot_token:
         return
@@ -4959,18 +5420,30 @@ def _post_result_to_pr(repository: str, pr_number: str, result_text: str, bot_to
             _conclusion = _parsed["conclusion"]
     except Exception:
         pass
+    _structured_conclusion = _conclusion
+    _plain_text = ""
     if not _conclusion:
         # Issue #679：无 conclusion 时保留有效纯文本正文；为空或纯 JSON 时跳过发帖（不发占位文案）
         _stripped = (result_text or "").replace("<!-- grape-auto-comment -->", "").strip()
         if _stripped and not _stripped.startswith("{") and not _stripped.startswith("["):
+            _plain_text = _stripped
             _conclusion = _stripped[:3000]
         else:
+            if agent_result and (result_text or "").strip():
+                _record_post_suppressed(task_id, seq, repo_key, pr_number, agent_type,
+                                        "no_conclusion", result_text)
             log.info(f"Exec agent: skip PR comment, no conclusion to post to {repository}/pulls/{pr_number}")
+            return
+    if agent_result:
+        _conclusion = _apply_agent_result_policy(
+            result_text, _structured_conclusion, _plain_text,
+            task_id, seq, repo_key, pr_number, agent_type)
+        if not _conclusion:
             return
     _comment = f"[{agent_type.upper()} Agent] {_conclusion}"
     _comment += "\n<!-- grape-auto-comment -->"
     try:
-        import urllib.request, json as _json
+        import urllib.request, urllib.error, json as _json
         if _is_github_repo(repo_key):
             # GitHub: PR 共用 Issue 评论 API
             _url = f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments"
@@ -5007,6 +5480,38 @@ def _post_result_to_pr(repository: str, pr_number: str, result_text: str, bot_to
         except Exception as _le:
             log.warning(f"outbound_ledger record (_post_result_to_pr) failed: {_le}")
         log.info(f"PR-sub: posted result comment to {repository}/pulls/{pr_number}")
+    except urllib.error.HTTPError as e:
+        # Issue #754：GitCode 已 merged PR 评论 405（not allowed to be reviewed after being
+        # merged）→ 等价留痕通道回写兜底：PR=issue 语义，改走 /issues/{n}/comments。
+        if (e.code == 405 and "/pulls/" in getattr(e, "url", "") and "gitcode.com" in getattr(e, "url", "")):
+            try:
+                _url754 = f"https://gitcode.com/api/v5/repos/{repository}/issues/{pr_number}/comments"
+                _req754 = urllib.request.Request(_url754, data=_data,
+                    headers={"Authorization": f"Bearer {bot_token}",
+                             "Content-Type": "application/json"}, method="POST")
+                _resp = urllib.request.urlopen(_req754, timeout=15)
+                try:
+                    _body_resp = b""
+                    try:
+                        _body_resp = _resp.read()
+                    except Exception:
+                        pass
+                    _parsed_pr = {}
+                    try:
+                        _parsed_pr = _json.loads(_body_resp) if _body_resp else {}
+                    except Exception:
+                        _parsed_pr = {}
+                    _ledger_record_comment("gitcode", repo_key, repository, pr_number, _comment,
+                                           _parsed_pr if isinstance(_parsed_pr, dict) else {})
+                except Exception as _le:
+                    log.warning(f"outbound_ledger record (_post_result_to_pr 405-fallback) failed: {_le}")
+                log.info(f"PR-sub: posted result comment via issue-channel fallback to "
+                         f"{repository}/pulls/{pr_number} (Issue #754)")
+                return
+            except Exception as e2:
+                log.warning(f"PR-sub: post result comment failed (405 fallback also failed): {e2}")
+                return
+        log.warning(f"PR-sub: post result comment failed: {e}")
     except Exception as e:
         log.warning(f"PR-sub: post result comment failed: {e}")
 
@@ -5127,10 +5632,17 @@ def _redispatch_vod_after_recommend(repo_key: str, issue_id: str, vod_skill: str
     R20.29.4: redispatch 时 token 短路返回空 → 新 task 行 repo_gitcode_token=空 → agent 运行时实时获取。
     Issue #565: bot 建单只做场景判定（scene_id 已写库），不进执行棒——evt 带 _bot_opened
     标记时短路，不重派 VOD 执行流（不派 issue/coding 棒）。
+    2026-11-04 反转：默认放开（GRAPE_BOT_OPENED_FULL_PIPELINE=1），bot 建单推荐完成后
+    照常重派 VOD 跑完整流水线；仅当开关显式置 0 时回退旧的 scene-only 短路。
     """
-    if evt.get("_bot_opened"):
-        log.info(f"智能推荐完成: bot-opened issue {issue_id}, scene-only, skip redispatch (Issue #565)")
+    from src.config import GRAPE_BOT_OPENED_FULL_PIPELINE as _bot_full_pipeline
+    if evt.get("_bot_opened") and not _bot_full_pipeline:
+        log.info(f"智能推荐完成: bot-opened issue {issue_id}, scene-only, skip redispatch (Issue #565, "
+                 f"GRAPE_BOT_OPENED_FULL_PIPELINE=0)")
         return
+    if evt.get("_bot_opened"):
+        log.info(f"智能推荐完成: bot-opened issue {issue_id}, full pipeline enabled "
+                 f"(GRAPE_BOT_OPENED_FULL_PIPELINE=1), redispatch VOD")
     from src.api.event_store import append_event
     from src.runtime.engine_select import pick_engine, engine_name
     from src.runtime.service import get_execution_mode, EXEC_MODE_DIRECT
@@ -5148,6 +5660,7 @@ def _redispatch_vod_after_recommend(repo_key: str, issue_id: str, vod_skill: str
         _title = f"VOD redispatch: {vod_skill}"
 
     # 创建新 event
+    _a2a_actor = _a2a_actor_for(evt, issue_id, repo_key)
     seq = append_event(
         repo_key=repo_key,
         event_type="a2a_event",
@@ -5155,9 +5668,10 @@ def _redispatch_vod_after_recommend(repo_key: str, issue_id: str, vod_skill: str
         issue_id=issue_id,
         source="a2a",
         agent_type="vod",
-        actor="",
+        actor=_a2a_actor,
         summary=f"智能推荐完成 → VOD ({vod_skill})",
         payload={"repository": evt.get("repository", ""), "issue_number": _issue_num,
+                 "account": _a2a_actor,
                  "context": "智能推荐完成，重派 VOD 执行完整工作流"},
         status="pending",
         entity_type="issue",
@@ -5172,9 +5686,19 @@ def _redispatch_vod_after_recommend(repo_key: str, issue_id: str, vod_skill: str
         from src.runtime.engine_select import _repo_user_id
         _scene_uid = _repo_user_id(repo_key, issue_creator=evt.get("actor", ""))
 
-    # skill 解析
+    # skill 解析 + 单一判官 scope 校验（Issue #657/#1758：显式 id 仍需校验）
     from src.user.db import resolve_skill_id, get_skill_by_id, get_skill_path
     skill_name = vod_skill
+    _vod_sid = resolve_scene_node_skill_id(repo_key, "vod", scene_id=_scene_id,
+                                           user_id=_scene_uid)
+    _ev_vod = _evaluate_skill_scope(vod_skill, repo_key, skill_id=_vod_sid,
+                                    node_tag="vod", scene_id=_scene_id)
+    if not _ev_vod["ok"]:
+        _fail_skill_resolve_event(
+            repo_key, vod_skill, _scene_id, "vod",
+            _ev_vod["reason"], issue_id=issue_id, seq=seq,
+            scope_info=_ev_vod)
+        return False
     skill_id = resolve_skill_id(vod_skill, repo_key=repo_key, user_id=_scene_uid) or 0
     skill_path = vod_skill
     if skill_id:
@@ -5214,12 +5738,7 @@ def _redispatch_vod_after_recommend(repo_key: str, issue_id: str, vod_skill: str
                                is_scene_recommend=False)
         log.info(f"智能推荐重派: enqueued VOD task, seq={seq}, skill={vod_skill}")
     else:
-        # direct 模式
-        evt_copy["_skill_path"] = skill_path
-        evt_copy["_skill_id"] = skill_id
-        _direct_tid = _create_direct_task(repo_key, seq, "vod", _be, vod_skill,
-                                          skill_path, engine_id, evt_copy, issue_id, skill_id=skill_id)
-        start_direct_agent(_execute_agent, (
-            repo_key, seq, "vod", _be, vod_skill, evt_copy, engine_id, _direct_tid,
-        ), name=f"ag-vod-{seq}")
-        log.info(f"智能推荐重派: started direct VOD, seq={seq}, skill={vod_skill}")
+        # P0 (Issue #596): direct 路径改走 enqueue_task，由 local_claimer 认领执行
+        _enqueue_pipeline_task(repo_key, seq, "vod", _be, vod_skill, evt_copy,
+                               skill_id, skill_path, engine_id, issue_id)
+        log.info(f"智能推荐重派: enqueued VOD task, seq={seq}, skill={vod_skill}")

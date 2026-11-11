@@ -8,7 +8,47 @@
 """
 import os
 import time
-from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, generate_latest, CONTENT_TYPE_LATEST
+
+# prometheus_client 是服务端依赖（A/B/C 都装）；worker 包按最小依赖原则不带它，
+# 但 worker 侧需要通过 src.observability.otel 报 span（架构守护 BLOCKED-1）。
+# 因此这里做可选导入：缺失时提供 no-op 指标桩，保证模块可导入（worker 不采集指标）。
+try:
+    from prometheus_client import (Counter, Histogram, Gauge, CollectorRegistry,
+                                   generate_latest, CONTENT_TYPE_LATEST)
+    _PROMETHEUS_AVAILABLE = True
+except Exception:  # pragma: no cover - worker 包路径
+    _PROMETHEUS_AVAILABLE = False
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+
+    class _NoopMetric:  # type: ignore[no-redef]
+        """无 prometheus_client 时的指标桩：所有操作静默成功。"""
+
+        def __init__(self, *a, **k):
+            pass
+
+        def labels(self, *a, **k):
+            return self
+
+        def inc(self, *a, **k):
+            pass
+
+        def dec(self, *a, **k):
+            pass
+
+        def observe(self, *a, **k):
+            pass
+
+        def set(self, *a, **k):
+            pass
+
+    Counter = Histogram = Gauge = _NoopMetric  # type: ignore[misc,assignment]
+
+    class CollectorRegistry:  # type: ignore[no-redef]
+        def __init__(self, *a, **k):
+            pass
+
+    def generate_latest(*a, **k) -> bytes:  # type: ignore[misc]
+        return b""
 
 # ===== 配置（参考 multica metrics/config.go）=====
 
@@ -148,8 +188,13 @@ def start_metrics_server():
     """在独立端口启动 metrics HTTP server（参考 multica metrics/server.go）。
 
     仅在 METRICS_ADDR 启用时启动。绑定到指定地址，与主 API 分离。
+    幂等（three-process double-import fix 2026-11-04）：grape_server 与
+    main.py 双重调用/模块重复加载时只启动一次；端口被占（TIME_WAIT/
+    重复绑定）时降级跳过而非抛异常阻断应用启动。
     """
     global _metrics_httpd
+    if _metrics_httpd is not None:
+        return
     if not metrics_enabled():
         return
 
@@ -175,7 +220,14 @@ def start_metrics_server():
         def log_message(self, format, *args):
             pass  # 静默访问日志
 
-    _metrics_httpd = HTTPServer((host or "127.0.0.1", int(port or 9090)), _MetricsHandler)
+    try:
+        _metrics_httpd = HTTPServer((host or "127.0.0.1", int(port or 9090)), _MetricsHandler)
+    except OSError as _bind_err:
+        # 端口被占（快速重启 TIME_WAIT / 重复入口）：降级跳过，不阻断应用启动
+        from src.config import log as _log
+        _log.warning(f"metrics server skipped: bind failed on {addr} ({_bind_err})")
+        _metrics_httpd = None
+        return
 
     import threading
     t = threading.Thread(target=_metrics_httpd.serve_forever, daemon=True)
@@ -470,8 +522,9 @@ def _stuck_minutes() -> int:
     return get_stuck_threshold_minutes()
 
 
-# 采样器 Gauge 描述（用 ConstMetric，避免 stale series）
-from prometheus_client import Gauge as _Gauge
+# 采样器 Gauge 描述（用 ConstMetric，避免 stale series）。
+# worker 包不带 prometheus_client：这里复用上面的可选导入（缺失时 _Gauge 为 no-op 桩）。
+_Gauge = Gauge
 
 SAMPLER_TASK_QUEUED = _Gauge(
     "grape_task_queued",

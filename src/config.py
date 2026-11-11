@@ -34,12 +34,19 @@ user_var: contextvars.ContextVar = contextvars.ContextVar("user_id", default="")
 
 
 class _RequestIdFilter(logging.Filter):
-    """把 ContextVar 中的 request_id / repo_key / user_id 注入到每条 LogRecord 中。"""
+    """把 ContextVar 中的 request_id / repo_key / user_id 注入到每条 LogRecord 中。
+
+    调用方已通过 extra={...} 显式传入同名字段时保留显式值（如凭据接口日志显式
+    传 repo_key），仅补齐缺失字段，避免 ContextVar 覆盖业务上下文。
+    """
 
     def filter(self, record):
-        record.request_id = request_id_var.get()
-        record.repo_key = repo_var.get()
-        record.user_id = user_var.get()
+        if not getattr(record, "request_id", None):
+            record.request_id = request_id_var.get()
+        if not getattr(record, "repo_key", None):
+            record.repo_key = repo_var.get()
+        if not getattr(record, "user_id", None):
+            record.user_id = user_var.get()
         return True
 
 
@@ -55,16 +62,28 @@ class _JsonFormatter(logging.Formatter):
     """
 
     # extra 字段白名单：只有这些 LogRecord 属性会被提升为顶层 JSON 字段
-    _EXTRA_FIELDS = ("method", "path", "status", "duration_ms", "user_id", "repo_key")
+    _EXTRA_FIELDS = (
+        "method", "path", "status", "duration_ms", "user_id", "repo_key",
+        "event", "stage", "error_code", "provider", "auth_type",
+        "agent_type", "error_class",
+    )
 
     def format(self, record):
         import time as _t
+        # OTel trace 关联（2026-11-05 MR-1 Step 3）：注入 trace_id/span_id
+        try:
+            from src.observability.otel import inject_trace_ids
+            inject_trace_ids(record)
+        except Exception:
+            pass
         log_entry = {
             "ts": _t.strftime("%Y-%m-%dT%H:%M:%S.", _t.gmtime(record.created))
                   + f"{record.msecs:03.0f}Z",
             "level": record.levelname,
             "component": record.name,
             "request_id": getattr(record, "request_id", "-"),
+            "trace_id": getattr(record, "trace_id", "") or "",
+            "span_id": getattr(record, "span_id", "") or "",
             "message": record.getMessage(),
         }
         # 提取 extra 字段（HTTP 请求日志中间件注入的结构化维度）
@@ -304,6 +323,22 @@ def _load_accounts():
                 if _wcu:
                     set_meta_value("worker_connect_url", _wcu)
                     log.info(f"Configured worker_connect_url from server-config.json: {_wcu}")
+            # Issue #1577：业务 API 基址（任务内 GRAPE_SERVER_URL）可选配置，
+            # 未配置 getter 回退 server_base_url（单地址部署与改造前等价）。
+            if not get_meta_value("task_business_api_url"):
+                _tba = (_cfg.get("task_business_api_url") or "").strip().rstrip("/")
+                if _tba:
+                    set_meta_value("task_business_api_url", _tba)
+                    log.info(f"Configured task_business_api_url from server-config.json: {_tba}")
+            # Issue #1858：按服务任务基址（VCS/Issue/A2A）+ 可选聚合网关。
+            # 双写 server-config.json > meta；未配置不写，getter 回退业务/回连基址。
+            for _svc_key in ("task_vcs_api_url", "task_issue_api_url",
+                             "task_a2a_api_url", "task_gateway_base_url"):
+                if not get_meta_value(_svc_key):
+                    _svc_val = (_cfg.get(_svc_key) or "").strip().rstrip("/")
+                    if _svc_val:
+                        set_meta_value(_svc_key, _svc_val)
+                        log.info(f"Configured {_svc_key} from server-config.json: {_svc_val}")
         except Exception:
             pass
     except Exception as e:
@@ -834,6 +869,13 @@ BWRAP_RW_ENGINE = {
 # 注意：非瞬时错误（鉴权/配置）与有写操作证据的失败不重试（transient_retry.py 分类器+闸门）。
 GRAPE_TRANSIENT_RETRY_MAX = max(0, int(os.environ.get("GRAPE_TRANSIENT_RETRY_MAX", "3") or 3))
 GRAPE_TRANSIENT_RETRY_BASE = max(1, int(os.environ.get("GRAPE_TRANSIENT_RETRY_BASE", "10") or 10))
+
+# ===== bot 建单：智能推荐完成后是否进入完整流水线（Issue #565 反转开关，2026-11-04）=====
+# 旧行为（Issue #565）：bot 建单只做场景判定，scene_id 写库后短路，不重派 VOD 执行棒。
+# 现默认放开：推荐完成即按场景重派 VOD，继续跑完整流水线（issue/coding/qa/sre）。
+# 置 0/false/off 可回退到旧的 scene-only 行为；评论族自循环拦截不受本开关影响。
+GRAPE_BOT_OPENED_FULL_PIPELINE = os.environ.get(
+    "GRAPE_BOT_OPENED_FULL_PIPELINE", "1").strip().lower() in ("1", "true", "on", "yes")
 
 # ===== Admin Console =====
 ADMIN_CONSOLE_URL = os.environ.get("ADMIN_CONSOLE_URL", "").rstrip("/")

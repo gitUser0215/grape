@@ -19,6 +19,7 @@ from pydantic import BaseModel, field_validator
 from src.api.deps import get_current_user, check_repo_access
 from src.config import log
 from src.session_manager import db, db_lock
+from src.runtime.scheduler import _get_exec_agent_task
 
 router = APIRouter(prefix="/api/autopilot", tags=["autopilot"])
 
@@ -488,18 +489,24 @@ def list_executions(
     """查询执行日志（可按 task_id / status 筛选，分页）。
 
     Issue #258: 响应增加 agent_task_ids 字段（老流水线任务，通过 issue_number + repo_key 关联）。
-    Issue #261: 响应增加 agent_task_id 字段（单 agent 定时任务，通过 event_seq=exec_id 关联），
-    新版 autopilot 无 issue_number，agent_task_id 为主要日志查看入口。
+    Issue #261: 响应增加 agent_task_id 字段（单 agent 定时任务，日志查看入口）。
+    Issue #1546: 关联按 agent_task_id 直连优先，历史空值按 event_type + started_at 兜底，
+    不再裸用 event_seq 反查。
     """
     # 如果指定了 task_id，校验归属
     if task_id is not None:
         _check_task_access(user, task_id)
     # v3.0: autopilot_executions 不再有 issue_number 列（旧字段物理保留则兼容读取）
-    _has_issue_num_col = "issue_number" in _autopilot_exec_cols()
+    _exec_cols = _autopilot_exec_cols()
+    _has_issue_num_col = "issue_number" in _exec_cols
     _issue_num_expr = "e.issue_number" if _has_issue_num_col else "'' AS issue_number"
+    # Issue #1546（架构审查 M2）：agent_task_id 为新增列，迁移未落（MySQL 已盖章但列未建）
+    # 时列表查询不能直撞 1054 → 500；与 issue_number 同一列探测口径做表达式兜底。
+    _has_agent_task_id_col = "agent_task_id" in _exec_cols
+    _agent_task_id_expr = "e.agent_task_id" if _has_agent_task_id_col else "'' AS agent_task_id"
     sql = ("SELECT e.id, e.task_id, e.status, e.retry_count, e.result, e.error, "
            "e.started_at, e.completed_at, e.created_at, e.agent_type, e.findings_json, "
-           + _issue_num_expr + " FROM autopilot_executions e WHERE 1=1")
+           + _issue_num_expr + ", " + _agent_task_id_expr + " FROM autopilot_executions e WHERE 1=1")
     count_sql = "SELECT COUNT(*) FROM autopilot_executions e WHERE 1=1"
     conditions = []
     params = []
@@ -535,17 +542,18 @@ def list_executions(
         exec_id = r[0]
         tid = r[1]
         issue_number = r[11] or ""
-        # 反查 agent_task_id（event_seq = exec_id，旧路径）
-        agent_task_id = ""
-        try:
-            with db_lock:
-                c2 = db.cursor()
-                c2.execute("SELECT id FROM agent_tasks WHERE event_seq=? ORDER BY created_at DESC LIMIT 1", (exec_id,))
-                at_row = c2.fetchone()
-                if at_row:
-                    agent_task_id = at_row[0]
-        except Exception:
-            pass
+        # 反查 agent_task_id（Issue #1546：agent_task_id 直连优先，历史空值受约束兜底）
+        # 主查询已带回 agent_task_id/started_at/created_at，避免逐行重查执行记录（N+1）。
+        agent_task_id = r[12] or ""
+        if not agent_task_id:
+            try:
+                with db_lock:
+                    c2 = db.cursor()
+                    at_row = _get_exec_agent_task(c2, exec_id, "", r[6], r[8])
+                    if at_row:
+                        agent_task_id = at_row[0]
+            except Exception as e:
+                log.warning(f"Autopilot: resolve agent_task_id failed for exec {exec_id}: {e}")
         # Issue #258: 查 agent_task_ids（issue_number + repo_key 关联，支持多阶段）
         agent_task_ids: list[str] = []
         if issue_number:
@@ -607,11 +615,93 @@ class DispatchBody(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     scene_id: Optional[str] = None
+    # Issue #697：疑似重复（suspected_duplicate）需跟踪单 owner agent 确认后方可并入挂靠
+    dedup_confirmed: bool = False
+    dedup_confirmed_by: str = ""
+
+
+# Issue #697：判定级别枚举/归一/门禁判定统一取自 scheduler（单一事实源，禁止双源漂移）
+try:
+    from src.runtime.scheduler import (
+        DEDUP_LEVEL_SUSPECTED,
+        dedup_auto_merge_allowed,
+        normalize_dedup_level,
+        sanitize_dedup_note,
+        sanitize_dedup_confirmed_by,
+    )
+except Exception:  # scheduler 不可达时兜底（与 AUTOPILOT_DEDUP_RULE 同策略）
+    DEDUP_LEVEL_SUSPECTED = "suspected_duplicate"
+
+    def normalize_dedup_level(raw):
+        level = str(raw or "").strip().lower()
+        if not level:
+            return ""
+        return level if level in ("exact_duplicate", "suspected_duplicate", "not_duplicate") \
+            else "suspected_duplicate"
+
+    def dedup_auto_merge_allowed(dedup_level, dedup_confirmed=False):
+        level = normalize_dedup_level(dedup_level)
+        return level in ("", "not_duplicate", "exact_duplicate") or bool(dedup_confirmed)
+
+    def sanitize_dedup_note(raw):
+        return " ".join(str(raw or "").split())[:200]
+
+    def sanitize_dedup_confirmed_by(raw):
+        return " ".join(str(raw or "").split())[:64]
+
+
+def _dedup_dispatch_guard(finding: dict, dedup_confirmed: bool = False) -> None:
+    """疑似重复派发门禁（Issue #697，代码级强制）。
+
+    dedup_level 经 normalize_dedup_level 归一（fail-closed：LLM 漏发为空串保持既有放行，
+    拼错/未知非空级别一律降级为 suspected_duplicate），疑似重复且未经 owner 确认
+    （dedup_confirmed != true）时拒绝派发挂靠（409），防止仅标题相似即误并乃至级联关闭独立跟踪线。
+    确认后由调用方将 dedup_confirmed 落回 findings_json（创建 Issue 失败也不丢确认标记）。
+    """
+    if not dedup_auto_merge_allowed(finding.get("dedup_level"), dedup_confirmed
+                                    or bool(finding.get("dedup_confirmed"))):
+        raise HTTPException(status_code=409, detail={
+            "code": 409,
+            "message": "疑似重复（suspected_duplicate）：根因比对不一致，"
+                       "需跟踪单 owner agent 确认后方可派发并入；确认后携带 dedup_confirmed=true 重试",
+            "dedup_level": DEDUP_LEVEL_SUSPECTED,
+            "dedup_note": sanitize_dedup_note(finding.get("dedup_note")),
+        })
+
+
+def _append_dedup_note(description: str, finding: dict) -> str:
+    """Issue #697：派发描述追加判定级别与差异说明，保留根因对比证据链。
+
+    级别经 normalize 归一（未知 fail-closed）、dedup_note 压平限长后再写入公开 Issue 描述。
+    """
+    level = normalize_dedup_level(finding.get("dedup_level"))
+    if not level:
+        return description
+    note = sanitize_dedup_note(finding.get("dedup_note"))
+    lines = [description.rstrip(), "", f"[dedup] level={level}"]
+    if note:
+        lines.append(f"[dedup] 差异说明: {note}")
+    if level == DEDUP_LEVEL_SUSPECTED:
+        lines.append("[dedup] 疑似重复：待跟踪单 owner agent 确认后方可并入")
+    return "\n".join(lines)
+
+
+def _save_findings_json(exec_id: int, findings_data: dict) -> None:
+    """Issue #697：findings_json 回写（确认标记/派发号共用，统一加锁提交）。"""
+    with db_lock:
+        c = db.cursor()
+        c.execute(
+            "UPDATE autopilot_executions SET findings_json=? WHERE id=?",
+            (json.dumps(findings_data, ensure_ascii=False), exec_id)
+        )
+        db.commit()
 
 
 async def _dispatch_finding_core(exec_id: int, finding_id: str,
                                  title: str = "", description: str = "",
-                                 scene_id: str = "", user: dict = None):
+                                 scene_id: str = "", user: dict = None,
+                                 dedup_confirmed: bool = False,
+                                 dedup_confirmed_by: str = ""):
     """派发核心逻辑（autopilot-feishu-subscription-design.md §4.7）。
 
     从路由 dispatch_finding 抽出，供 Web 路由与飞书 /finding-dispatch handler 共用，
@@ -649,6 +739,18 @@ async def _dispatch_finding_core(exec_id: int, finding_id: str,
                                                      "message": f"已派发过 (Issue #{finding['dispatched_issue_number']})",
                                                      "issue_number": finding["dispatched_issue_number"]})
 
+    # Issue #697：疑似重复（根因不一致）未经 owner 确认 → 拒绝派发挂靠
+    _dedup_dispatch_guard(finding, dedup_confirmed)
+
+    # Issue #697：owner 确认后立即落库标记（先于建 Issue，建 Issue 失败也不丢确认），
+    # 防止后续重复确认/误判链重启；确认人取服务端身份，客户端自证字段仅作兜底展示
+    if dedup_confirmed and not finding.get("dedup_confirmed"):
+        finding["dedup_confirmed"] = True
+        _confirmed_by = sanitize_dedup_confirmed_by(dedup_confirmed_by)
+        if _confirmed_by:
+            finding["dedup_confirmed_by"] = _confirmed_by
+        _save_findings_json(exec_id, findings_data)
+
     # 创建真实 Issue（调用方传的 title/desc/scene_id 优先，否则用 finding 原值）
     from src.repo_key import split_owner_repo
     owner, rname = split_owner_repo(repo_key)
@@ -671,7 +773,7 @@ async def _dispatch_finding_core(exec_id: int, finding_id: str,
     issue_body = TaskCreateBody(
         repo_key=repo_key,
         title=title or finding["title"],
-        description=description or finding.get("description", ""),
+        description=_append_dedup_note(description or finding.get("description", ""), finding),
         scene_id=scene_id or "",
     )
     internal_user = {"id": (user or {}).get("id", 0),
@@ -682,13 +784,7 @@ async def _dispatch_finding_core(exec_id: int, finding_id: str,
     if issue_number and issue_number != "0":
         # 更新 findings_json
         finding["dispatched_issue_number"] = issue_number
-        with db_lock:
-            c = db.cursor()
-            c.execute(
-                "UPDATE autopilot_executions SET findings_json=? WHERE id=?",
-                (json.dumps(findings_data, ensure_ascii=False), exec_id)
-            )
-            db.commit()
+        _save_findings_json(exec_id, findings_data)
         log.info(f"Autopilot: finding {finding_id} dispatched as Issue #{issue_number} (exec={exec_id})")
         return {"ok": True, "issue_number": issue_number, "message": f"已创建 Issue #{issue_number}"}
     return {"ok": False, "message": f"创建 Issue 失败: {result}"}
@@ -700,10 +796,14 @@ async def dispatch_finding(exec_id: int, body: DispatchBody, user: dict = Depend
     exec_info = _check_exec_access(user, exec_id)
     log.info(f"[dispatch-debug] body.scene_id={body.scene_id!r} body.title={body.title!r}")
 
-    # 权限/仓库校验后走共用核心（权限模型与路由原本一致）
+    # 权限/仓库校验后走共用核心（权限模型与路由原本一致）；
+    # dedup_confirmed_by 以服务端认证身份为准（客户端自证字段仅兜底，防止伪造确认人）
     return await _dispatch_finding_core(exec_id, body.finding_id,
                                         body.title or "", body.description or "",
-                                        body.scene_id or "", user=user)
+                                        body.scene_id or "", user=user,
+                                        dedup_confirmed=bool(body.dedup_confirmed),
+                                        dedup_confirmed_by=str((user or {}).get("username")
+                                                               or body.dedup_confirmed_by or ""))
 
 
 # ====== 飞书订阅（autopilot-feishu-subscription-design.md §4.3）======

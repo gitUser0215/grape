@@ -118,12 +118,19 @@ function _loadRuntimesData() {
   API.get('/settings/agent-runtimes' + qs).then(function(d) {
     if (window._currentView !== 'runtimes') return;
     _rtTotal = d.total || 0;
-    // 空数据快速路径：直接渲染空态，不经过 renderRuntimes（避免等待 sceneTagsCache）
+    // 空数据快速路径：不等待 sceneTagsCache，先给即时反馈。
+    // Issue #1167: 有激活筛选时与 Worker 页空态对齐——走完整渲染路径（保留搜索框与
+    // 筛选栏，筛选栏自带 ✕ 清除，列表区内联「暂无引擎」）；无筛选的真空态保持
+    // 原「接入第一台引擎设备」引导不变。
     var _rts = (d && d.runtimes) || [];
     var _devs = (d && d.devices) || [];
     if (_rts.length === 0 && _devs.length === 0) {
-      _renderRuntimesSkeleton(d);
-      if (!__sceneTagsCache) _loadSceneTagsCache(function() {});
+      if (_rtHasActiveFilters()) {
+        renderRuntimes(d);   // 场景标签缓存未就绪时内部已自行预热并回调重渲
+      } else {
+        _renderRuntimesSkeleton(d);
+        if (!__sceneTagsCache) _loadSceneTagsCache(function() {});
+      }
       return;
     }
     renderRuntimes(d);
@@ -191,10 +198,15 @@ function _sortByHealth(list) {
 }
 
 // 按名称排序（字母数字从小到大）
+// Issue #1310：引擎按「引擎名（凭据名）」、设备按设备显示名（workerDisplayName）排序
+function _rtListSortName(x) {
+  if (x && Array.isArray(x.runtimes)) return workerDisplayName(x) || '';
+  return engineDisplayName(x) || x.instance_name || x.name || '';
+}
 function _sortByName(list) {
   return list.sort((a, b) => {
-    const na = (a.instance_name || a.name || a.device_name || '').toLowerCase();
-    const nb = (b.instance_name || b.name || b.device_name || '').toLowerCase();
+    const na = _rtListSortName(a).toLowerCase();
+    const nb = _rtListSortName(b).toLowerCase();
     return na.localeCompare(nb);
   });
 }
@@ -254,9 +266,14 @@ function _summaryStatsBar(data, devices) {
   return `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:7px 14px;margin-bottom:10px;font-size:12px;color:var(--t2);background:var(--bg);border-radius:8px">${parts.join('<span style="color:var(--t3)">·</span>')}</div>`;
 }
 
-// 引擎半透明底图：logo 图片水印（右下角，区分 opencode/hermes/codearts/codex/aishell）
+// 引擎半透明底图：logo 图片水印（右下角，区分 opencode/hermes/codearts/codex/aishell/aishell-dsh）
 function _engineWatermark(name) {
   const n = (name || '').toLowerCase();
+  if (n.startsWith('aishell-dsh') || n.includes('aishell-dsh')) {
+    // aishell-dsh 独立图标资产（AIShellDsh.svg，内容复用 AIShell.svg——同名不同物但视觉同源，
+    // 2026-11-09 用户裁定：两文件分开存，后续可独立替换 aishell-dsh 专属图）
+    return `<img src="/static/img/engines/AIShellDsh.svg" style="position:absolute;right:12px;bottom:8px;width:56px;height:56px;object-fit:contain;opacity:.25;pointer-events:none" alt="">`;
+  }
   if (n.includes('aishell') || n.includes('hwcloud')) {
     return `<img src="/static/img/engines/AIShell.svg" style="position:absolute;right:12px;bottom:8px;width:56px;height:56px;object-fit:contain;opacity:.25;pointer-events:none" alt="">`;
   }
@@ -414,6 +431,13 @@ function _addDeviceBtnHtml() {
   document.head.appendChild(s);
 })();
 
+// Issue #1167: 是否存在用户激活的筛选条件（与 _rtClearFilters 的重置范围保持一致）
+// 空数据快速路径据此区分「筛选无结果」与「组织无引擎」两种空态。
+function _rtHasActiveFilters() {
+  return !!(_rtFilterScope || _rtFilterType || _rtFilterScene.length || _rtFilterTag.length ||
+    _runtimeSearch || (_rtRange && _rtRange !== 'all'));
+}
+
 function _renderRuntimesSkeleton(data) {
   var el = document.getElementById('pageContent');
   if (!el) return;
@@ -431,9 +455,16 @@ function _renderRuntimesSkeleton(data) {
   _addDeviceBtnHtml() +
   '</div>';
   if (isEmpty) {
+    var emptyIcon = '<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="var(--t3)" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" style="opacity:.55"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
+    // Issue #1167: 有激活筛选时不渲染「组织无引擎」引导——骨架只出工具栏+加载占位，
+    // 待场景标签缓存就绪后由完整渲染与 Worker 页对齐（搜索框/筛选栏保留，列表区内联「暂无引擎」）。
+    if (_rtHasActiveFilters()) {
+      el.innerHTML = toolbar + '<div class="loading">' + (I18N.t('common.loading') || '加载中...') + '</div>';
+      return;
+    }
     el.innerHTML = toolbar +
       '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;gap:12px">' +
-      '<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="var(--t3)" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" style="opacity:.55"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>' +
+      emptyIcon +
       '<div style="font-size:15px;font-weight:600;color:var(--t1)">' + I18N.t('runtimes.empty.no_engines_title') + '</div>' +
       '<div style="font-size:13px;color:var(--t3)">' + I18N.t('runtimes.empty.no_engines_sub') + '</div>' +
       '</div>';
@@ -520,7 +551,8 @@ function renderRuntimes(data) {
   //             旧缓存缺字段时回退当前页派生
   const _availTypes = _runtimeTab === 'engines'
     ? (data.avail_types || [...new Set((data.runtimes||[]).map(e => {
-        const n = ((e.instance_name || e.name || '')).toLowerCase();
+        const n = ((e.display_name || e.name || e.instance_name || '')).toLowerCase();
+        if (n.startsWith('aishell-dsh') || n.includes('aishell-dsh')) return 'aishell-dsh';
         if (n.includes('aishell') || n.includes('hwcloud')) return 'aishell';
         if (n.includes('hermes')) return 'hermes';
         if (n.includes('opencode')) return 'opencode';
@@ -534,7 +566,7 @@ function renderRuntimes(data) {
   // 筛选标签从后端返回的 avail_scopes 生成（不依赖当前页数据）
   const _availScopes = _runtimeTab === 'engines' ? (data.avail_scopes || []) : (_rtDevAvailScopes || []);
   const _hasScope = (sc) => _availScopes.includes(sc);
-  const _ENGINE_DOT = { opencode: '#3b82f6', hermes: '#8b5cf6', codearts: '#f59e0b', codex: '#10a37f', aishell: '#0a8cd8' };
+  const _ENGINE_DOT = { opencode: '#3b82f6', hermes: '#8b5cf6', codearts: '#f59e0b', codex: '#10a37f', aishell: '#0a8cd8', 'aishell-dsh': '#22c55e' };
   // 收集可用场景和标签（Issue #472: 优先用后端返回的全量可见集派生值）
   const _allRuntimes = (data.runtimes || []);
   const _availScenes = (data.avail_scenes || [...new Set(_allRuntimes.flatMap(rt => rt.scene_tags || []))]).filter(Boolean);
@@ -570,7 +602,7 @@ function renderRuntimes(data) {
         ${_availTags.map(t => { var c = _RT_TAG_COLORS[t]||'#999'; var sel = _rtFilterTag.indexOf(t) >= 0; return '<label style="padding:5px 10px;font-size:11px;cursor:pointer;border-radius:4px;display:flex;align-items:center;gap:6px" onmouseover="this.style.background=\'var(--bg)\'" onmouseout="this.style.background=\'\'"><input type="checkbox" onchange="_rtToggleMulti(\'tag\',\'' + t + '\')" ' + (sel?'checked':'') + ' style="width:13px;height:13px;accent-color:' + c + '"><span style="font-size:9px;padding:1px 7px;border-radius:999px;color:#fff;background:' + c + '">' + _rtTagLabel(t) + '</span></label>'; }).join('')}
       </div>
     </div>` : ''}
-    ${(_rtFilterType || _rtFilterScope || _rtFilterScene.length || _rtFilterTag.length || _runtimeSearch) ? `<span onclick="_rtClearFilters()" style="cursor:pointer;font-size:11px;padding:4px 12px;border-radius:999px;color:#86868b;font-weight:400" onmouseover="this.style.color='#d32f2f'" onmouseout="this.style.color='#86868b'">✕ 清除</span>` : ''}
+    ${_rtHasActiveFilters() ? `<span onclick="_rtClearFilters()" style="cursor:pointer;font-size:11px;padding:4px 12px;border-radius:999px;color:#86868b;font-weight:400" onmouseover="this.style.color='#d32f2f'" onmouseout="this.style.color='#86868b'">✕ 清除</span>` : ''}
   </div>`;
   html += _summaryStatsBar(data, devices);
   html += _runtimeTab === 'engines' ? renderEngines(data, devices) : renderWorkers(data, devices);
@@ -585,6 +617,39 @@ function renderRuntimes(data) {
     window._rtOpenPanelOnEnter = false;
     setTimeout(function () { if (window._currentView === 'runtimes') openAddDevicePanel(); }, 150);
   }
+}
+
+// ====== Issue #865：引擎模型展示（配置模型 → 最近模型 → —）======
+function _engineModelDisplay(rt) {
+  const configured = rt.model_name || '';
+  if (configured) return configured;
+  const recent = (rt.recent_models || [])[0];
+  if (recent && recent.model) return recent.model + ' (' + I18N.t('runtimes.label.model_recent_short') + ')';
+  return '—';
+}
+
+function _engineModelTooltip(rt) {
+  const configured = rt.model_name || '';
+  if (configured) {
+    const src = rt.model_source === 'local_config'
+      ? I18N.t('runtimes.label.model_source_local')
+      : I18N.t('runtimes.label.model_source_report');
+    return configured + ' · ' + src;
+  }
+  return I18N.t('runtimes.label.model_fallback_hint');
+}
+
+function _recentModelsBlock(rt) {
+  const items = rt.recent_models || [];
+  if (!items.length) {
+    return `<div class="ts t3" style="font-size:12px;padding:4px 0">${I18N.t('runtimes.label.recent_models_empty')}</div>`;
+  }
+  return `<div style="display:flex;flex-direction:column;gap:6px">` + items.map(m => `
+    <div style="display:flex;align-items:center;gap:10px;font-size:12px;color:var(--t2);min-width:0">
+      <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">${m.model}</span>
+      <span class="ts t3" style="flex-shrink:0">${I18N.t('runtimes.label.model_used_count', {count: m.count})}</span>
+      <span class="ts t3" style="flex-shrink:0">${I18N.t('runtimes.label.model_last_used')} ${m.last_used_at ? relTime(m.last_used_at) : '—'}</span>
+    </div>`).join('') + `</div>`;
 }
 
 function renderEngines(data, devices) {
@@ -606,7 +671,7 @@ function renderEngines(data, devices) {
     const _abnormal = _isAbnormalEngine(rt);
     const _borderColor = _abnormal ? (_abnormalBorderColor(rt) || _cardLeftBorder) : _cardLeftBorder;
     const _cardShadow = _abnormal ? 'var(--sh),0 0 0 1px var(--r)' : 'var(--sh)';
-    const _engineName = rt.alias || rt.instance_name || rt.name || '—';
+    const _engineName = rt.alias || engineDisplayName(rt) || '—';
     const _engineType = rt.name || '—';
     const _engineVersion = rt.version || '—';
     const _engineInstalled = rt.installed ? I18N.t('runtimes.label.yes') : I18N.t('runtimes.label.no');
@@ -619,8 +684,8 @@ function renderEngines(data, devices) {
         ${_workerVersionStaleBadge(rt)}
         <span style="display:inline-flex;align-items:center;gap:3px;overflow:hidden;flex:1;min-width:0">
           <span style="font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_engineName}</span>
-          ${rt.alias ? `<span style="font-size:10px;color:var(--t3);font-weight:400">(${rt.instance_name || rt.name || '—'})</span>` : ''}
-          <svg onclick="event.stopPropagation();copyText('${(rt.instance_name || rt.name || '').replace(/'/g, "\\'")}');this.style.color='var(--g)';var _t=this;setTimeout(function(){_t.style.color='var(--t3)'},1500)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--t3)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;cursor:pointer;transition:color .2s"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          ${rt.alias ? `<span style="font-size:10px;color:var(--t3);font-weight:400">(${engineDisplayName(rt)})</span>` : ''}
+          <svg onclick="event.stopPropagation();copyText('${(engineDisplayName(rt) || '').replace(/'/g, "\\'")}');this.style.color='var(--g)';var _t=this;setTimeout(function(){_t.style.color='var(--t3)'},1500)" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--t3)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;cursor:pointer;transition:color .2s"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
         </span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;font-size:12px;color:var(--t2);flex:1">
@@ -632,6 +697,7 @@ function renderEngines(data, devices) {
         <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span style="color:var(--t3);display:inline-block;min-width:46px">${I18N.t('runtimes.label.tags')}</span> ${_engineTagSummary(rt.agent_tags)}</div>
         <div><span style="color:var(--t3);display:inline-block;min-width:46px">${I18N.t('runtimes.label.installed')}</span> ${_engineInstalled}</div>
         <div><span style="color:var(--t3);display:inline-block;min-width:46px">健康分</span> ${_healthScoreBadge(rt) || '—'}</div>
+        <div style="grid-column:1 / -1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${_engineModelTooltip(rt)}"><span style="color:var(--t3);display:inline-block;min-width:46px">${I18N.t('runtimes.label.model')}</span> ${_engineModelDisplay(rt)}</div>
       </div>
     </div>`;
   });
@@ -656,7 +722,7 @@ function renderWorkers(data, devices) {
     const _canManage = d.credential_id && _isOwner;
     const _curScope = d.scope || 'global';
     const _isLocal = d.credential_id === 0;
-    const clis = (d.runtimes || []).map(rt => `<span style="cursor:pointer;color:#235ec7;text-decoration:underline" onclick="event.stopPropagation();openEngineDetail(${rt.id})">${rt.alias || rt.name} v${rt.version || ''}${rt.healthy ? ' ✓' : ' ✗'}</span>`).join(' · ');
+    const clis = (d.runtimes || []).map(rt => `<span style="cursor:pointer;color:#235ec7;text-decoration:underline" onclick="event.stopPropagation();openEngineDetail(${rt.id})">${rt.alias || engineDisplayName(rt)} v${rt.version || ''}${rt.healthy ? ' ✓' : ' ✗'}</span>`).join(' · ');
     const credColor = d.credential_status === 'revoked' ? 'var(--r)' : 'var(--g)';
     const _wStatus = d.health || 'offline';
     const _wCardLeftBorder = _wStatus === 'online' ? 'none' : (RUNTIME_COLOR[_wStatus] || 'var(--t3)');
@@ -1370,8 +1436,8 @@ function _renderEngineDetail(rt) {
         ${_healthBadge(rt.health)}
         ${_helpBtn(_healthHelpHint(rt))}
         ${_workerVersionStaleBadge(rt)}
-        <span style="font-weight:700;font-size:18px">${rt.alias || rt.instance_name || rt.name}</span>
-        ${rt.alias ? `<span style="font-size:12px;color:var(--t3)">(${rt.instance_name || rt.name})</span>` : ''}
+        <span style="font-weight:700;font-size:18px">${rt.alias || engineDisplayName(rt)}</span>
+        ${rt.alias ? `<span style="font-size:12px;color:var(--t3)">(${engineDisplayName(rt)})</span>` : ''}
         <button class="bt bt-o" style="font-size:11px;padding:3px 8px;border-radius:4px" onclick="editRuntimeAlias(${runtimeId})">${I18N.t('runtimes.action.edit_alias')}</button>
         ${rt.is_local ? `<span style="font-size:11px;font-weight:600;color:#0e7490;background:#cffafe;border-radius:999px;padding:1px 8px">${I18N.t('runtimes.label.local_direct')}</span>` : ''}
         <button class="bt bt-o" style="margin-left:auto" onclick="closeEngineDetail()">${I18N.t('runtimes.action.close')}</button>
@@ -1389,6 +1455,15 @@ function _renderEngineDetail(rt) {
         <div style="display:flex;align-items:center;gap:8px"><span style="color:var(--t3);display:inline-block;min-width:70px">健康分</span> ${_healthScoreBadge(rt) || '—'}${_healthCanReset(rt) ? `<button class="bt bt-o" title="${I18N.t('runtimes.action.reset_health')}" style="font-size:11px;padding:3px 10px;border-radius:4px;margin-left:4px" onclick="event.stopPropagation();resetEngineHealth(${rt.id})">${I18N.t('runtimes.action.reset_health')}</button>` : ''}</div>
         <div><span style="color:var(--t3);display:inline-block;min-width:70px">异常原因</span> ${(() => { const _k = _healthHelpHint(rt); return _k ? `<span style="color:var(--r);font-weight:500">${I18N.t(_k)}</span>` : '<span class="ts t3">—</span>'; })()}</div>
         <div><span style="color:var(--t3);display:inline-block;min-width:70px">最近失败</span> ${rt.health_last_failure_at ? `<span class="ts t2">${relTime(rt.health_last_failure_at)}</span>` : '<span class="ts t3">—</span>'}</div>
+        <div style="display:flex;align-items:center;gap:4px;min-width:0"><span style="color:var(--t3);display:inline-block;min-width:70px;flex-shrink:0">${I18N.t('runtimes.label.model_configured')}</span> <span title="${_engineModelTooltip(rt)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${rt.model_name || '—'}</span></div>
+        <div><span style="color:var(--t3);display:inline-block;min-width:70px">${I18N.t('runtimes.label.model_last_used')}</span> ${(() => { const _m = (rt.recent_models || [])[0]; return _m && _m.last_used_at ? `<span class="ts t2">${relTime(_m.last_used_at)}</span>` : '<span class="ts t3">—</span>'; })()}</div>
+      </div>
+      <div style="border-top:1px solid var(--b);padding-top:16px;margin-bottom:16px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+          <span style="font-weight:600;font-size:14px">${I18N.t('runtimes.label.recent_models')}</span>
+          <span class="ts t3" style="font-size:11px">${I18N.t('runtimes.label.recent_models_desc')}</span>
+        </div>
+        ${_recentModelsBlock(rt)}
       </div>
       <div style="border-top:1px solid var(--b);padding-top:16px;margin-bottom:16px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
@@ -1694,17 +1769,17 @@ function editRuntimeAlias(runtimeId) {
           var parent = titleEl.parentElement;
           var nextSibling = titleEl.nextSibling;
           // 重建标题区域
-          titleEl.textContent = d.alias || (rt ? (rt.instance_name || rt.name) : '');
+          titleEl.textContent = d.alias || (rt ? engineDisplayName(rt) : '');
           // 更新括号显示
           var parenSpan = parent.querySelector('span[style*="color:var(--t3)"][style*="font-size:12px"]');
           if (d.alias && rt) {
             if (!parenSpan) {
               var ns = document.createElement('span');
               ns.style.cssText = 'font-size:12px;color:var(--t3)';
-              ns.textContent = '(' + (rt.instance_name || rt.name) + ')';
+              ns.textContent = '(' + engineDisplayName(rt) + ')';
               titleEl.insertAdjacentElement('afterend', ns);
             } else {
-              parenSpan.textContent = '(' + (rt.instance_name || rt.name) + ')';
+              parenSpan.textContent = '(' + engineDisplayName(rt) + ')';
             }
           } else if (parenSpan) {
             parenSpan.remove();

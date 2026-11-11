@@ -425,6 +425,16 @@ def askpass_path(issue_dir: str) -> str:
     return os.path.join(issue_dir, ".git-askpass.sh")
 
 
+def _install_branch_guard_hook(issue_dir: str, repo_key: str, branch: str) -> None:
+    """Issue #993：安装 worktree 级 pre-push 钩子（失败仅告警，不阻断建树）。"""
+    try:
+        from src.runtime.branch_guard import install_pre_push_hook
+        if not install_pre_push_hook(issue_dir, repo_key):
+            log.warning(f"repogit branch guard hook install failed {repo_key}:{branch}")
+    except Exception as e:
+        log.warning(f"repogit branch guard hook install error {repo_key}:{branch}: {e}")
+
+
 def ensure_issue_worktree(repo_key: str, agent_type: str, issue_num, token: str = "", work_branch: str = "") -> str | None:
     """确保共享基线 + Issue 级 worktree（任务 cwd）。已存在则直接复用。
 
@@ -437,11 +447,20 @@ def ensure_issue_worktree(repo_key: str, agent_type: str, issue_num, token: str 
         return None
     issue_dir = issue_dir_for(repo_key, agent_type, issue_num)
     os.makedirs(os.path.dirname(issue_dir), exist_ok=True)
+    branch = f"feat/issue-{issue_num}"
     if os.path.isdir(issue_dir) and (os.path.isdir(os.path.join(issue_dir, ".git"))
                                      or os.path.isfile(os.path.join(issue_dir, ".git"))):
         _write_askpass(issue_dir, repo_key)
+        # Issue #752（M2）：复用 worktree（如复测重跑）时同样重置保真基线——
+        # 基线=本次任务开始（清理前）的功能文件指纹，任务结束时比对（worktree_guard.verify_fidelity）
+        try:
+            from src.runtime.worktree_guard import save_baseline
+            save_baseline(issue_dir, token=token)
+        except Exception as _fg_e:
+            log.warning(f"repogit fidelity baseline failed {repo_key}: {_fg_e}")
+        # Issue #993：复用 worktree 同样安装 pre-push 守卫（覆盖 Agent 手工 push）
+        _install_branch_guard_hook(issue_dir, repo_key, branch)
         return issue_dir
-    branch = f"feat/issue-{issue_num}"
     with _lock_for(repo_key):
         try:
             base_branch = _default_base_branch(base, token, repo_key, env_work_branch=work_branch)
@@ -454,6 +473,14 @@ def ensure_issue_worktree(repo_key: str, agent_type: str, issue_num, token: str 
                 log.warning(f"repogit worktree add failed {repo_key}: {(r.stderr if r else 'git exec failed')[:300]}")
                 return None
             _write_askpass(issue_dir, repo_key)
+            # Issue #752（M2）：新建 worktree 后保存功能文件指纹基线（清理前快照）
+            try:
+                from src.runtime.worktree_guard import save_baseline
+                save_baseline(issue_dir, token=token)
+            except Exception as _fg_e:
+                log.warning(f"repogit fidelity baseline failed {repo_key}: {_fg_e}")
+            # Issue #993：worktree 建好后安装 pre-push 分支守卫（租约/merged/漂移）
+            _install_branch_guard_hook(issue_dir, repo_key, branch)
             return issue_dir
         except Exception as e:
             log.warning(f"repogit worktree failed {repo_key}: {e}")
