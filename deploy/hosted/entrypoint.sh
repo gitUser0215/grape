@@ -1,11 +1,12 @@
 #!/bin/sh
-# Grape · 托管平台启动引导（幂等；配置唯一真相源＝平台环境变量）
+# Grape · hosted-platform bootstrap (idempotent; platform env vars are the single source of truth)
 #
-# 自动补齐三件事，全部可安全重复执行：
-#   1) JWT_SECRET      —— 未提供则生成一次并落卷（否则重部署换密钥、登录全失效）
-#   2) server base url —— 显式 SERVER_BASE_URL 优先，其次通用 PUBLIC_DOMAIN，再次平台注入的 RAILWAY_PUBLIC_DOMAIN
-#   3) 引擎模型配置    —— 按 LLM_* 变量组装 $HOME/.config/opencode/opencode.json
-# 之后把控制权交回原 CMD。
+# Fills in three things, all safe to re-run:
+#   1) JWT_SECRET      - generate once and persist on the volume if absent
+#                        (otherwise every redeploy rotates the key and logs everyone out)
+#   2) public base URL - explicit SERVER_BASE_URL > generic PUBLIC_DOMAIN > platform-injected RAILWAY_PUBLIC_DOMAIN
+#   3) engine config   - build $HOME/.config/opencode/opencode.json from the LLM_* variables
+# Then hands control back to the original CMD.
 set -eu
 
 DATA="${DEVOPS_DATA_DIR:-/app/data}"
@@ -26,9 +27,9 @@ if [ -z "${JWT_SECRET:-}" ]; then
   echo "[entrypoint] JWT_SECRET <- ${JWT_SRC}"
 fi
 
-# ---------- 2) 对外基址 ----------
-# configs/ 被 .dockerignore 排除，所以必须运行时创建。
-# 优先级：显式 SERVER_BASE_URL > 平台注入的 RAILWAY_PUBLIC_DOMAIN。
+# ---------- 2) Public base URL ----------
+# configs/ is excluded by .dockerignore, so it has to be created at runtime.
+# Priority: explicit SERVER_BASE_URL > generic PUBLIC_DOMAIN > platform-injected RAILWAY_PUBLIC_DOMAIN.
 BASE_URL=""
 BASE_SRC=""
 if [ -n "${SERVER_BASE_URL:-}" ]; then
@@ -43,13 +44,14 @@ if [ -n "$BASE_URL" ]; then
   export TRUSTED_HOSTS="${TRUSTED_HOSTS:-$HOST}"
   echo "[entrypoint] server_base_url <- ${BASE_SRC} (${BASE_URL})"
 else
-  echo "[entrypoint] 警告: 既未提供 SERVER_BASE_URL，也拿不到 PUBLIC_DOMAIN / RAILWAY_PUBLIC_DOMAIN —— 未生成 server-config.json，OAuth 回调将指向 localhost:3000" >&2
+  echo "[entrypoint] WARN: neither SERVER_BASE_URL nor PUBLIC_DOMAIN / RAILWAY_PUBLIC_DOMAIN is available - server-config.json not written; OAuth callbacks will point at localhost:3000" >&2
 fi
 
-# ---------- 3) 项目模板预同步（幂等）----------
-# Grape 的模板注册表 configs/project-templates.json 与 examples/ 不在仓库里，
-# 由 scripts/sync_templates.sh 从 grape-template 仓库同步生成。镜像内没有它 → 前端模板页为空。
-# 这里在启动时补一次：优先 svn 脚本（需 git），失败则退回 codeload tarball（不依赖 git）。
+# ---------- 3) Project templates pre-sync (idempotent) ----------
+# Grape's template registry (configs/project-templates.json) and examples/ are not committed;
+# scripts/sync_templates.sh generates them from the grape-template repository. Without them the
+# UI template page is empty. We sync once at startup: try the shell script (needs git) first,
+# fall back to a codeload tarball (no git required).
 if [ ! -s /app/configs/project-templates.json ] || [ ! -d /app/examples ] || [ -z "$(find /app/examples -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)" ]; then
   TPL_REPO="${TEMPLATES_REPO:-https://github.com/grape-dev/grape-template.git}"
   TPL_REF="${TEMPLATES_REF:-main}"
@@ -71,7 +73,7 @@ if [ ! -s /app/configs/project-templates.json ] || [ ! -d /app/examples ] || [ -
       fi
       echo "[entrypoint] templates synced (tarball)"
     else
-      echo "[entrypoint] 警告: 模板同步失败（模板页可能为空），应用仍会启动" >&2
+      echo "[entrypoint] WARN: template sync failed (template page may be empty); starting anyway" >&2
     fi
     rm -rf "$TPL_STAGE"
   fi
@@ -79,16 +81,16 @@ else
   echo "[entrypoint] templates present (skip sync)"
 fi
 
-# ---------- 4) 引擎模型配置（实测可用的 opencode provider 形态）----------
-# 为什么不用 `providers` 顶层写法：opencode 1.18.x 只认旧式 `provider.<id>.options.baseURL`
-# 与 `npm`（不是 `package`）字段，包名必须是 @ai-sdk/openai-compatible；
-# 写成 providers + package + 顶层 baseURL 会报 "Provider not found / Failed to initialize provider"
-# （2026-11-11 本机实测：该形态可直接调通网关并返回结果）。
+# ---------- 4) Engine model config (opencode provider shape verified working) ----------
+# Why not the top-level `providers` form: opencode 1.18.x only understands the classic
+# `provider.<id>` block with `npm` (not `package`) + `options.baseURL`, and the npm package must be
+# @ai-sdk/openai-compatible. Using `providers` + `package` + a top-level baseURL yields
+# "Provider not found" / "Failed to initialize provider". Verified working against a real gateway.
 if [ -n "${LLM_API_KEY:-}" ]; then
   CFG="$HOME/.config/opencode/opencode.json"
   mkdir -p "$(dirname "$CFG")"
   PID="${LLM_PROVIDER_ID:-custom}"
-  # provider 预设：只填 LLM_PROVIDER + LLM_API_KEY 即可开箱可用
+  # provider presets: LLM_PROVIDER + LLM_API_KEY is enough to be usable out of the box
   case "${LLM_PROVIDER:-}" in
     openai)     DEF_BASE="https://api.openai.com/v1" ;;
     deepseek)   DEF_BASE="https://api.deepseek.com/v1" ;;
@@ -98,7 +100,7 @@ if [ -n "${LLM_API_KEY:-}" ]; then
   esac
   BASE="${LLM_BASE_URL:-$DEF_BASE}"
   if [ -z "$BASE" ]; then
-    echo "[entrypoint] 警告: 未指定 LLM_BASE_URL 也未给 LLM_PROVIDER 预设，引擎可能无法解析端点" >&2
+    echo "[entrypoint] WARN: neither LLM_BASE_URL nor an LLM_PROVIDER preset was given; the engine may not resolve an endpoint" >&2
   fi
   LLM_BASE_URL="$BASE" \
   LLM_MODEL_ID="${LLM_MODEL:-}" \
@@ -113,7 +115,7 @@ pid = (os.environ.get("LLM_PROVIDER_ID") or "custom").strip() or "custom"
 cfg_path = os.environ["OPENCODE_CFG"]
 api_key = os.environ.get("LLM_API_KEY") or ""
 
-# LLM_MODEL 允许写成 custom/<模型ID> 或裸 <模型ID>，统一取后半段作为模型 ID
+# LLM_MODEL may be `custom/<model-id>` or a bare `<model-id>`; we keep the part after the slash
 mid = mid.split("/", 1)[1] if "/" in mid else mid
 
 models = {}
@@ -124,8 +126,8 @@ def add(m):
 
 add(mid)
 
-# 端点若有 /models 清单，则把全部模型注册进来 —— 这样部署者可在
-# Grape「Agent 配置」里自由切换多个大模型，而不是被钉在单一模型上。
+# If the endpoint exposes /models, register every model it returns, so deployers can switch
+# between models in Grape's Agent Settings instead of being pinned to a single one.
 if base:
     try:
         req = urllib.request.Request(
@@ -140,7 +142,7 @@ if base:
         print(f"[entrypoint] model discovery skipped: {type(e).__name__}: {e}", file=sys.stderr)
 
 if not models:
-    print("[entrypoint] 未提供模型且端点未返回模型清单，跳过引擎配置", file=sys.stderr)
+    print("[entrypoint] no model given and endpoint returned no model list; skipping engine config", file=sys.stderr)
     sys.exit(0)
 
 default_model = f"{pid}/{mid}" if mid else f"{pid}/{sorted(models)[0]}"
@@ -165,8 +167,8 @@ print(
 )
 PY
 else
-  echo "[entrypoint] LLM_API_KEY 未提供：跳过引擎配置，任务将提示「无可用引擎」" >&2
+  echo "[entrypoint] LLM_API_KEY not provided: skipping engine config; tasks will report \"no available engine\"" >&2
 fi
 
-# ---------- 5) 交回原启动命令 ----------
+# ---------- 5) Hand control back to the original CMD ----------
 exec "$@"

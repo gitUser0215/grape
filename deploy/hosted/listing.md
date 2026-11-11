@@ -61,7 +61,7 @@ To use AIShell / Codex / dsh / CodeArts: install that CLI **on your own machine*
 This template **does not upgrade itself**. Code updates only take effect when you confirm them:
 
 1. When the template author merges an update, your project shows an "update available" notice;
-2. Before applying, read the [CHANGELOG](https://github.com/gitUser0215/grape/blob/main/deploy/hosted/changelog.md) to see what changed and whether manual steps are needed;
+2. Before applying, review the [commit history](https://github.com/gitUser0215/grape/commits/main) to see what changed and whether manual steps are needed;
 3. Apply from the notice when you are ready. Otherwise you stay on your current version with no impact.
 
 Notes:
