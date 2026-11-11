@@ -6748,3 +6748,42 @@ def _backfill_scene_display_names():
                 log.info("Issue #344: cleared cached plaintext tokens from chat_conversations and agent_tasks")
     except Exception as e:
         log.warning(f"Issue #344 token cleanup failed: {e}")
+
+
+# ===== 存量库补种子：官方 Agent 类型（2026-11-11 实测定型）=====
+def _fn_seed_agent_types_from_config() -> None:
+    """存量库补种子：把 configs/agent-description.json 的官方 Agent 类型写入 agent_type 表。
+
+    问题：种子逻辑 _seed_from_json() 位于**已冻结的老轨** _run_all_migrations()，
+    只服务「全新库 / 未盖 legacy-stamp 202610300001 的库」。存量库启动只跑
+    _MIGRATIONS（本处登记的迁移），因此 agent_type 永远为空：
+      - GET /api/agents/types → {"types": []}
+      - GET /api/agents/{name}/{owner}/{repo} → 404「Agent 类型未配置: vod」
+    与 Issue #995（issue.vcs_exists 静默 Unknown column）同一类问题：
+    「老轨永不执行 + 查询异常被 except 吞掉 → 接口静默返回空」。
+    另外镜像内若缺 /app/configs/agent-description.json（.dockerignore 曾整目录排除
+    configs/），首次启动同样 seed 不到，之后库被盖章就再也补不上——本迁移兜住这条路径。
+
+    幂等：INSERT OR REPLACE 按 agent_type 主键覆盖；不需要 meta.seeded_keys 配合。
+    失败：文件缺失只告警不抛错（不阻断启动），其它异常照常抛出让执行器不盖章、下次重试。
+    """
+    filepath = os.path.join(_CONFIG_DIR, "agent-description.json")
+    if not os.path.exists(filepath):
+        log.warning(f"seed-agent-types: {filepath} not found, skip")
+        return
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or not data:
+        log.warning("seed-agent-types: agent-description.json empty or invalid, skip")
+        return
+    # 复用既有写入逻辑（列集合与 _run_all_migrations 里的 seed 完全一致）
+    _insert_seed_data("agent_type", data)
+    log.info(f"seed-agent-types: upserted {len(data)} agent types from agent-description.json")
+
+
+register_migration(
+    version="202611110001",
+    name="seed-agent-types-from-config",
+    kind="safe",
+    fn=_fn_seed_agent_types_from_config,
+)
