@@ -13,7 +13,9 @@ set -eu
 # present). When it is off we simply exec the requested command, so self-hosting stays unchanged.
 HOSTED="${GRAPE_HOSTED_BOOTSTRAP:-auto}"
 if [ "$HOSTED" = "auto" ]; then
-  if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ] || [ -n "${RAILWAY_ENVIRONMENT:-}" ] || [ -n "${LLM_API_KEY:-}" ]; then
+  if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ] || [ -n "${RAILWAY_ENVIRONMENT_NAME:-}" ] \
+     || [ -n "${RAILWAY_PROJECT_ID:-}" ] || [ -n "${PUBLIC_DOMAIN:-}" ] \
+     || [ -n "${SERVER_BASE_URL:-}" ] || [ -n "${LLM_API_KEY:-}" ]; then
     HOSTED=1
   else
     HOSTED=0
