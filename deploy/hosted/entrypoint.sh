@@ -106,6 +106,23 @@ else
   echo "[entrypoint] templates present (skip sync)"
 fi
 
+# ---------- 3b) Official config seeds (agent types / pipelines / ...) ----------
+# configs/*.json are excluded from the build context by the upstream .dockerignore, so a container
+# built from this repo has no /app/configs/*.json at all. Consequences: Grape cannot seed the
+# agent_type table (the Agents page then fails with "Agent type not configured: vod") and several
+# defaults are missing. Fetch whichever seed files are absent from the public repo (best effort).
+CFG_BASE="${GRAPE_CONFIG_RAW_BASE:-https://raw.githubusercontent.com/grape-dev/grape/main/configs}"
+for _f in agent-description.json agent-skill-mapping.json default-scene.json engine-selection.json \
+          pipelines.json credential-filter.json onboarding-templates.json; do
+  [ -s "/app/configs/$_f" ] && continue
+  if curl -fsSL --retry 2 --max-time 30 "$CFG_BASE/$_f" -o "/app/configs/$_f"; then
+    echo "[entrypoint] config seed fetched: $_f"
+  else
+    rm -f "/app/configs/$_f"
+    echo "[entrypoint] WARN: config seed unavailable: $_f" >&2
+  fi
+done
+
 # ---------- 4) Engine model config (opencode provider shape verified working) ----------
 # Why not the top-level `providers` form: opencode 1.18.x only understands the classic
 # `provider.<id>` block with `npm` (not `package`) + `options.baseURL`, and the npm package must be
