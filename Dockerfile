@@ -1,57 +1,65 @@
+# Grape - single image definition for BOTH self-hosting and hosted platforms.
+# Hosted-platform artifacts live in deploy/hosted/ (no vendor in the naming); this file serves both,
+# so upstream changes to the image are picked up by hosted deployments automatically.
+# Layer order follows change frequency: system/engine -> python deps -> templates -> source.
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# 系统依赖——gcc/g++ 编译 C 扩展（bcrypt/cffi 等）
+# ---- 1) System deps + execution engine + codegraph (changes only when bumping versions) ----
+# git/curl/ca-certificates: template sync and fallback downloads
+# node 22: runtime for the opencode engine (and for codegraph)
+# opencode-ai: the execution engine Grape drives (the npm package name is opencode-ai)
+# codegraph: project-info generation engine (Issue #666), installed into its own prefix
+# NOTE: node is intentionally NOT purged - the engine needs it at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ && \
-    rm -rf /var/lib/apt/lists/*
+        gcc g++ git curl ca-certificates \
+ && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && npm i -g opencode-ai \
+ && ( npm install -g --prefix /opt/codegraph @colbymchenry/codegraph \
+      && ln -sf /opt/codegraph/bin/codegraph /usr/local/bin/codegraph \
+      || echo "warning: codegraph install failed, project-info will run degraded with warning" ) \
+ && npm cache clean --force \
+ && rm -rf /var/lib/apt/lists/* \
+ && ( codegraph --version \
+      || ( echo "warning: codegraph unavailable, project-info will run degraded with warning"; rm -f /usr/local/bin/codegraph ) )
 
-# Python 依赖（Issue #452: 使用完整 requirements.txt，生产部署需全部功能）
+# ---- 2) Python dependencies (changes only with requirements.txt) ----
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Issue #666 (M3): 引擎基线镜像预装 codegraph（project-info 全量生成引擎）。
-# 分发形式：npm 平台二进制包 @colbymchenry/codegraph（自包含：内置 node 运行时 + Rust 内核，
-# bin/codegraph 可直接执行，见 scripts/install-codegraph.sh 注释）——非 pip 包。
-# 构建期用 nodejs/npm 在线安装，装完卸载 nodejs/npm 保持镜像精简（二进制自包含不依赖系统 node）。
-# best-effort：安装失败不阻断镜像构建，运行时走降级路径并显式告警（src/project_info/builder.py）。
-# 安装位置：独立 prefix /opt/codegraph（QA 修复 #666：规避 apt purge nodejs/npm 时
-# npm 全局目录 /usr/lib/node_modules 被连带清理的风险）；bin 软链到 /usr/local/bin。
-# purge 后最终复核 codegraph --version（不可用则清理失效软链并告警，镜像仍可构建）。
-RUN set -x; \
-    apt-get update && apt-get install -y --no-install-recommends nodejs npm; \
-    if npm install -g --prefix /opt/codegraph @colbymchenry/codegraph; then \
-        ln -sf /opt/codegraph/bin/codegraph /usr/local/bin/codegraph; \
-    else \
-        echo "warning: codegraph install failed, project-info will run degraded with warning"; \
-    fi; \
-    apt-get purge -y nodejs npm; \
-    apt-get autoremove -y; \
-    rm -rf /var/lib/apt/lists/*; \
-    if codegraph --version >/dev/null 2>&1; then \
-        codegraph --version; \
-    else \
-        echo "warning: codegraph missing after node purge, project-info will run degraded with warning"; \
-        rm -f /usr/local/bin/codegraph; \
-    fi
+# ---- 3) Project templates (changes only with upstream grape-template; ~226 KB) ----
+# The registry (configs/project-templates.json) and examples/ are not committed, and configs/ is
+# excluded by .dockerignore, so they have to be baked in here - otherwise the UI template page is empty.
+RUN mkdir -p /app/examples /app/configs \
+ && curl -fsSL --retry 2 --max-time 180 \
+      https://codeload.github.com/grape-dev/grape-template/tar.gz/refs/heads/main -o /tmp/tpl.tgz \
+ && tar xzf /tmp/tpl.tgz -C /tmp \
+ && SRC=$(find /tmp -mindepth 1 -maxdepth 1 -type d -name 'grape-template-*' | head -1) \
+ && for d in "$SRC"/*/; do n=$(basename "$d"); [ "$n" = ".git" ] && continue; cp -a "$d" "/app/examples/$n"; done \
+ && cp -a "$SRC/project-templates.json" /app/configs/project-templates.json \
+ && rm -rf /tmp/tpl.tgz "$SRC"
 
-# 代码
+# ---- 4) Source code (changes most often, so it goes last) ----
 COPY . .
-
-# 默认 .env（Issue #452: SQLite + OBS 关闭，生产环境通过环境变量覆盖）
-# 审查修复: COPY .env.example .env，确保容器内始终有 /app/.env，不再依赖宿主 bind mount
 COPY .env.example .env
 
-# 时区
 ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Issue #452: 内网/Docker 环境关闭公网 IP 探测
+# Disable public-IP probing in container environments
 ENV GRAPE_AUTO_DETECT_URL=false
 
-EXPOSE 3000
+# ---- 5) Bootstrap ----
+# The hosted bootstrap fills in the JWT secret (persisted on the volume), the public base URL and the
+# engine model config from environment variables. It is inert unless it detects a hosted environment
+# (or GRAPE_HOSTED_BOOTSTRAP=1), in which case it just execs the requested command - self-hosting is
+# unaffected. COOKIE_SECURE is deliberately NOT set here: hosted platforms set it as a variable,
+# while self-hosters on plain HTTP must keep it false or they cannot sign in.
+COPY deploy/hosted/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
-# 只启动 3000 主服务——main:app 已包含所有路由（含 webhook + A2A + runtime API）
-# 不启动 8080——run_webhook:app 是冗余的，main:app 已注册 webhook_router（main.py 第 119 行）
+EXPOSE 3000
 CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "3000", "--proxy-headers", "--forwarded-allow-ips=*"]

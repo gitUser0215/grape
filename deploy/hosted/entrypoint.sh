@@ -9,6 +9,27 @@
 # Then hands control back to the original CMD.
 set -eu
 
+# Hosted bootstrap is opt-in: 1 = always, 0 = never, unset = auto-detect (hosted platform signals
+# present). When it is off we simply exec the requested command, so self-hosting stays unchanged.
+HOSTED="${GRAPE_HOSTED_BOOTSTRAP:-auto}"
+if [ "$HOSTED" = "auto" ]; then
+  if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ] || [ -n "${RAILWAY_ENVIRONMENT:-}" ] || [ -n "${LLM_API_KEY:-}" ]; then
+    HOSTED=1
+  else
+    HOSTED=0
+  fi
+fi
+if [ "$HOSTED" != "1" ]; then
+  echo "[entrypoint] hosted bootstrap disabled (GRAPE_HOSTED_BOOTSTRAP=$HOSTED) -> exec as-is"
+  exec "$@"
+fi
+
+# Keep the engine home on the persistent volume when one is mounted, so model config survives redeploys.
+# Without a volume (plain self-hosting) HOME is left untouched.
+if [ -d /app/data ]; then
+  export HOME="${GRAPE_ENGINE_HOME:-/app/data/engine-home}"
+fi
+
 DATA="${DEVOPS_DATA_DIR:-/app/data}"
 mkdir -p "$DATA" /app/configs "$HOME/.config/opencode"
 
@@ -34,6 +55,8 @@ BASE_URL=""
 BASE_SRC=""
 if [ -n "${SERVER_BASE_URL:-}" ]; then
   BASE_URL="${SERVER_BASE_URL%/}"; BASE_SRC="SERVER_BASE_URL"
+elif [ -n "${PUBLIC_DOMAIN:-}" ]; then
+  BASE_URL="https://${PUBLIC_DOMAIN}"; BASE_SRC="PUBLIC_DOMAIN"
 elif [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
   BASE_URL="https://${RAILWAY_PUBLIC_DOMAIN}"; BASE_SRC="RAILWAY_PUBLIC_DOMAIN"
 fi

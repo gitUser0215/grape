@@ -1,12 +1,13 @@
 # Hosted-platform deployment materials (`deploy/hosted`)
 
-Everything needed to publish Grape on a container hosting platform lives here. Neither the directory
+Everything needed to publish Grape on a container hosting platform lives here. The image itself is
+built from the repository root `Dockerfile` (one definition shared by self-hosting and hosted
+platforms, so upstream image changes apply everywhere); `entrypoint.sh` below is the hosted bootstrap. Neither the directory
 nor the filenames reference any vendor, so the same set works for any platform that can build from a
 Dockerfile, inject a domain variable and attach a persistent volume.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Image definition for the platform build: Python runtime + execution engine (`opencode`) + project templates baked in |
 | `entrypoint.sh` | Idempotent container bootstrap: session secret, public base URL, template pre-sync, engine model config |
 | `listing.md` | Marketplace listing copy (English) — overview, model endpoint guide, engine notes, upgrade policy |
 | `variables.md` | Variable table: which are required, which are hidden defaults, which the platform injects |
@@ -19,7 +20,7 @@ default branch, and the commit history is the changelog —
 ## The platform still needs one config file
 
 `railway.json` at the repository root is a **filename required by the platform** (config-as-code,
-read only from the repo root). It does one thing: point the build at `deploy/hosted/Dockerfile`.
+read only from the repo root). It does one thing: point the build at the repository's root `Dockerfile`.
 When moving to another platform, delete it and write that platform's equivalent — nothing in this
 directory has to change.
 

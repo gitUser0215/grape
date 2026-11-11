@@ -40,6 +40,7 @@
 | `COOKIE_SECURE` | `true` | The platform serves HTTPS only; production checks enforce it |
 | `GRAPE_PORT` | `3000` | Must match the container port and the template's public port |
 | `DEVOPS_DB_BACKEND` | `sqlite` | Default SQLite; data lives on the `/app/data` volume |
+| `GRAPE_HOSTED_BOOTSTRAP` | unset (auto) | Hosted bootstrap switch: `1` always, `0` never, unset = auto-detect (on these platforms it always runs). The bootstrap fills in the JWT secret, the public base URL and the engine model config |
 
 ## 3. Injected by the platform — do **not** set by hand
 
