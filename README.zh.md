@@ -14,7 +14,7 @@
     <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
     <a href="#五快速开始">快速开始</a> ·
     <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
-    <a href="CONTRIBUTING.zh.md">参与贡献</a> ·
+    <a href="CONTRIBUTING.md">参与贡献</a> ·
     <span title="入群入口筹备中"><img src="assets/community/feishu.svg" width="16" height="16" alt="飞书">&nbsp;飞书</span> ·
     <span title="入群入口筹备中"><img src="assets/community/wechat.svg" width="16" height="16" alt="微信">&nbsp;微信</span>
   </p>
@@ -143,17 +143,18 @@ git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 | **配置 OAuth 应用凭据** | GitCode / GitHub 登录返回 400（`not_configured`），登录按钮灰 | `configs/oauth-providers.json` 填两个 provider 的 `client_id` / `client_secret`，回调须为 `https://<域名>/api/auth/callback/{gitcode,github}` |
 | **配置对外可访问基址** | 回退 `localhost:3000`，OAuth 回调无法回访，登录与托管不可用 | `configs/server-config.json` 的 `server_base_url` 与 `webhook_url` 改成对外地址 |
 
-## 社群
+## 社区与贡献
 
-- **Issues** —— https://github.com/grape-dev/grape/issues
-- <img src="assets/community/feishu.svg" width="16" height="16" alt="飞书">&nbsp;**飞书** —— 入群入口筹备中，开放后在此更新（接入 Grape 后也可在绑定的群内直接反馈）
-- <img src="assets/community/wechat.svg" width="16" height="16" alt="微信">&nbsp;**微信** —— 入群入口筹备中，开放后在此更新
-- **社群** —— https://www.grapedev.cn/community.html
+- **官网**：[grapedev.cn](https://www.grapedev.cn/)
+- **场景与案例**：[社区与场景实践](https://www.grapedev.cn/community.html)
+- **问题反馈**：[Issues](https://github.com/grape-dev/grape/issues)
+- **交流**：<img src="assets/community/feishu.svg" width="18" height="18" alt="飞书">&nbsp;飞书 · <img src="assets/community/wechat.svg" width="18" height="18" alt="微信">&nbsp;微信 —— 群入口筹备中，开放后在此更新；接入 Grape 后也可在绑定的群内直接反馈
+- **贡献**：修 bug、加需求、写 Skill 都欢迎 —— 见 [CONTRIBUTING.md](CONTRIBUTING.md)；贡献者名单见 [Contributors](https://github.com/grape-dev/grape/graphs/contributors)
 
-## 安全
+## 安全与隐私
 
 漏洞上报与 Agent 执行安全模型见 [SECURITY.md](SECURITY.md)。
 
-## 许可
+## 许可证
 
 MIT，见 [LICENSE](LICENSE)。

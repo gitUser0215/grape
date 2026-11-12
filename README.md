@@ -145,12 +145,13 @@ The first sign-in, platform-facing configuration and deployment are covered in *
 
 ## Community
 
-- **Issues** — https://github.com/grape-dev/grape/issues
-- <img src="assets/community/feishu.svg" width="16" height="16" alt="Feishu">&nbsp;**Feishu** — join link coming soon; once connected to Grape you can also give feedback in your bound group chat
-- <img src="assets/community/wechat.svg" width="16" height="16" alt="WeChat">&nbsp;**WeChat** — join link coming soon
-- **Community** — https://www.grapedev.cn/community.html
+- **Website**: [grapedev.cn](https://www.grapedev.cn/)
+- **Scenes and cases**: [community and use cases](https://www.grapedev.cn/community.html)
+- **Feedback**: [Issues](https://github.com/grape-dev/grape/issues)
+- **Chat**: <img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu">&nbsp;Feishu · <img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat — join links coming soon, updated here once open; once connected to Grape you can also give feedback in your bound group chat
+- **Contributing**: bug fixes, feature requests and new Skills are all welcome — see [CONTRIBUTING.md](CONTRIBUTING.md); contributor list in [Contributors](https://github.com/grape-dev/grape/graphs/contributors)
 
-## Security
+## Security and privacy
 
 Vulnerability reporting and the security model of agent execution: [SECURITY.md](SECURITY.md).
 
