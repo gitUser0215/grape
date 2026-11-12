@@ -52,7 +52,6 @@ Grape 把任意 Git 项目变成一支 AI 自主开发团队：需求、实现�
 | **五段 Agent 流水线** | VOD 收集声音建单 → Issue 分类指派 → Coding 编码提 PR → QA 审查与安全扫描 → SRE 构建部署运维；Chat Agent 随时问答。事件进来即自动贯穿全流程。 |
 | **一键托管任意 Git 项目** | 选模板或喂现有仓库 → 自动套用「Agent × Skill」场景 → 异步首次引导（分析项目、建体验部署与探索 Issue）→ 此后每个 Issue / PR 自动处理。 |
 | **Skills 技能库** | 15+ 官方技能覆盖全流程（声音收集、Issue 管理、代码实现、PR 审查、构建部署运维、通知、托管引导），支持官方 / 仓库级 / 个人级三态自定义。 |
-| **三入口接入** | GitCode Webhook（Issue / PR / 评论 / 构建部署事件）· 飞书 WebSocket 多 Bot（100+ 隔离运行）· WebUI（Dashboard / Pipeline / Agent / Chat / Skills / Settings）。 |
 | **多租户与可审计** | GitCode OAuth 动态建号、登录白名单、凭据按用户隔离；每次 Agent 执行留痕（日志 / 耗时 / 结论），Pipeline 可追踪。 |
 | **引擎可插拔** | opencode / codearts 等多后端切换，按 online-healthy-installed 选型。 |
 

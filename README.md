@@ -52,7 +52,6 @@ Grape turns any Git project into an autonomous AI development team: requirements
 | **Five-stage agent pipeline** | VOD collects voice and files issues → Issue triages and assigns → Coding implements and opens PRs → QA reviews and scans for security → SRE builds, deploys and operates; the Chat agent answers anytime. Any incoming event runs the whole chain automatically. |
 | **One-click hosting for any Git project** | Pick a template or point at an existing repo → the Agent × Skill scene is applied → async onboarding analyses the project and files trial-deployment and exploration issues → from then on every issue / PR is handled automatically. |
 | **Skills library** | 15+ official skills across the lifecycle (voice collection, issue management, implementation, PR review, build/deploy/ops, notifications, onboarding), plus custom skills at official / repository / personal level. |
-| **Three entry points** | GitCode webhooks (issue / PR / comment / build / deploy events) · Feishu WebSocket bots (100+, isolated) · WebUI (Dashboard / Pipeline / Agent / Chat / Skills / Settings). |
 | **Multi-tenant and auditable** | GitHub/GitCode OAuth sign-up, login allowlist, per-user credentials; every agent run is logged (logs, duration, verdict) and traceable in the pipeline. |
 | **Pluggable engines** | opencode / codearts and more, chosen by online-healthy-installed. |
 
