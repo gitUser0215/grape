@@ -7,6 +7,12 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # ---- 1) System deps + execution engine + codegraph (changes only when bumping versions) ----
+# Engine versions are pinned so the image is reproducible: the provider schema changed between
+# opencode 1.18.x and 1.19.x, and an unpinned build would silently pick up either.
+ARG OPENCODE_VERSION=1.19.5
+ARG CODEGRAPH_VERSION=1.6.2
+# Template registry ref: defaults to the upstream branch; pass --build-arg TEMPLATES_REF=<tag> to pin.
+ARG TEMPLATES_REF=main
 # git/curl/ca-certificates: template sync and fallback downloads
 # node 22: runtime for the opencode engine (and for codegraph)
 # opencode-ai: the execution engine Grape drives (the npm package name is opencode-ai)
@@ -16,8 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc g++ git curl ca-certificates \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \
- && npm i -g opencode-ai \
- && ( npm install -g --prefix /opt/codegraph @colbymchenry/codegraph \
+ && npm i -g opencode-ai@${OPENCODE_VERSION} \
+ && ( npm install -g --prefix /opt/codegraph @colbymchenry/codegraph@${CODEGRAPH_VERSION} \
       && ln -sf /opt/codegraph/bin/codegraph /usr/local/bin/codegraph \
       || echo "warning: codegraph install failed, project-info will run degraded with warning" ) \
  && npm cache clean --force \
@@ -34,7 +40,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # excluded by .dockerignore, so they have to be baked in here - otherwise the UI template page is empty.
 RUN mkdir -p /app/examples /app/configs \
  && curl -fsSL --retry 2 --max-time 180 \
-      https://codeload.github.com/grape-dev/grape-template/tar.gz/refs/heads/main -o /tmp/tpl.tgz \
+      https://codeload.github.com/grape-dev/grape-template/tar.gz/refs/heads/${TEMPLATES_REF} -o /tmp/tpl.tgz \
  && tar xzf /tmp/tpl.tgz -C /tmp \
  && SRC=$(find /tmp -mindepth 1 -maxdepth 1 -type d -name 'grape-template-*' | head -1) \
  && for d in "$SRC"/*/; do n=$(basename "$d"); [ "$n" = ".git" ] && continue; cp -a "$d" "/app/examples/$n"; done \

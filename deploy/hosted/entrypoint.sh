@@ -4,7 +4,8 @@
 # Fills in three things, all safe to re-run:
 #   1) JWT_SECRET      - generate once and persist on the volume if absent
 #                        (otherwise every redeploy rotates the key and logs everyone out)
-#   2) public base URL - explicit SERVER_BASE_URL > generic PUBLIC_DOMAIN > platform-injected RAILWAY_PUBLIC_DOMAIN
+#   2) public base URL - explicit SERVER_BASE_URL > generic PUBLIC_DOMAIN > platform-injected domain
+#                        (RAILWAY_* is one example; other platforms set PUBLIC_DOMAIN or SERVER_BASE_URL)
 #   3) engine config   - build $HOME/.config/opencode/opencode.json from the LLM_* variables
 # Then hands control back to the original CMD.
 set -eu
@@ -63,8 +64,10 @@ elif [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
   BASE_URL="https://${RAILWAY_PUBLIC_DOMAIN}"; BASE_SRC="RAILWAY_PUBLIC_DOMAIN"
 fi
 if [ -n "$BASE_URL" ]; then
-  printf '{"server_base_url":"%s","webhook_url":"%s/webhook/gitcode"}\n' \
-    "$BASE_URL" "$BASE_URL" > /app/configs/server-config.json
+  # The webhook route differs per git host (GitCode lives under /webhook/gitcode); override for others.
+  WEBHOOK_PATH="${WEBHOOK_PATH:-/webhook/gitcode}"
+  printf '{"server_base_url":"%s","webhook_url":"%s%s"}\n' \
+    "$BASE_URL" "$BASE_URL" "$WEBHOOK_PATH" > /app/configs/server-config.json
   HOST="${BASE_URL#http://}"; HOST="${HOST#https://}"; HOST="${HOST%%/*}"
   export TRUSTED_HOSTS="${TRUSTED_HOSTS:-$HOST}"
   echo "[entrypoint] server_base_url <- ${BASE_SRC} (${BASE_URL})"
@@ -85,7 +88,9 @@ if [ ! -s /app/configs/project-templates.json ] || [ ! -d /app/examples ] || [ -
     echo "[entrypoint] templates synced (git)"
   else
     TPL_STAGE=$(mktemp -d)
-    TPL_TB="https://codeload.github.com/grape-dev/grape-template/tar.gz/refs/heads/${TPL_REF}"
+    # Derive owner/repo from TEMPLATES_REPO so a mirror or fork override also applies to the fallback.
+    TPL_SLUG=$(printf '%s' "$TPL_REPO" | sed -e 's#^.*github\.com[/:]##' -e 's#\.git$##')
+    TPL_TB="https://codeload.github.com/${TPL_SLUG:-grape-dev/grape-template}/tar.gz/refs/heads/${TPL_REF}"
     if curl -fsSL --retry 2 --max-time 120 "$TPL_TB" -o "$TPL_STAGE/t.tgz" && tar xzf "$TPL_STAGE/t.tgz" -C "$TPL_STAGE"; then
       TPL_SRC=$(find "$TPL_STAGE" -mindepth 1 -maxdepth 1 -type d -name 'grape-template-*' | head -1)
       mkdir -p /app/examples /app/configs
@@ -132,11 +137,19 @@ if [ -n "${LLM_API_KEY:-}" ]; then
   CFG="$HOME/.config/opencode/opencode.json"
   mkdir -p "$(dirname "$CFG")"
   PID="${LLM_PROVIDER_ID:-custom}"
-  # provider presets: LLM_PROVIDER + LLM_API_KEY is enough to be usable out of the box
+  # Provider presets: LLM_PROVIDER + LLM_API_KEY is enough to be usable out of the box.
+  # Every preset below speaks the OpenAI-compatible protocol (the engine is configured with
+  # @ai-sdk/openai-compatible). Anything else: leave LLM_PROVIDER empty and set LLM_BASE_URL.
+  # Providers without a /models endpoint are flagged, so we skip a discovery call that cannot succeed
+  # and ask for LLM_MODEL instead.
+  NO_MODEL_LIST=0
   case "${LLM_PROVIDER:-}" in
     openai)     DEF_BASE="https://api.openai.com/v1" ;;
-    deepseek)   DEF_BASE="https://api.deepseek.com/v1" ;;
     openrouter) DEF_BASE="https://openrouter.ai/api/v1" ;;
+    gemini)     DEF_BASE="https://generativelanguage.googleapis.com/v1beta/openai" ;;
+    groq)       DEF_BASE="https://api.groq.com/openai/v1" ;;
+    anthropic)  DEF_BASE="https://api.anthropic.com/v1"; NO_MODEL_LIST=1 ;;
+    deepseek)   DEF_BASE="https://api.deepseek.com/v1" ;;
     opengw)     DEF_BASE="https://opengw.clouddeveloper.club/v1" ;;
     *)          DEF_BASE="" ;;
   esac
@@ -147,6 +160,7 @@ if [ -n "${LLM_API_KEY:-}" ]; then
   LLM_BASE_URL="$BASE" \
   LLM_MODEL_ID="${LLM_MODEL:-}" \
   LLM_PROVIDER_ID="$PID" \
+  LLM_NO_MODEL_LIST="$NO_MODEL_LIST" \
   OPENCODE_CFG="$CFG" \
   python3 - <<'PY'
 import json, os, sys, urllib.request
@@ -170,7 +184,8 @@ add(mid)
 
 # If the endpoint exposes /models, register every model it returns, so deployers can switch
 # between models in Grape's Agent Settings instead of being pinned to a single one.
-if base:
+no_list = os.environ.get("LLM_NO_MODEL_LIST") == "1"
+if base and not no_list:
     try:
         req = urllib.request.Request(
             base.rstrip("/") + "/models",
@@ -184,10 +199,32 @@ if base:
         print(f"[entrypoint] model discovery skipped: {type(e).__name__}: {e}", file=sys.stderr)
 
 if not models:
-    print("[entrypoint] no model given and endpoint returned no model list; skipping engine config", file=sys.stderr)
+    print(
+        "[entrypoint] ERROR: no model available - the endpoint returned no model list, or the discovery call failed, and LLM_MODEL is empty.\n"
+        "[entrypoint]        set LLM_MODEL explicitly, e.g. claude-sonnet-4-5 for the anthropic preset.",
+        file=sys.stderr,
+    )
     sys.exit(0)
 
-default_model = f"{pid}/{mid}" if mid else f"{pid}/{sorted(models)[0]}"
+# When no model was given, prefer a strong general-purpose model over the alphabetically first one
+# (an aggregator endpoint such as OpenRouter lists hundreds of models in arbitrary order).
+PREFERRED = [
+    "claude-sonnet-4-5", "claude-sonnet-4", "claude-3-7-sonnet",
+    "gpt-5", "gpt-4.1", "gemini-2.5-pro", "deepseek-chat", "deepseek-v3",
+    "qwen3-coder", "llama-3.3-70b",
+]
+
+
+def pick_default(available):
+    lowered = {m.lower(): m for m in available}
+    for pref in PREFERRED:
+        for k, m in lowered.items():
+            if pref in k:
+                return m
+    return sorted(available)[0]
+
+
+default_model = f"{pid}/{mid}" if mid else f"{pid}/{pick_default(models)}"
 provider = {
     "npm": "@ai-sdk/openai-compatible",
     "options": {"apiKey": "{env:LLM_API_KEY}"},
