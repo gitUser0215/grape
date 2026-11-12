@@ -14,7 +14,9 @@
     <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
     <a href="#四快速开始">快速开始</a> ·
     <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
-    <a href="CONTRIBUTING.zh.md">参与贡献</a>
+    <a href="CONTRIBUTING.zh.md">参与贡献</a> ·
+    <span title="入群入口筹备中">飞书</span> ·
+    <span title="入群入口筹备中">微信</span>
   </p>
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue&style=flat-square" alt="License: MIT"></a>
@@ -123,7 +125,8 @@ git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 ## 社群
 
 - **Issues** —— https://github.com/grape-dev/grape/issues
-- **飞书** —— 接入 Grape 后可在绑定群内直接反馈
+- **飞书** —— 入群入口筹备中，开放后在此更新（接入 Grape 后也可在绑定的群内直接反馈）
+- **微信** —— 入群入口筹备中，开放后在此更新
 - **社群** —— https://www.grapedev.cn/community.html
 
 ## 安全
