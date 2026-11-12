@@ -148,7 +148,7 @@ git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 - **官网**：[grapedev.cn](https://www.grapedev.cn/)
 - **场景与案例**：[社区与场景实践](https://www.grapedev.cn/community.html)
 - **问题反馈**：[Issues](https://github.com/grape-dev/grape/issues)
-- **交流**：<img src="assets/community/feishu.svg" width="18" height="18" alt="飞书">&nbsp;飞书 · <img src="assets/community/wechat.svg" width="18" height="18" alt="微信">&nbsp;微信 —— 群入口筹备中，开放后在此更新；接入 Grape 后也可在绑定的群内直接反馈
+- **交流**：<span title="群入口筹备中"><img src="assets/community/feishu.svg" width="18" height="18" alt="飞书"></span>&nbsp;飞书 · <span title="群入口筹备中"><img src="assets/community/wechat.svg" width="18" height="18" alt="微信"></span>&nbsp;微信 —— 群入口筹备中，开放后在此更新；接入 Grape 后也可在绑定的群内直接反馈
 - **贡献**：修 bug、加需求、写 Skill 都欢迎 —— 见 [CONTRIBUTING.md](CONTRIBUTING.md)；贡献者名单见 [Contributors](https://github.com/grape-dev/grape/graphs/contributors)
 
 ## 安全与隐私
