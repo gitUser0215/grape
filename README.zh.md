@@ -106,16 +106,14 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 安装并启动，一个命令搞定：
 
 ```bash
-uvx grape-quickstart init
+git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-**国内网络访问 GitHub 慢**，把源码源换成 GitCode 镜像：
+Windows PowerShell（5.1 不支持 `&&`，用 `;` 代替）：
 
-```bash
-uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
+```powershell
+git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 ```
-
-安装完成后更新源码：`uvx grape-quickstart update`。
 
 首次登录、平台对外配置、上线部署等其余事项，见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
 

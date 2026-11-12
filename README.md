@@ -106,16 +106,16 @@ Execution engine and model configuration, hosting your first repository, the pre
 Install and start — one command does it all:
 
 ```bash
-uvx grape-quickstart init
+git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-**If GitHub is slow from your network**, pull the source from the GitCode mirror:
+Windows PowerShell (5.1 does not support `&&` — use `;` instead):
 
-```bash
-uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
+```powershell
+git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 ```
 
-Update the source later with `uvx grape-quickstart update`. The first sign-in, platform-facing configuration and deployment are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)**.
+The first sign-in, platform-facing configuration and deployment are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)**.
 
 </details>
 
