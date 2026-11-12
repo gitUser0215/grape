@@ -71,33 +71,32 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 
 ## 4. AI Native Efficiency, Measured in Production
 
-Everything below comes from Grape's production database (`grape_system_db`), window 2026-08-28 – 11-05 (70 days) — measured, not projected.
+Data from the production database `grape_system_db`, window 2026-08-28 – 11-05 (70 days).
 
-| Metric | Measured |
-| --- | --- |
-| Issues carried | **8,037** |
-| Agent tasks · completion rate | **49,968** · **90.3%** |
-| Agent tasks per issue (avg) | **6.2** |
-| Real users / accounts / connected repos | **110 / 165 / 352** (309 repos ran tasks in the window) |
+<p align="center">
+  <img src="assets/metrics/en/kpi.svg" alt="8,037 issues carried · 49,968 agent tasks · 90.3% completion · 6.2 tasks per issue · 110 real users · 352 connected repos">
+</p>
 
-**Iteration speed: task volume grew almost an order of magnitude in 70 days**
+<p align="center">
+  <img src="assets/metrics/en/monthly.svg" alt="Monthly agent tasks: Aug 683, Sep 5,989, Oct 27,937, Nov first 5 days 15,360">
+</p>
 
-| Period | Agent tasks |
-| --- | --- |
-| Aug (4 days) | 683 |
-| Sep | 5,989 |
-| Oct | 27,937 (4.7× September) |
-| Nov (first 5 days) | 15,360 (3,072/day vs 901/day in October — another 2.4×) |
+- **Iteration speed**: task volume nearly 10x in 70 days; November runs 3,072 tasks/day vs 901 in October
+- **Issue closure**: 1,821 completed, 3.5x the previous period; 1,733 awaiting review (32.3% of in-flight) is the current bottleneck
+- **Verification is the heaviest load**: qa accounts for 33% — review tasks now outnumber generation tasks
 
-**Issue throughput and closure**: 1,821 issues completed in this period, 3.5× the previous one; in flight: processing 3,022, pending_review 1,733, active 550. Task failure rate fell from 9.1% to 8.0%. Human review is still the visible bottleneck — pending_review is 32.3% of in-flight issues and grows with volume.
+<p align="center">
+  <img src="assets/metrics/en/status.svg" alt="Issue states: processing 3,022 / completed 1,821 / pending_review 1,733; task states: completed 45,111 (90.3%), failed 3,887">
+</p>
 
-**Verification is now the heaviest load**: qa 16,545 (33%), vod 13,019, issue 11,073, coding 6,217, sre 2,918 — review tasks now outnumber generation tasks.
+<p align="center">
+  <img src="assets/metrics/en/pipeline.svg" alt="Agent types: qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918; event sources: A2A 18,317 = 39%">
+</p>
 
-**Nearly half of all tasks are dispatched agent-to-agent**: A2A events 18,317 (39% of all event sources, 48% in the first five days of November); issue_comment 15,883, issue_opened 6,588, PR events 2,416.
+- **Agents dispatch work to agents**: A2A is 39% of all event entries, 48% in the first five days of November
+- **We are our own number-one user**: five grape-dev repos ran 15,055 tasks (30% of the platform); 800K lines of code, 8,386 test cases and 378 skills were produced on the pipeline
 
-**We are our own number-one user**: five repos in the grape-dev org ran 15,055 tasks (30% of the platform); 800K lines of code and 8,386 test cases were produced and verified on the pipeline, with process knowledge captured as 378 skills.
-
-> Method: 70-day window; 10.22 peaked at 8,822 including a ~5,000-task batch QA scan — excluding it, the regular daily peak is 4,614 on 11.02. Full data and analysis: [AI Native practice write-up](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html).
+> Method: 10.22 peaked at 8,822 including a ~5,000-task batch QA scan; excluding it the regular peak is 4,614. Full analysis: [AI Native practice write-up](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html).
 
 ## 5. Quick Start
 
