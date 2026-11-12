@@ -56,19 +56,19 @@ Grape turns any Git project into an autonomous AI development team: requirements
 | **Multi-tenant and auditable** | GitHub/GitCode OAuth sign-up, login allowlist, per-user credentials; every agent run is logged (logs, duration, verdict) and traceable in the pipeline. |
 | **Pluggable engines** | opencode / codearts and more, chosen by online-healthy-installed. |
 
-## 3. Problems it solves
+## 3. The Problem
 
-In traditional DevOps everything from requirement to release is manual: people triage and label issues, write the code, review the PRs and trigger builds. The more projects, the higher the cost — and context scatters.
+Traditional DevOps relies heavily on manual effort across the pipeline: Issues need manual triage, code needs developers to write, PRs need human review, builds and deployments need manual triggers. More projects, more overhead.
 
-| Stage | Traditional workflow | Grape |
-| --- | --- | --- |
-| Requirement intake | Manually collect feedback | The VOD agent clusters feedback into issues |
-| Issue processing | Manual triage, labels, assignment | The Issue agent classifies and assigns automatically |
-| Implementation | Developers write the code | The Coding agent implements and opens PRs |
-| Code review | Manual review | The QA agent reviews and scans for security |
-| Build and deploy | Manual / CI triggered | The SRE agent builds, deploys and operates automatically |
+Grape's goal is to **AI-ify every one of these steps**, turning developers from executors into decision-makers — you define the direction, AI handles the rest.
 
-Result: developers move from **executors** to **decision makers** — they define direction and review outcomes only.
+| Stage | Traditional | Grape AI Native |
+|-------|-----------|-----------------|
+| Issue Triage | Manual classification & assignment | VOD / Issue Agent auto-classify & assign |
+| Implementation | Developer writes code | Coding Agent auto-implements & submits PR |
+| Code Review | Human review | QA Agent auto-review & security scan |
+| Build & Deploy | Manual / CI trigger | SRE Agent auto-build, deploy, monitor |
+| Requirements | Manual feedback collection | VOD Agent gathers developer voice, clusters insights |
 
 ## 4. Quick Start
 
