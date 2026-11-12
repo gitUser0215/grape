@@ -80,7 +80,7 @@ Two install paths — pick one: hand it to an agent, or do it yourself.
 Hand the line below to your AI agent and let it handle everything:
 
 ```text
-Install and start the Grape platform for me by following https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/README/v4/SETUP.AGENT.md
+Install and start the Grape platform for me by following https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md
 ```
 
 Execution engine and model configuration, hosting your first repository, the preflight check and deployment are covered in **[SETUP.AGENT.md](SETUP.AGENT.md)**.

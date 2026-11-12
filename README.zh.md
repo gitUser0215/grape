@@ -80,7 +80,7 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
 把下面这句丢给你的 AI Agent，让它全程搞定：
 
 ```text
-按 https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/README/v4/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
+按 https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
 ```
 
 执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项，见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
