@@ -1,4 +1,4 @@
-![](https://raw.githubusercontent.com/gitUser0215/grape/main/deploy/hosted/icon.png)
+![](https://www.grapedev.cn/assets/grape-logo.jpg)
 
 # Deploy Grape
 
