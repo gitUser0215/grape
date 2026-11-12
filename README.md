@@ -78,12 +78,16 @@ Data from the production database `grape_system_db`, 70-day window (as of 2026-1
 </p>
 
 <p align="center">
-  <img src="assets/metrics/en/monthly.svg" alt="Monthly agent tasks: 683, 5,989, 27,937, 15,360">
+  <img src="assets/metrics/en/efficiency.svg" alt="Efficiency: agent tasks per active person per day 9.4 -> 39.4 (4.2x); new issues per day 98 -> 733 (7.5x)">
 </p>
 
-- **Iteration speed**: task volume nearly 10x in 70 days; 3,072 tasks/day in the last 5 days vs 901 in the previous full month
-- **Issue closure**: 1,821 completed, 3.5x the previous period; 1,733 awaiting review (32.3% of in-flight) is the current bottleneck
-- **Verification is the heaviest load**: qa accounts for 33% — review tasks now outnumber generation tasks
+<p align="center">
+  <img src="assets/metrics/en/quality.svg" alt="Task failure rate 9.1% -> 8.0%; agent-to-agent share 39% -> 48%">
+</p>
+
+
+- **Efficiency and throughput**: active people fell from 96 to 78, while agent tasks per active person per day rose from 9.4 to 39.4 (4.2x); new issues per day rose from 98 to 733 (7.5x)
+- **Quality and collaboration**: failure rate down from 9.1% to 8.0%; A2A share up from 39% to 48% — nearly half of all work is now dispatched agent-to-agent
 
 <p align="center">
   <img src="assets/metrics/en/status.svg" alt="Issue states: processing 3,022 / completed 1,821 / pending_review 1,733; task states: completed 45,111 (90.3%), failed 3,887">
@@ -93,10 +97,12 @@ Data from the production database `grape_system_db`, 70-day window (as of 2026-1
   <img src="assets/metrics/en/pipeline.svg" alt="Agent types: qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918; event sources: A2A 18,317 = 39%">
 </p>
 
-- **Agents dispatch work to agents**: A2A is 39% of all event entries, 48% in the last five days
-- **We are our own number-one user**: five grape-dev repos ran 15,055 tasks (30% of the platform); 800K lines of code, 8,386 test cases and 378 skills were produced on the pipeline
+<p align="center">
+  <img src="assets/metrics/en/spread.svg" alt="Top 6 repos by task volume; grape-dev own 5 repos 30.1%, other orgs top 4 repos 32.5%">
+</p>
 
-> Method: the single-day peak of 8,822 includes a ~5,000-task batch QA scan; excluding it the regular peak is 4,614. Full analysis: [AI Native practice write-up](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html).
+
+- **Not only our own repos**: the top repo by task volume belongs to another org (agent-office-skills 7,585); our own five repos account for 30.1%, four top repos from other orgs for 32.5%
 
 ## 5. Quick Start
 
