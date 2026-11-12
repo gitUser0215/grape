@@ -29,11 +29,7 @@
   <p>
     <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
   </p>
-
-  <sub>VOD Agent → Issue Agent → Coding Agent → QA Agent → SRE Agent · + Chat Agent</sub>
 </div>
-
-<img src="assets/issue-agent-flow.gif" alt="Issues flow through agents autonomously, with QA rejection routed back to Coding" width="100%">
 
 ---
 
