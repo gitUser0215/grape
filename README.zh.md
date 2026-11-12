@@ -1,33 +1,30 @@
 <div align="center">
-  <img src="assets/grape-logo.jpg" alt="Grape" width="140">
 
-  <h1>Grape</h1>
+  <h1><a href="https://www.grapedev.cn/" target="_blank" rel="noopener noreferrer"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/grape-wordmark-dark.png"><img src="assets/grape-wordmark-light.png" alt="Grape" height="56"></picture></a></h1>
 
   <p>
     <strong>AI Native DevOps —— 将任意 Git 项目一键变为 AI 自主驱动的开发工作流</strong>
     <br>
     无需 IDE，随处设计、开发、测试、发布——让团队每个人都是交付者
   </p>
-
   <p>
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue" alt="License: MIT"></a>
-    <a href="https://github.com/gitUser0215/grape/tree/main"><img src="https://img.shields.io/badge/branch-main-blue" alt="main"></a>
-    <a href="https://www.grapedev.cn/"><img src="https://img.shields.io/badge/%E5%AE%98%E7%BD%91-grapedev.cn-blue" alt="官网"></a>
-    <img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+">
-    <img src="https://img.shields.io/badge/node.js-18%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 18+">
-    <img src="https://img.shields.io/github/stars/grape-dev/grape?style=social" alt="Stars">
-    <a href="README.md"><img src="https://img.shields.io/badge/README-English-blue" alt="English"></a>
+    <a href="README.md">English</a> / 中文
+  </p>
+  <p>
+    <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
+    <a href="#四快速开始">快速开始</a> ·
+    <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
+    <a href="CONTRIBUTING.zh.md">参与贡献</a>
+  </p>
+  <p>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue&style=flat-square" alt="License: MIT"></a>
+    <a href="https://github.com/grape-dev/grape/tags"><img src="https://img.shields.io/github/v/tag/grape-dev/grape?label=release&labelColor=black&style=flat-square" alt="tag"></a>
+    <a href="https://github.com/grape-dev/grape/commits/main"><img src="https://img.shields.io/github/last-commit/grape-dev/grape?style=flat-square" alt="Last commit"></a>
+    <a href="https://github.com/grape-dev/grape/graphs/contributors"><img src="https://img.shields.io/github/contributors/grape-dev/grape?color=c4f042&labelColor=black&style=flat-square" alt="contributors"></a>
   </p>
 
   <p>
     <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
-  </p>
-
-  <p>
-    <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
-    <a href="#四快速开始">快速开始</a> ·
-    <a href="CONTRIBUTING.md">参与贡献</a> ·
-    <a href="README.md">English</a>
   </p>
 
   <sub>VOD Agent → Issue Agent → Coding Agent → QA Agent → SRE Agent · + Chat Agent</sub>
@@ -43,11 +40,11 @@
 
 | 理念与特征 | 含义 | 在 Grape 中的体现 |
 | --- | --- | --- |
-| **代码仓第一等公民**（设计原点） | 仓是工程知识的事实来源：需求、决策、评审证据与交付记录都由仓持有 | 上下文跨成员、跨任务、跨工具连续，不因人员变动断档 |
-| **端到端闭环 · 短小精简** | 打破角色墙，让上下文在闭环内流动；以小型闭环团队为单位，决策链条大幅缩短 | 一个仓即一条完整旅程：需求 → Coding → QA → SRE 在同一闭环内交接，无跨角色提单 |
-| **上下文即资产** | 决策、反问、经验跨成员、跨任务、跨工具可见可复用，组织记忆可被显式管理 | 决策、问答与任务摘要沉淀在仓上，跨会话可查 |
-| **AI 是流程的主要参与者** | 与人并列的执行单元：被分配任务、被编排进交付链路、以结构化接口与其他 Agent 协同 | Agent 有角色、输入、上下文与产物，经 A2A 交接；人在关键节点审批放行 |
-| **经验飞轮** | 每跑一次任务，组织变聪明一次；平台异步提炼经验、决策、反问 Q&A 三类资产 | 三类资产沉淀在仓上，由后续任务按相关性召回注入 |
+| **代码仓第一等公民**（设计原点） | 仓是工程知识的事实来源：需求、决策、评审证据与交付记录都由仓持有 | 上下文跨成员、跨任务、跨工具连续，不因人员变动断档 → [托管首个仓库](SETUP.AGENT.md#host-your-first-repository) |
+| **端到端闭环 · 短小精简** | 打破角色墙，让上下文在闭环内流动；以小型闭环团队为单位，决策链条大幅缩短 | 一个仓即一条完整旅程：需求 → Coding → QA → SRE 在同一闭环内交接，无跨角色提单 → [五段流水线与交接](docs/WORKFLOW.zh.md#五段流水线与交接) |
+| **上下文即资产** | 决策、反问、经验跨成员、跨任务、跨工具可见可复用，组织记忆可被显式管理 | 决策、问答与任务摘要沉淀在仓上，跨会话可查 → [上下文即资产落在哪](docs/WORKFLOW.zh.md#上下文即资产落在哪) |
+| **AI 是流程的主要参与者** | 与人并列的执行单元：被分配任务、被编排进交付链路、以结构化接口与其他 Agent 协同 | Agent 有角色、输入、上下文与产物，经 A2A 交接；人在关键节点审批放行 → [执行引擎与模型](docs/CONFIGURATION.zh.md#执行引擎与模型) |
+| **经验飞轮** | 每跑一次任务，组织变聪明一次；平台异步提炼经验、决策、反问 Q&A 三类资产 | 三类资产沉淀在仓上，由后续任务按相关性召回注入 → [经验飞轮：三类资产](docs/WORKFLOW.zh.md#经验飞轮三类资产) |
 
 ### 价值主张
 
@@ -64,13 +61,13 @@ Grape 重新定义了软件开发工作流——不再是"人驱动 AI 辅助"�
 | # | 核心特性 | 说明 |
 | --- | --- | --- |
 | 1 | **需求入仓即托管** | VOD 聚类反馈建单，Issue 自动分诊与指派 |
-| 2 | **Agent 间自主交接** | 五段流水线经 A2A 交接，无需人工路由与状态同步 |
+| 2 | **Agent 间自主交接** | 五段流水线经 A2A 交接，无需人工路由与状态同步 → [交接方式](docs/WORKFLOW.zh.md#五段流水线与交接) |
 | 3 | **验证闭环** | QA 驳回退回 Coding 重做，质量门由流程保证 |
-| 4 | **人在环上把关** | 关键节点的审批与放行由人决定 |
-| 5 | **多引擎广播** | 同一任务并行多引擎执行，自动择优 |
-| 6 | **飞轮资产** | 决策、问答与任务摘要留在仓上，由后续任务按相关性召回 |
+| 4 | **人在环上把关** | 关键节点的审批与放行由人决定 → [人把关在哪几处](docs/WORKFLOW.zh.md#人把关在哪几处) |
+| 5 | **多引擎广播** | 同一任务并行多引擎执行，自动择优 → [执行引擎配置](docs/CONFIGURATION.zh.md#执行引擎与模型) |
+| 6 | **飞轮资产** | 决策、问答与任务摘要留在仓上，由后续任务按相关性召回 → [三类资产](docs/WORKFLOW.zh.md#经验飞轮三类资产) |
 | 7 | **全程可观测** | 任务中心、流水线时间线、Agent 状态与健康度可查 |
-| 8 | **IM 原生协同** | 飞书内提需求、审批、看进展；Chat Agent 承接会话入口 |
+| 8 | **IM 原生协同** | 飞书内提需求、审批、看进展；Chat Agent 承接会话入口 → [对外配置](docs/CONFIGURATION.zh.md) |
 
 ## 三、解决的问题
 
@@ -96,7 +93,7 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 把下面这句丢给你的 AI Agent，让它全程搞定：
 
 ```text
-按 https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
+按 https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/README/v3/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
 ```
 
 执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项，见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
@@ -106,17 +103,19 @@ Grape 通过多个 AI Agent 自主协作，让开发工作流中的重复环节�
 <details>
 <summary><strong>② 人工安装（一条命令）</strong></summary>
 
+安装并启动，一个命令搞定：
+
 ```bash
 uvx grape-quickstart init
 ```
 
-一条命令完成：拉取源码到 `~/.grape/src` → 环境探测 → 安装依赖 → 后台启动 → 健康检查（`http://localhost:3000/api/health` 返回 200 即成功）。
-
-**国内网络访问 GitHub 慢**，源码改走 GitCode 镜像：
+**国内网络访问 GitHub 慢**，把源码源换成 GitCode 镜像：
 
 ```bash
 uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
 ```
+
+安装完成后更新源码：`uvx grape-quickstart update`。
 
 首次登录、平台对外配置、上线部署等其余事项，见 **[SETUP.HUMAN.zh.md](SETUP.HUMAN.zh.md)**。
 
@@ -124,7 +123,7 @@ uvx grape-quickstart init --repo https://gitcode.com/grape-dev/grape.git
 
 ## 社群
 
-- **Issues** —— https://github.com/gitUser0215/grape/issues
+- **Issues** —— https://github.com/grape-dev/grape/issues
 - **飞书** —— 接入 Grape 后可在绑定群内直接反馈
 - **社群** —— https://www.grapedev.cn/community.html
 
