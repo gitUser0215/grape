@@ -113,7 +113,6 @@ git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 | **配置 OAuth 应用凭据** | GitCode / GitHub 登录返回 400（`not_configured`），登录按钮灰 | `configs/oauth-providers.json` 填两个 provider 的 `client_id` / `client_secret`，回调须为 `https://<域名>/api/auth/callback/{gitcode,github}` |
 | **配置对外可访问基址** | 回退 `localhost:3000`，OAuth 回调无法回访，登录与托管不可用 | `configs/server-config.json` 的 `server_base_url` 与 `webhook_url` 改成对外地址 |
 
-> 托管平台部署（如 Railway 模板）这两步已自动化：基址由平台域名变量推导，OAuth 凭证在 `/admin` 配置页填写 —— 不需要进容器改文件。
 ## 五、进阶
 
 - **安装部署**：源码自建与容器部署见 [docs/DEPLOYMENT.zh.md](docs/DEPLOYMENT.zh.md)
