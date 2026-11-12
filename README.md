@@ -12,7 +12,7 @@
   </p>
   <p>
     <a href="https://www.grapedev.cn/">▶ Try it live</a> ·
-    <a href="#4-quick-start">Quick start</a> ·
+    <a href="#5-quick-start">Quick start</a> ·
     <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
     <a href="CONTRIBUTING.md">Contributing</a> ·
     <span title="Join link coming soon"><img src="assets/community/feishu.svg" width="16" height="16" alt="Feishu">&nbsp;Feishu</span> ·
@@ -69,7 +69,37 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 | Build & Deploy | Manual / CI trigger | SRE Agent auto-build, deploy, monitor |
 | Requirements | Manual feedback collection | VOD Agent gathers developer voice, clusters insights |
 
-## 4. Quick Start
+## 4. AI Native Efficiency, Measured in Production
+
+Everything below comes from Grape's production database (`grape_system_db`), window 2026-08-28 – 11-05 (70 days) — measured, not projected.
+
+| Metric | Measured |
+| --- | --- |
+| Issues carried | **8,037** |
+| Agent tasks · completion rate | **49,968** · **90.3%** |
+| Agent tasks per issue (avg) | **6.2** |
+| Real users / accounts / connected repos | **110 / 165 / 352** (309 repos ran tasks in the window) |
+
+**Iteration speed: task volume grew almost an order of magnitude in 70 days**
+
+| Period | Agent tasks |
+| --- | --- |
+| Aug (4 days) | 683 |
+| Sep | 5,989 |
+| Oct | 27,937 (4.7× September) |
+| Nov (first 5 days) | 15,360 (3,072/day vs 901/day in October — another 2.4×) |
+
+**Issue throughput and closure**: 1,821 issues completed in this period, 3.5× the previous one; in flight: processing 3,022, pending_review 1,733, active 550. Task failure rate fell from 9.1% to 8.0%. Human review is still the visible bottleneck — pending_review is 32.3% of in-flight issues and grows with volume.
+
+**Verification is now the heaviest load**: qa 16,545 (33%), vod 13,019, issue 11,073, coding 6,217, sre 2,918 — review tasks now outnumber generation tasks.
+
+**Nearly half of all tasks are dispatched agent-to-agent**: A2A events 18,317 (39% of all event sources, 48% in the first five days of November); issue_comment 15,883, issue_opened 6,588, PR events 2,416.
+
+**We are our own number-one user**: five repos in the grape-dev org ran 15,055 tasks (30% of the platform); 800K lines of code and 8,386 test cases were produced and verified on the pipeline, with process knowledge captured as 378 skills.
+
+> Method: 70-day window; 10.22 peaked at 8,822 including a ~5,000-task batch QA scan — excluding it, the regular daily peak is 4,614 on 11.02. Full data and analysis: [AI Native practice write-up](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html).
+
+## 5. Quick Start
 
 Two install paths — pick one: hand it to an agent, or do it yourself.
 
