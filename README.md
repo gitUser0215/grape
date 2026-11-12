@@ -5,7 +5,7 @@
   <p>
     <strong>AI Native DevOps —— Turn Any Git Project into an AI-Driven Development Workflow with One Click</strong>
     <br>
-    No IDE required. Design, develop, test, and ship anywhere, anytime — everyone on your team is a shipper.
+    People set requirements and review; agents do the delivery.
   </p>
   <p>
     English / <a href="README.zh.md">中文</a>
@@ -35,7 +35,7 @@
 
 ## 1. Principles and Value
 
-**From process-driven work where people treat AI as a tool, to workflow-driven collaboration between AI and people** — turn any Git project into a self-evolving AI development workflow: people only create requirements and review; AI completes the journey from requirement to delivery.
+**In one line**: AI-driven, human-reviewed — the repository is the source of truth, agents are participants in the process, and people approve at key points.
 
 | Principle / characteristic | Meaning | How Grape realizes it |
 | --- | --- | --- |
@@ -46,8 +46,6 @@
 | **Experience flywheel** | Every run makes the organization smarter; the platform asynchronously distils experience, decisions and question–answer pairs | Those three asset types persist on the repository and are recalled by relevance into later tasks → [Flywheel: the three asset types](docs/WORKFLOW.md#flywheel-assets-the-three-types) |
 
 ### Value proposition
-
-Grape redefines the software development workflow — no longer "human-driven with AI assistance", but "AI-driven, human-reviewed".
 
 | # | Core Value | Description |
 | --- | --- | --- |
