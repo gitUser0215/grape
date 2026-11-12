@@ -69,9 +69,7 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
 | 构建部署 | 手动 / CI 触发 | SRE Agent 自动构建、部署、运维 |
 | 需求收集 | 人工汇总反馈 | VOD Agent 收集开发者声音、聚类提炼 |
 
-## 四、AI Native 提效实测
-
-数据来自现网生产库 `grape_system_db`，统计窗口 70 天（截至 2026-11）。
+## 四、提效实测
 
 <p align="center">
   <img src="assets/metrics/zh/kpi.svg" alt="8,037 承载需求 · 49,968 Agent 任务 · 完成率 90.3% · 6.2 任务每需求 · 110 真实用户 · 352 接入仓库">
@@ -101,8 +99,6 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
   <img src="assets/metrics/zh/spread.svg" alt="任务量 Top 6 仓库；grape-dev 自家 5 仓 30.1%，其他组织头部 4 仓 32.5%">
 </p>
 
-
-- **不只自家在用**：任务量第一的仓来自其他组织（agent-office-skills 7,585）；自家 5 仓占 30.1%，其他组织头部 4 仓占 32.5%
 
 ## 五、快速开始
 

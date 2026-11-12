@@ -69,9 +69,7 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 | Build & Deploy | Manual / CI trigger | SRE Agent auto-build, deploy, monitor |
 | Requirements | Manual feedback collection | VOD Agent gathers developer voice, clusters insights |
 
-## 4. AI Native Efficiency, Measured in Production
-
-Data from the production database `grape_system_db`, 70-day window (as of 2026-11).
+## 4. Efficiency, Measured in Production
 
 <p align="center">
   <img src="assets/metrics/en/kpi.svg" alt="8,037 issues carried · 49,968 agent tasks · 90.3% completion · 6.2 tasks per issue · 110 real users · 352 connected repos">
@@ -101,8 +99,6 @@ Data from the production database `grape_system_db`, 70-day window (as of 2026-1
   <img src="assets/metrics/en/spread.svg" alt="Top 6 repos by task volume; grape-dev own 5 repos 30.1%, other orgs top 4 repos 32.5%">
 </p>
 
-
-- **Not only our own repos**: the top repo by task volume belongs to another org (agent-office-skills 7,585); our own five repos account for 30.1%, four top repos from other orgs for 32.5%
 
 ## 5. Quick Start
 
