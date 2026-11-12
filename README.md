@@ -41,25 +41,6 @@ Grape turns any Git project into an autonomous AI development team: requirements
 
 Three design principles: **the repository is the source of truth** (requirements, decisions, review evidence and delivery records all live in the repo) · **AI is a participant in the process** (it has a role, context and artifacts, and hands over via A2A) · **experience is an asset** (every run distils experience, decisions and Q&A that later tasks recall).
 
-<details>
-<summary>Expand: the five principles and three value propositions (detailed)</summary>
-
-| Principle | Meaning | How Grape realizes it |
-| --- | --- | --- |
-| **Repository as first-class citizen** | The repo is the source of truth for engineering knowledge | Context stays continuous across members, tasks and tools; personnel change does not break it |
-| **End-to-end closed loop, small and lean** | Break role walls so context flows inside the loop | One repo is one journey: requirement → Coding → QA → SRE hand over in the same chain, no cross-role ticketing |
-| **Context as an asset** | Decisions, follow-up questions and experience are reusable | Persisted on the repo and searchable across sessions |
-| **AI is a primary participant** | A peer execution unit | Agents hold roles and artifacts, hand over via A2A, people approve at key points |
-| **Experience flywheel** | Every run makes the organization smarter | Experience, decisions and Q&A are distilled and recalled into later tasks |
-
-| # | Value proposition | Description |
-| --- | --- | --- |
-| 1 | **One-click AI hosting, autonomous evolution** | After connecting, the whole pipeline is driven by multi-agent handoff: issues triaged, code implemented, PRs reviewed, builds deployed |
-| 2 | **No IDE needed, full R&D cycle anywhere** | Feishu or the WebUI is your development interface; everyone can contribute to delivery |
-| 3 | **Open source as templates, instant trial and customization** | Community projects become templates: one-click creation, auto trial deployment, Skill-driven customization |
-
-</details>
-
 ## 2. What Grape can do
 
 | Capability | What you get |
