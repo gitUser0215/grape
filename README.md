@@ -39,7 +39,11 @@ Grape turns any Git project into an autonomous AI development team: requirements
 
 **In one line: turn your Git project into an AI-driven autonomous development team.**
 
-Three design principles: **the repository is the source of truth** (requirements, decisions, review evidence and delivery records all live in the repo) · **AI is a participant in the process** (it has a role, context and artifacts, and hands over via A2A) · **experience is an asset** (every run distils experience, decisions and Q&A that later tasks recall).
+> **Three design principles**
+>
+> - **The repository is the source of truth** — requirements, decisions, review evidence and delivery records all live in the repo, so context survives personnel changes
+> - **AI is a participant in the process** — agents hold roles, context and artifacts, hand over via A2A, and people approve at key points
+> - **Experience is an asset** — every run distils experience, decisions and Q&A, recalled by later tasks
 
 ## 2. What Grape can do
 
