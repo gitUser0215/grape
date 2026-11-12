@@ -39,6 +39,10 @@ Grape turns any Git project into an autonomous AI development team: requirements
 
 **In one line: turn your Git project into an AI-driven autonomous development team.**
 
+<p align="center">
+  <img src="assets/screenshots/pipeline.png" alt="Grape pipeline dashboard: VOD -> Issue -> Coding -> QA stages (all done), with the issue/PR task table below showing duration, agents, stage, scene and owner">
+</p>
+
 > **Three design principles**
 >
 > - **The repository is the source of truth** — requirements, decisions, review evidence and delivery records all live in the repo, so context survives personnel changes

@@ -39,6 +39,10 @@ Grape 把任意 Git 项目变成一支 AI 自主开发团队：需求、实现�
 
 **一句话：把你的 Git 项目变成 AI 驱动的自主开发团队。**
 
+<p align="center">
+  <img src="assets/screenshots/pipeline.png" alt="Grape Pipeline 看板：VOD → Issue → Coding → QA 四段流水线（均已完成），下方为 Issue / PR 任务表，含耗时、Agent、阶段、场景、负责人">
+</p>
+
 > **三条设计原则**
 >
 > - **仓是事实来源** —— 需求、决策、评审证据、交付记录都落在仓上，人员变动也不断档
