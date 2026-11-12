@@ -71,17 +71,17 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
 
 ## 四、AI Native 提效实测
 
-数据来自现网生产库 `grape_system_db`，窗口 2026-08-28 – 11-05（70 天）。
+数据来自现网生产库 `grape_system_db`，统计窗口 70 天（截至 2026-11）。
 
 <p align="center">
   <img src="assets/metrics/zh/kpi.svg" alt="8,037 承载需求 · 49,968 Agent 任务 · 完成率 90.3% · 6.2 任务/需求 · 110 真实用户 · 352 接入仓库">
 </p>
 
 <p align="center">
-  <img src="assets/metrics/zh/monthly.svg" alt="月度 Agent 任务量：8 月 683、9 月 5,989、10 月 27,937、11 月前 5 天 15,360">
+  <img src="assets/metrics/zh/monthly.svg" alt="月度 Agent 任务量：683、5,989、27,937、15,360">
 </p>
 
-- **迭代速度**：任务量 70 天翻近一个量级，11 月前 5 天日均 3,072（10 月 901）
+- **迭代速度**：任务量 70 天翻近一个量级，最近 5 天日均 3,072（上一完整月 901）
 - **需求闭环**：本期完成 1,821，较上期 3.5 倍；人审积压 1,733 占在途 32.3%，是当前瓶颈
 - **验证负荷最重**：qa 占 33%，审查任务密度已超过生成任务
 
@@ -93,10 +93,10 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
   <img src="assets/metrics/zh/pipeline.svg" alt="Agent 类型：qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918；事件来源：A2A 18,317 占 39%">
 </p>
 
-- **Agent 派活**：A2A 占全部事件入口 39%，11 月前 5 天已达 48%
+- **Agent 派活**：A2A 占全部事件入口 39%，最近 5 天已达 48%
 - **自己先当样板**：grape-dev 5 个仓 15,055 个任务（占全平台 30%），80 万行代码、8,386 个测试用例、378 个技能都在流水线上产出
 
-> 口径：10.22 单日 8,822 含约 5,000 任务的批量 QA 扫描，剔除后常规峰值 4,614。完整解读见 [AI Native 实践分享](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html)。
+> 口径：单日峰值 8,822 含约 5,000 任务的批量 QA 扫描，剔除后常规峰值 4,614。完整解读见 [AI Native 实践分享](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html)。
 
 ## 五、快速开始
 

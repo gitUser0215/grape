@@ -71,17 +71,17 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 
 ## 4. AI Native Efficiency, Measured in Production
 
-Data from the production database `grape_system_db`, window 2026-08-28 – 11-05 (70 days).
+Data from the production database `grape_system_db`, 70-day window (as of 2026-11).
 
 <p align="center">
   <img src="assets/metrics/en/kpi.svg" alt="8,037 issues carried · 49,968 agent tasks · 90.3% completion · 6.2 tasks per issue · 110 real users · 352 connected repos">
 </p>
 
 <p align="center">
-  <img src="assets/metrics/en/monthly.svg" alt="Monthly agent tasks: Aug 683, Sep 5,989, Oct 27,937, Nov first 5 days 15,360">
+  <img src="assets/metrics/en/monthly.svg" alt="Monthly agent tasks: 683, 5,989, 27,937, 15,360">
 </p>
 
-- **Iteration speed**: task volume nearly 10x in 70 days; November runs 3,072 tasks/day vs 901 in October
+- **Iteration speed**: task volume nearly 10x in 70 days; 3,072 tasks/day in the last 5 days vs 901 in the previous full month
 - **Issue closure**: 1,821 completed, 3.5x the previous period; 1,733 awaiting review (32.3% of in-flight) is the current bottleneck
 - **Verification is the heaviest load**: qa accounts for 33% — review tasks now outnumber generation tasks
 
@@ -93,10 +93,10 @@ Data from the production database `grape_system_db`, window 2026-08-28 – 11-05
   <img src="assets/metrics/en/pipeline.svg" alt="Agent types: qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918; event sources: A2A 18,317 = 39%">
 </p>
 
-- **Agents dispatch work to agents**: A2A is 39% of all event entries, 48% in the first five days of November
+- **Agents dispatch work to agents**: A2A is 39% of all event entries, 48% in the last five days
 - **We are our own number-one user**: five grape-dev repos ran 15,055 tasks (30% of the platform); 800K lines of code, 8,386 test cases and 378 skills were produced on the pipeline
 
-> Method: 10.22 peaked at 8,822 including a ~5,000-task batch QA scan; excluding it the regular peak is 4,614. Full analysis: [AI Native practice write-up](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html).
+> Method: the single-day peak of 8,822 includes a ~5,000-task batch QA scan; excluding it the regular peak is 4,614. Full analysis: [AI Native practice write-up](https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/%E6%B4%9E%E5%AF%9F%E5%88%86%E6%9E%90/grape-ai-native-practice-1105.html).
 
 ## 5. Quick Start
 
