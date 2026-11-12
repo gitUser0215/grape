@@ -15,8 +15,8 @@
     <a href="#4-quick-start">Quick start</a> ·
     <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
     <a href="CONTRIBUTING.md">Contributing</a> ·
-    <span title="Join link coming soon">Feishu</span> ·
-    <span title="Join link coming soon">WeChat</span>
+    <span title="Join link coming soon"><img src="assets/community/feishu.svg" width="16" height="16" alt="Feishu">&nbsp;Feishu</span> ·
+    <span title="Join link coming soon"><img src="assets/community/wechat.svg" width="16" height="16" alt="WeChat">&nbsp;WeChat</span>
   </p>
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue&style=flat-square" alt="License: MIT"></a>
@@ -125,8 +125,8 @@ The first sign-in, platform-facing configuration and deployment are covered in *
 ## Community
 
 - **Issues** — https://github.com/grape-dev/grape/issues
-- **Feishu** — join link coming soon; once connected to Grape you can also give feedback in your bound group chat
-- **WeChat** — join link coming soon
+- <img src="assets/community/feishu.svg" width="16" height="16" alt="Feishu">&nbsp;**Feishu** — join link coming soon; once connected to Grape you can also give feedback in your bound group chat
+- <img src="assets/community/wechat.svg" width="16" height="16" alt="WeChat">&nbsp;**WeChat** — join link coming soon
 - **Community** — https://www.grapedev.cn/community.html
 
 ## Security
