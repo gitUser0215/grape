@@ -112,11 +112,6 @@ The first sign-in, platform-facing configuration and deployment are covered in *
 | **Configure OAuth app credentials** | GitCode / GitHub sign-in returns 400 (`not_configured`) and the buttons stay grey | Fill `client_id` / `client_secret` for both providers in `configs/oauth-providers.json`; the callback must be `https://<domain>/api/auth/callback/{gitcode,github}` |
 | **Configure the public base URL** | Falls back to `localhost:3000`; OAuth callbacks cannot reach the service and login/hosting fail | Set `server_base_url` and `webhook_url` in `configs/server-config.json` to the public address |
 
-## 5. Going further
-
-- **Install and deploy**: source and container deployments — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
-- **Develop and test**: run `pytest tests/`; details in [CONTRIBUTING.md](CONTRIBUTING.md)
-
 ## Community
 
 - **Issues** — https://github.com/grape-dev/grape/issues
