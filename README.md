@@ -33,52 +33,57 @@
 
 ---
 
-## 1. Principles and Value
+## 1. What Grape is
 
-**In one line**: AI-driven, human-reviewed — the repository is the source of truth, agents are participants in the process, and people approve at key points.
+Grape turns any Git project into an autonomous AI development team: requirements, implementation, review and deployment are handed off along a single chain of agents, and people only write requirements and review.
 
-| Principle / characteristic | Meaning | How Grape realizes it |
+**In one line: turn your Git project into an AI-driven autonomous development team.**
+
+Three design principles: **the repository is the source of truth** (requirements, decisions, review evidence and delivery records all live in the repo) · **AI is a participant in the process** (it has a role, context and artifacts, and hands over via A2A) · **experience is an asset** (every run distils experience, decisions and Q&A that later tasks recall).
+
+<details>
+<summary>Expand: the five principles and three value propositions (detailed)</summary>
+
+| Principle | Meaning | How Grape realizes it |
 | --- | --- | --- |
-| **Repository as first-class citizen** (design premise) | The repository is the source of truth for engineering knowledge: requirements, decisions, review evidence and delivery records are all held by it | Context stays continuous across members, tasks and tools, and does not break with personnel change → [Host your first repository](SETUP.AGENT.md#host-your-first-repository) |
-| **End-to-end closed loop, small and lean** | Break down role walls so context flows inside the loop; small closed-loop teams shorten decision chains | One repository is one complete journey: requirement → Coding → QA → SRE hand over inside the same loop, with no cross-role ticketing → [Pipeline and handoff](docs/WORKFLOW.md#five-stage-pipeline-and-handoff) |
-| **Context as an asset** | Decisions, follow-up questions and experience are visible and reusable across members, tasks and tools; organizational memory becomes explicitly manageable | Decisions, Q&A and task summaries persist on the repository and are searchable across sessions → [Where those assets live](docs/WORKFLOW.md#where-context-as-an-asset-lives) |
-| **AI is a primary participant in the process** | A peer execution unit: assigned tasks, orchestrated into the delivery chain, collaborating with other agents through structured interfaces | Agents hold a role, input, context and artifact, hand over via A2A, and people approve at key points → [Execution engine and model](docs/CONFIGURATION.md#execution-engine-and-model) |
-| **Experience flywheel** | Every run makes the organization smarter; the platform asynchronously distils experience, decisions and question–answer pairs | Those three asset types persist on the repository and are recalled by relevance into later tasks → [Flywheel: the three asset types](docs/WORKFLOW.md#flywheel-assets-the-three-types) |
+| **Repository as first-class citizen** | The repo is the source of truth for engineering knowledge | Context stays continuous across members, tasks and tools; personnel change does not break it |
+| **End-to-end closed loop, small and lean** | Break role walls so context flows inside the loop | One repo is one journey: requirement → Coding → QA → SRE hand over in the same chain, no cross-role ticketing |
+| **Context as an asset** | Decisions, follow-up questions and experience are reusable | Persisted on the repo and searchable across sessions |
+| **AI is a primary participant** | A peer execution unit | Agents hold roles and artifacts, hand over via A2A, people approve at key points |
+| **Experience flywheel** | Every run makes the organization smarter | Experience, decisions and Q&A are distilled and recalled into later tasks |
 
-### Value proposition
-
-| # | Core Value | Description |
+| # | Value proposition | Description |
 | --- | --- | --- |
-| **1** | **One-Click AI Hosting, Autonomous Evolution** | Connect any Git project to Grape, and the full pipeline from requirements to delivery is driven by Multi-Agent handoff. Issues auto-triage, code auto-implemented, PRs auto-reviewed, builds auto-deployed — iteration velocity **skyrockets**. |
-| **2** | **No IDE, Anywhere Full-Stack R&D** | Feishu or WebUI becomes your development interface. Design, develop, test, ship — no editor required. Everyone on the team can directly contribute to delivery. |
-| **3** | **Open Source as Templates, Instant Experience & Customization** | Every open-source project in the community is your starting template. One-click creation, auto-deployment for experience, Skill-driven customization — an AI development workflow from 0 to 1, ready instantly. |
+| 1 | **One-click AI hosting, autonomous evolution** | After connecting, the whole pipeline is driven by multi-agent handoff: issues triaged, code implemented, PRs reviewed, builds deployed |
+| 2 | **No IDE needed, full R&D cycle anywhere** | Feishu or the WebUI is your development interface; everyone can contribute to delivery |
+| 3 | **Open source as templates, instant trial and customization** | Community projects become templates: one-click creation, auto trial deployment, Skill-driven customization |
 
-## 2. Core Features
+</details>
 
-| # | Core features | Description |
+## 2. What Grape can do
+
+| Capability | What you get |
+| --- | --- |
+| **Five-stage agent pipeline** | VOD collects voice and files issues → Issue triages and assigns → Coding implements and opens PRs → QA reviews and scans for security → SRE builds, deploys and operates; the Chat agent answers anytime. Any incoming event runs the whole chain automatically. |
+| **One-click hosting for any Git project** | Pick a template or point at an existing repo → the Agent × Skill scene is applied → async onboarding analyses the project and files trial-deployment and exploration issues → from then on every issue / PR is handled automatically. |
+| **Skills library** | 15+ official skills across the lifecycle (voice collection, issue management, implementation, PR review, build/deploy/ops, notifications, onboarding), plus custom skills at official / repository / personal level. |
+| **Three entry points** | GitCode webhooks (issue / PR / comment / build / deploy events) · Feishu WebSocket bots (100+, isolated) · WebUI (Dashboard / Pipeline / Agent / Chat / Skills / Settings). |
+| **Multi-tenant and auditable** | GitHub/GitCode OAuth sign-up, login allowlist, per-user credentials; every agent run is logged (logs, duration, verdict) and traceable in the pipeline. |
+| **Pluggable engines** | opencode / codearts and more, chosen by online-healthy-installed. |
+
+## 3. Problems it solves
+
+In traditional DevOps everything from requirement to release is manual: people triage and label issues, write the code, review the PRs and trigger builds. The more projects, the higher the cost — and context scatters.
+
+| Stage | Traditional workflow | Grape |
 | --- | --- | --- |
-| 1 | **Managed from the moment it enters the repository** | The VOD agent clusters feedback into issues; the Issue agent classifies and assigns them |
-| 2 | **Agent-to-agent handoff** | The five-stage pipeline hands over via A2A — no manual routing or status synchronization → [How handoff works](docs/WORKFLOW.md#five-stage-pipeline-and-handoff) |
-| 3 | **Closed verification loop** | A QA rejection returns the issue to Coding; the quality gate is enforced by the workflow |
-| 4 | **Human holds the gate** | Approvals and releases at key stages are decided by a person → [Where humans decide](docs/WORKFLOW.md#where-humans-hold-the-gate) |
-| 5 | **Multi-engine broadcast** | One task runs in parallel across several engines; the best artifact is selected automatically → [Engine configuration](docs/CONFIGURATION.md#execution-engine-and-model) |
-| 6 | **Flywheel assets** | Decisions, Q&A and task summaries persist on the repository, recalled by later tasks → [The three asset types](docs/WORKFLOW.md#flywheel-assets-the-three-types) |
-| 7 | **Full observability** | Task centre, pipeline timeline, agent status and health are inspectable |
-| 8 | **IM-native collaboration** | Requirements, approvals and progress in Feishu; the Chat Agent is the entry point → [Platform-facing configuration](docs/CONFIGURATION.md) |
+| Requirement intake | Manually collect feedback | The VOD agent clusters feedback into issues |
+| Issue processing | Manual triage, labels, assignment | The Issue agent classifies and assigns automatically |
+| Implementation | Developers write the code | The Coding agent implements and opens PRs |
+| Code review | Manual review | The QA agent reviews and scans for security |
+| Build and deploy | Manual / CI triggered | The SRE agent builds, deploys and operates automatically |
 
-## 3. Problems Addressed
-
-Grape orchestrates multiple AI agents that hand work over to one another, so the repetitive steps of the development workflow complete autonomously. Once a traditional Git project is connected, it gains a complete AI development workflow — requirement clarification, implementation, review and verification, build and deployment — AI Native end to end.
-
-These stages complete without human execution, which leaves developers as decision-makers: define direction, review outcomes.
-
-| Stage | Traditional workflow | Grape AI Native workflow |
-| --- | --- | --- |
-| Requirement collection | Manual feedback aggregation | VOD Agent gathers developer voice and clusters it |
-| Issue handling | Manual triage, labelling, assignment | VOD / Issue Agent classify and assign automatically |
-| Implementation | Developers code by hand | Coding Agent implements and opens a PR |
-| Code review | Human review | QA Agent reviews and runs security scans |
-| Build and deployment | Manual / CI trigger | SRE Agent builds, deploys and operates |
+Result: developers move from **executors** to **decision makers** — they define direction and review outcomes only.
 
 ## 4. Quick Start
 
@@ -115,6 +120,20 @@ git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 The first sign-in, platform-facing configuration and deployment are covered in **[SETUP.HUMAN.md](SETUP.HUMAN.md)**.
 
 </details>
+
+### Two required steps (self-hosting)
+
+| Step | If skipped | How |
+| --- | --- | --- |
+| **Configure OAuth app credentials** | GitCode / GitHub sign-in returns 400 (`not_configured`) and the buttons stay grey | Fill `client_id` / `client_secret` for both providers in `configs/oauth-providers.json`; the callback must be `https://<domain>/api/auth/callback/{gitcode,github}` |
+| **Configure the public base URL** | Falls back to `localhost:3000`; OAuth callbacks cannot reach the service and login/hosting fail | Set `server_base_url` and `webhook_url` in `configs/server-config.json` to the public address |
+
+> On hosted platforms (e.g. the Railway template) both steps are automated: the base URL is derived from the platform domain and OAuth credentials are entered on the `/admin` page — no file edits inside the container.
+
+## 5. Going further
+
+- **Install and deploy**: source and container deployments — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- **Develop and test**: run `pytest tests/`; details in [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Community
 
