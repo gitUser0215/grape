@@ -14,9 +14,7 @@
     <a href="https://www.grapedev.cn/">▶ Try it live</a> ·
     <a href="#5-quick-start">Quick start</a> ·
     <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
-    <a href="CONTRIBUTING.md">Contributing</a> ·
-    <span title="Join link coming soon"><img src="assets/community/feishu.svg" width="16" height="16" alt="Feishu">&nbsp;Feishu</span> ·
-    <span title="Join link coming soon"><img src="assets/community/wechat.svg" width="16" height="16" alt="WeChat">&nbsp;WeChat</span>
+    <a href="CONTRIBUTING.md">Contributing</a>
   </p>
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue&style=flat-square" alt="License: MIT"></a>
@@ -28,6 +26,10 @@
 
   <p>
     <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
+  </p>
+  <p>
+    <span title="Join link coming soon"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu">&nbsp;Feishu</span> ·
+    <span title="Join link coming soon"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</span>
   </p>
 </div>
 

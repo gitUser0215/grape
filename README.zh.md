@@ -14,9 +14,7 @@
     <a href="https://www.grapedev.cn/">▶ 立即体验</a> ·
     <a href="#五快速开始">快速开始</a> ·
     <a href="https://github.com/grape-dev/grape/issues">Issues</a> ·
-    <a href="CONTRIBUTING.md">参与贡献</a> ·
-    <span title="入群入口筹备中"><img src="assets/community/feishu.svg" width="16" height="16" alt="飞书">&nbsp;飞书</span> ·
-    <span title="入群入口筹备中"><img src="assets/community/wechat.svg" width="16" height="16" alt="微信">&nbsp;微信</span>
+    <a href="CONTRIBUTING.md">参与贡献</a>
   </p>
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/github/license/grape-dev/grape?color=blue&style=flat-square" alt="License: MIT"></a>
@@ -28,6 +26,10 @@
 
   <p>
     <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
+  </p>
+  <p>
+    <span title="入群入口筹备中"><img src="assets/community/feishu.svg" width="18" height="18" alt="飞书">&nbsp;飞书</span> ·
+    <span title="入群入口筹备中"><img src="assets/community/wechat.svg" width="18" height="18" alt="微信">&nbsp;微信</span>
   </p>
 </div>
 
