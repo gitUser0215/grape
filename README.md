@@ -28,8 +28,8 @@
     <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
   </p>
   <p>
-    <span title="Join link coming soon"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu">&nbsp;Feishu</span> ·
-    <span title="Join link coming soon"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</span>
+    <a href="https://www.grapedev.cn/community.html?cat=join" title="Join the community"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu">&nbsp;Feishu</a> ·
+    <a href="https://www.grapedev.cn/community.html?cat=join" title="Join the community"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</a>
   </p>
 </div>
 
@@ -146,7 +146,7 @@ The first sign-in, platform-facing configuration and deployment are covered in *
 - **Website**: [grapedev.cn](https://www.grapedev.cn/)
 - **Scenes and cases**: [community and use cases](https://www.grapedev.cn/community.html)
 - **Feedback**: [Issues](https://github.com/grape-dev/grape/issues)
-- **Chat**: <span title="join link coming soon"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu"></span>&nbsp;Feishu · <span title="join link coming soon"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat"></span>&nbsp;WeChat
+- **Chat**: <a href="https://www.grapedev.cn/community.html?cat=join" title="Join the community"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu">&nbsp;Feishu</a> · <a href="https://www.grapedev.cn/community.html?cat=join" title="Join the community"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</a>
 - **Contributing**: bug fixes, feature requests and new Skills are all welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Security and privacy

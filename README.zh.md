@@ -28,8 +28,8 @@
     <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
   </p>
   <p>
-    <span title="入群入口筹备中"><img src="assets/community/feishu.svg" width="18" height="18" alt="飞书">&nbsp;飞书</span> ·
-    <span title="入群入口筹备中"><img src="assets/community/wechat.svg" width="18" height="18" alt="微信">&nbsp;微信</span>
+    <a href="https://www.grapedev.cn/community.html?cat=join" title="加入社区群"><img src="assets/community/feishu.svg" width="18" height="18" alt="飞书">&nbsp;飞书</a> ·
+    <a href="https://www.grapedev.cn/community.html?cat=join" title="加入社区群"><img src="assets/community/wechat.svg" width="18" height="18" alt="微信">&nbsp;微信</a>
   </p>
 </div>
 
@@ -146,7 +146,7 @@ git clone https://github.com/grape-dev/grape.git ; python grape/quickstart.py
 - **官网**：[grapedev.cn](https://www.grapedev.cn/)
 - **场景与案例**：[社区与场景实践](https://www.grapedev.cn/community.html)
 - **问题反馈**：[Issues](https://github.com/grape-dev/grape/issues)
-- **交流**：<span title="群入口筹备中"><img src="assets/community/feishu.svg" width="18" height="18" alt="飞书"></span>&nbsp;飞书 · <span title="群入口筹备中"><img src="assets/community/wechat.svg" width="18" height="18" alt="微信"></span>&nbsp;微信
+- **交流**：<a href="https://www.grapedev.cn/community.html?cat=join" title="加入社区群"><img src="assets/community/feishu.svg" width="18" height="18" alt="飞书">&nbsp;飞书</a> · <a href="https://www.grapedev.cn/community.html?cat=join" title="加入社区群"><img src="assets/community/wechat.svg" width="18" height="18" alt="微信">&nbsp;微信</a>
 - **贡献**：修 bug、加需求、写 Skill 都欢迎 —— 见 [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## 安全与隐私
