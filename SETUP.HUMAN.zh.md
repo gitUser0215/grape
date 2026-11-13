@@ -8,9 +8,6 @@
 git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-- 免克隆的最短路径：`uvx grape-quickstart init`（详见 README 的「② 人工安装」）
-- 受限 Windows 环境（AppLocker / Smart App Control）：见文末 **受限环境**
-- 装完后的首次登录、对外配置与上线部署：见下文末两节
 
 ## 环境要求
 

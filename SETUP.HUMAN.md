@@ -8,9 +8,6 @@ This file covers the **manual step-by-step install**: concrete steps for each en
 git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-- Shortest path without cloning: `uvx grape-quickstart init` (see “② Manual installation” in the README)
-- Restricted Windows machines (AppLocker / Smart App Control): see **Restricted environments** at the end
-- After installing (first sign-in, platform-facing configuration, deployment): see the last two sections
 
 ## Prerequisites
 
