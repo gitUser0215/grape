@@ -77,26 +77,31 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 
 ## 4. Efficiency, Measured in Production
 
-<p align="center">
-  <img src="assets/metrics/en/efficiency.svg" alt="Efficiency: agent tasks per active person per day 9.4 -> 39.4 (4.2x); new issues per day 98 -> 733 (7.5x)">
-</p>
+One question only: how much faster did AI Native make delivery, and where does the speed come from?
+
+### 1. Organisation-wide gain — daily output up several times in one month
+
+Daily agent tasks for the whole org: 901 -> 3,072 (3.4x); per active person: 9.4 -> 39.4 (4.2x); demand intake: 98 -> 733 new issues per day (7.5x). All three are normalised per day, so this compares pace rather than window length - and no headcount was added.
 
 <p align="center">
-  <img src="assets/metrics/en/quality.svg" alt="Task failure rate 9.1% -> 8.0%; agent-to-agent share 39% -> 48%">
+  <img src="assets/metrics/en/org.svg" alt="Organisation-wide gain: daily agent tasks 901 -> 3,072 (3.4x); per active person 9.4 -> 39.4 (4.2x); new issues 98 -> 733 per day (7.5x)">
 </p>
 
+### 2. Getting faster — the curve is still climbing
 
-- **Efficiency and throughput**: active people fell from 96 to 78, while agent tasks per active person per day rose from 9.4 to 39.4 (4.2x); new issues per day rose from 98 to 733 (7.5x)
-- **Quality and collaboration**: failure rate down from 9.1% to 8.0%; A2A share up from 39% to 48% — nearly half of all work is now dispatched agent-to-agent
+Average agent tasks per day: 171 -> 200 -> 901 -> 3,072. The latest month is another 3.4x over the previous full month, while the task failure rate fell from 9.1% to 8.0% - speed did not cost quality.
 
 <p align="center">
-  <img src="assets/metrics/en/status.svg" alt="Issue states: processing 3,022 / completed 1,821 / pending_review 1,733; task states: completed 45,111 (90.3%), failed 3,887">
+  <img src="assets/metrics/en/speedup.svg" alt="Average agent tasks per day 171 -> 200 -> 901 -> 3,072; task failure rate 9.1% -> 8.0%">
 </p>
+
+### 3. Where the speed comes from — VOD clarification and QA verification
+
+59% of agent tasks are spent at the two ends: VOD turns a vague demand into an executable task (<=3 rounds) before handing it over via A2A, and QA verification passes before anything merges (8,386 test cases, 90.3% task completion). Writing code is only 12% - the bottleneck was never typing, so delegating these two ends to agents is where the gain actually comes from.
 
 <p align="center">
-  <img src="assets/metrics/en/pipeline.svg" alt="Agent types: qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918; event sources: A2A 18,317 = 39%">
+  <img src="assets/metrics/en/gate.svg" alt="Agent task mix: qa verify 16,545 (33%), vod clarify demand 13,019 (26%), issue 11,073, coding 6,217 (12%), sre 2,918; VOD + QA = 59%">
 </p>
-
 
 ## 5. Quick Start
 

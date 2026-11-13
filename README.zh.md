@@ -77,26 +77,31 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
 
 ## 四、提效实测
 
-<p align="center">
-  <img src="assets/metrics/zh/efficiency.svg" alt="人效：每活跃人每日 Agent 任务 9.4 → 39.4（4.2×）；新增需求 98 → 733 每日（7.5×）">
-</p>
+这一节只回答一个问题：AI Native 把研发变快了多少，快在哪一段。
+
+### 1. 组织提效 —— 同一个月里，日均产出翻了几倍
+
+组织日均 Agent 任务 901 → 3,072（3.4×）；摊到个人 9.4 → 39.4（4.2×）；需求入口 98 → 733（7.5×）。三项都按日归一，比的是节奏而不是月份长短 —— 人没有增加。
 
 <p align="center">
-  <img src="assets/metrics/zh/quality.svg" alt="任务失败率 9.1% → 8.0%；Agent 派活占比 39% → 48%">
+  <img src="assets/metrics/zh/org.svg" alt="组织提效：组织日均 Agent 任务 901 → 3,072（3.4×）；每活跃人每日 9.4 → 39.4（4.2×）；新增需求 98 → 733 每日（7.5×）">
 </p>
 
+### 2. 越来越快 —— 曲线还在爬
 
-- **人效与吞吐**：活跃人从 96 降到 78，每人每日 Agent 任务却从 9.4 升到 39.4（4.2×）；每日新增需求从 98 升到 733（7.5×）
-- **质量与协作**：失败率 9.1% → 8.0%；A2A 派活占比 39% → 48%，近一半的活由 Agent 派给 Agent
+月度日均 Agent 任务 171 → 200 → 901 → 3,072，最近一个月比上一完整月又翻了 3.4 倍；同期任务失败率 9.1% → 8.0%，快没有把质量拖下去。
 
 <p align="center">
-  <img src="assets/metrics/zh/status.svg" alt="需求终态：processing 3,022 / completed 1,821 / pending_review 1,733；任务状态：completed 45,111 占 90.3%、failed 3,887">
+  <img src="assets/metrics/zh/speedup.svg" alt="月度日均 Agent 任务 171 → 200 → 901 → 3,072；同期任务失败率 9.1% → 8.0%">
 </p>
+
+### 3. 快在这两段 —— VOD 澄清与 QA 验证
+
+Agent 任务有 59% 花在两头：VOD 把模糊需求收敛成可执行任务（≤3 轮）再 A2A 交办，QA 验证通过才合入 PR（8,386 条测试用例，任务完成率 90.3%）。写代码本身只占 12% —— 瓶颈从来不在敲代码，把这两段也交给 Agent，才是提效真正的来源。
 
 <p align="center">
-  <img src="assets/metrics/zh/pipeline.svg" alt="Agent 类型：qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918；事件来源：A2A 18,317 占 39%">
+  <img src="assets/metrics/zh/gate.svg" alt="Agent 任务构成：qa 验证 16,545（33%）、vod 需求澄清 13,019（26%）、issue 11,073、coding 6,217（12%）、sre 2,918；VOD + QA = 59%">
 </p>
-
 
 ## 五、快速开始
 
