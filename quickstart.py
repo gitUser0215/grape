@@ -68,6 +68,15 @@ def docker_cmd() -> list[str] | None:
     return None
 
 
+def compose_file() -> Path | None:
+    """定位 compose 文件：仓库根目录或 deploy/ 下（两种布局都支持）。"""
+    for cand in (HERE / "docker-compose.yml", HERE / "docker-compose.yaml",
+                 HERE / "deploy" / "docker-compose.yml", HERE / "deploy" / "docker-compose.yaml"):
+        if cand.exists():
+            return cand
+    return None
+
+
 def port_busy(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
@@ -256,7 +265,10 @@ def start_native(vp: Path, production: bool, foreground: bool) -> None:
 
 
 def start_docker(dc: list[str]) -> None:
-    step("Docker：配置文件与密钥")
+    cf = compose_file()
+    if cf and cf.parent != HERE:
+        dc = dc + ["-f", str(cf)]
+    step("Docker：配置文件与密钥" + (f"（{cf.relative_to(HERE) if cf else 'docker-compose.yml'}）" if cf else ""))
     env = HERE / ".env"
     if not env.exists() and (HERE / ".env.example").exists():
         shutil.copyfile(HERE / ".env.example", env)
@@ -265,7 +277,7 @@ def start_docker(dc: list[str]) -> None:
     if "JWT_SECRET=" not in text or len(text.split("JWT_SECRET=", 1)[1].splitlines()[0].strip()) < 8:
         with env.open("a", encoding="utf-8") as fh:
             fh.write(f"\nJWT_SECRET={secrets.token_hex(32)}\n")
-        ok("已生成并写入 JWT_SECRET（docker-compose.yml 缺它会立刻退出）")
+        ok("已生成并写入 JWT_SECRET（compose 文件缺它会立刻退出）")
     else:
         ok("JWT_SECRET 已存在")
 
