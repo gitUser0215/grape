@@ -1,12 +1,16 @@
 # Human Installation Guide
 
-**Install and start — one command does it all**:
+This file covers the **manual step-by-step install**: concrete steps for each environment (Windows / macOS / Linux / Docker), mirroring what the install script does.
 
-```powershell
-cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
+**Install and start with one command:**
+
+```bash
+git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-If `python` does not exist on your machine, use `python3`. The subsections below are the manual step-by-step route and mirror what the script does.
+- Shortest path without cloning: `uvx grape-quickstart init` (see “② Manual installation” in the README)
+- Restricted Windows machines (AppLocker / Smart App Control): see **Restricted environments** at the end
+- After installing (first sign-in, platform-facing configuration, deployment): see the last two sections
 
 ## Prerequisites
 
@@ -19,7 +23,7 @@ If `python` does not exist on your machine, use `python3`. The subsections below
 ## Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/gitUser0215/grape.git
+git clone https://github.com/grape-dev/grape.git
 cd grape
 
 # One-click setup: venv + deps + .env + preflight check + start
@@ -61,7 +65,7 @@ If the rule lives in `--system`, use `--system` instead (elevated PowerShell); i
 **Or manually** (same steps as the script):
 
 ```bash
-git clone https://github.com/gitUser0215/grape.git && cd grape
+git clone https://github.com/grape-dev/grape.git && cd grape
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -121,3 +125,23 @@ A local start needs **no `configs/` setup at all**: clone, start, done — then 
 | Execution engine and model configuration (runtime prerequisite) | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Platform-facing configuration (public base URL / OAuth / bot credentials) | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Deployment (start methods / database / configuration) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
+
+## Restricted environments
+
+On **restricted Windows machines** (AppLocker / Smart App Control blocking unsigned executables — `Failed to spawn: grape-quickstart` or `os error 4551`), avoid the generated executable and run the module instead. This applies to every `uvx grape-quickstart …` command in this document:
+
+```powershell
+uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart init
+```
+
+**Mainland China**: add `--repo https://gitcode.com/grape-dev/grape.git` for the source and `--mirror` for dependencies.
+
+## Updating and maintenance
+
+```bash
+uvx grape-quickstart update     # update ~/.grape/src to the latest (git pull --ff-only)
+```
+
+On restricted machines the equivalent is `uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart update`.
+
+Re-run `uvx grape-quickstart init` when dependencies changed (on restricted machines: `python -m grape_quickstart init`).

@@ -1,12 +1,16 @@
 # 人工安装指南
 
-**安装并启动，一个命令搞定**：
+本文件讲**手工逐步安装**：Windows / macOS / Linux / Docker 每种环境的具体步骤，与安装脚本做的事一一对应。
 
-```powershell
-cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python quickstart.py
+**安装并启动，一个命令：**
+
+```bash
+git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-命令里的 `python` 若不存在请换成 `python3`。以下各小节是手工逐步路径，与脚本做的事一一对应。
+- 免克隆的最短路径：`uvx grape-quickstart init`（详见 README 的「② 人工安装」）
+- 受限 Windows 环境（AppLocker / Smart App Control）：见文末 **受限环境**
+- 装完后的首次登录、对外配置与上线部署：见下文末两节
 
 ## 环境要求
 
@@ -19,7 +23,7 @@ cd ~ ; git clone https://github.com/gitUser0215/grape.git ; cd grape ; python qu
 ## Windows（PowerShell）
 
 ```powershell
-git clone https://github.com/gitUser0215/grape.git
+git clone https://github.com/grape-dev/grape.git
 cd grape
 
 # 一键启动：自动建 venv + 装依赖 + 复制 .env + 自检 + 启动
@@ -61,7 +65,7 @@ git config --global --unset-all "url.https://gh-proxy.com/https://github.ab.com/
 **或手动执行**（与脚本步骤一一对应）：
 
 ```bash
-git clone https://github.com/gitUser0215/grape.git && cd grape
+git clone https://github.com/grape-dev/grape.git && cd grape
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -121,3 +125,23 @@ docker compose up -d
 | 执行引擎与模型配置（运行前提） | [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md) |
 | 平台对外配置（对外基址 / OAuth / 机器人凭据） | [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md) |
 | 上线部署（启动方式 / 数据库 / 配置清单） | [docs/DEPLOYMENT.zh.md](docs/DEPLOYMENT.zh.md) |
+
+## 受限环境
+
+**受限 Windows**（AppLocker / Smart App Control 拦截未签名 exe，报 `Failed to spawn: grape-quickstart` 或 `os error 4551`）避免执行生成的 exe，改用模块方式；本节的写法适用于本文所有 `uvx grape-quickstart …` 命令：
+
+```powershell
+uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart init
+```
+
+**国内网络**：源码加 `--repo https://gitcode.com/grape-dev/grape.git`；依赖加 `--mirror`。
+
+## 更新与维护
+
+```bash
+uvx grape-quickstart update     # 把 ~/.grape/src 更新到最新（git pull --ff-only）
+```
+
+受限环境下等价写法：`uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart update`。
+
+依赖有变化时再跑一次 `uvx grape-quickstart init`（受限环境同理换成 `python -m grape_quickstart init`）。

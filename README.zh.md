@@ -111,7 +111,7 @@ Agent 任务的 59% 集中于流水线两端：VOD 将模糊需求收敛为可�
 把下面这句丢给你的 AI Agent，让它全程搞定：
 
 ```text
-按 https://github.com/gitUser0215/grape/blob/main/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
+按 SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
 ```
 
 执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项，见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
