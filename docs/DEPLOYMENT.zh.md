@@ -11,7 +11,7 @@ python -m src.api.run          # 生产：主 API 3000 + Webhook 8080
 python -m src.api.run --dev    # 开发：单端口 3000，热加载
 ```
 
-nginx 反向代理 / systemd / Docker 等生产部署示例见 `docs/`（先读 `docs/DOCUMENTATION-GUIDE.md`），compose 文件与 `nginx-grape.conf` 在仓库根目录，告警规则在 `deploy/alerts.yml`。
+nginx 反向代理 / systemd / Docker 等生产部署示例随代码提供：`nginx-grape.conf` 与 `docker-compose.yml` 在仓库根目录，systemd 单元在 `deploy/systemd/` 下，告警规则在 `deploy/alerts.yml`；文档地图见 `docs/DOCUMENTATION-GUIDE.md`。
 
 ## 数据库
 

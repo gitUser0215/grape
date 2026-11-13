@@ -11,7 +11,7 @@ python -m src.api.run          # Production: main API 3000 + Webhook 8080
 python -m src.api.run --dev    # Development: single port 3000, hot-reload
 ```
 
-Production deployment examples (nginx reverse proxy / systemd / Docker) live in `docs/` (see `docs/DOCUMENTATION-GUIDE.md`); the compose file and `nginx-grape.conf` are at the repo root. Alert rules ship in `deploy/alerts.yml`.
+Production deployment examples ship with the code: `nginx-grape.conf` and `docker-compose.yml` at the repo root, systemd units under `deploy/systemd/`, alert rules in `deploy/alerts.yml`. The documentation map is `docs/DOCUMENTATION-GUIDE.md`.
 
 ## Database
 
