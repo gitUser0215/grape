@@ -4,9 +4,19 @@ This file covers the **manual step-by-step install**: concrete steps for each en
 
 **Install and start with one command:**
 
+**GitHub**
+
 ```bash
 git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
+
+**GitCode**
+
+```bash
+git clone https://gitcode.com/grape-dev/grape.git && python grape/quickstart.py
+```
+
+> The manual steps below use the GitHub URL; for the GitCode mirror just swap `https://github.com/grape-dev/grape.git` for `https://gitcode.com/grape-dev/grape.git`.
 
 ## Prerequisites
 
