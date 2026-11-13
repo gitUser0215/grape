@@ -8,7 +8,6 @@ This file covers the **manual step-by-step install**: concrete steps for each en
 git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-
 ## Prerequisites
 
 | Component | Requirement | Notes |

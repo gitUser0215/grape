@@ -8,7 +8,6 @@
 git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
 ```
 
-
 ## 环境要求
 
 | 组件 | 版本要求 | 说明 |
