@@ -123,22 +123,12 @@ docker compose up -d
 | 平台对外配置（对外基址 / OAuth / 机器人凭据） | [docs/CONFIGURATION.zh.md](docs/CONFIGURATION.zh.md) |
 | 上线部署（启动方式 / 数据库 / 配置清单） | [docs/DEPLOYMENT.zh.md](docs/DEPLOYMENT.zh.md) |
 
-## 受限环境
-
-**受限 Windows**（AppLocker / Smart App Control 拦截未签名 exe，报 `Failed to spawn: grape-quickstart` 或 `os error 4551`）避免执行生成的 exe，改用模块方式；本节的写法适用于本文所有 `uvx grape-quickstart …` 命令：
-
-```powershell
-uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart init
-```
-
-**国内网络**：源码加 `--repo https://gitcode.com/grape-dev/grape.git`；依赖加 `--mirror`。
-
 ## 更新与维护
 
 ```bash
-uvx grape-quickstart update     # 把 ~/.grape/src 更新到最新（git pull --ff-only）
+cd grape
+git pull --ff-only                  # 拉取最新代码
+pip install -r requirements.txt     # 依赖有变化时重装
 ```
 
-受限环境下等价写法：`uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart update`。
-
-依赖有变化时再跑一次 `uvx grape-quickstart init`（受限环境同理换成 `python -m grape_quickstart init`）。
+**国内网络**：源码改用 GitCode 镜像 `git clone https://gitcode.com/grape-dev/grape.git`；pip 依赖加国内镜像源。

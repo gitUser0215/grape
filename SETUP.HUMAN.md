@@ -123,22 +123,12 @@ A local start needs **no `configs/` setup at all**: clone, start, done — then 
 | Platform-facing configuration (public base URL / OAuth / bot credentials) | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Deployment (start methods / database / configuration) | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) |
 
-## Restricted environments
-
-On **restricted Windows machines** (AppLocker / Smart App Control blocking unsigned executables — `Failed to spawn: grape-quickstart` or `os error 4551`), avoid the generated executable and run the module instead. This applies to every `uvx grape-quickstart …` command in this document:
-
-```powershell
-uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart init
-```
-
-**Mainland China**: add `--repo https://gitcode.com/grape-dev/grape.git` for the source and `--mirror` for dependencies.
-
 ## Updating and maintenance
 
 ```bash
-uvx grape-quickstart update     # update ~/.grape/src to the latest (git pull --ff-only)
+cd grape
+git pull --ff-only                  # pull the latest code
+pip install -r requirements.txt     # reinstall when dependencies changed
 ```
 
-On restricted machines the equivalent is `uvx --from 'grape-quickstart==0.1.4' python -m grape_quickstart update`.
-
-Re-run `uvx grape-quickstart init` when dependencies changed (on restricted machines: `python -m grape_quickstart init`).
+**Mainland China**: clone from the GitCode mirror `git clone https://gitcode.com/grape-dev/grape.git` and point pip at a domestic index.
