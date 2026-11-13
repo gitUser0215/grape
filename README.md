@@ -25,9 +25,6 @@
   </p>
 
   <p>
-    <a href="https://railway.com/deploy/grape-test?referralCode=25_MLK&utm_medium=integration&utm_source=template&utm_campaign=generic"><img src="https://railway.com/button.svg" alt="Deploy on Railway"></a>
-  </p>
-  <p>
     <a href="https://www.grapedev.cn/community.html?cat=join" title="Join the community"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu">&nbsp;Feishu</a> ·
     <a href="https://www.grapedev.cn/community.html?cat=join" title="Join the community"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat">&nbsp;WeChat</a>
   </p>
@@ -110,10 +107,14 @@ Two install paths — pick one: hand it to an agent, or do it yourself.
 Send the paragraph below to your AI agent; it will install and start the platform:
 
 ```text
-Install and start the Grape platform for me by following https://github.com/grape-dev/grape/blob/main/SETUP.AGENT.md
+Install and start the Grape platform for me by following https://gitcode.com/workSpace-hands-on/paper/blob/main/grape/README/v4/SETUP.AGENT.md
 ```
 
 Execution engine and model configuration, hosting your first repository, the preflight check and deployment are covered in **[SETUP.AGENT.md](SETUP.AGENT.md)**.
+
+Prerequisites: Python ≥ 3.10 (the script creates its own `venv`); on mainland networks the install uses the Aliyun PyPI mirror (`mirrors.aliyun.com`). Full steps: [SETUP.HUMAN.md](SETUP.HUMAN.md).
+
+First-time deployment? Follow the self-check list: [docs/0-to-1-checklist.md](docs/0-to-1-checklist.md).
 
 <details>
 <summary><strong>② Manual installation (one command)</strong></summary>
@@ -121,7 +122,7 @@ Execution engine and model configuration, hosting your first repository, the pre
 Install and start — one command does it all:
 
 ```bash
-git clone https://github.com/grape-dev/grape.git && python grape/quickstart.py
+git clone https://github.com/grape-dev/grape.git && python3 grape/quickstart.py
 ```
 
 Windows PowerShell (5.1 does not support `&&` — use `;` instead):
