@@ -105,18 +105,15 @@ Monthly average agent tasks per day: 171 -> 200 -> 901 -> 3,072, a further 3.4x 
 
 Two install paths — pick one: hand it to an agent, or do it yourself.
 
-<details open>
-<summary><strong>① Let an agent install it (recommended)</strong></summary>
+### ① Let an agent install it (recommended)
 
-Hand the line below to your AI agent and let it handle everything:
+Send the paragraph below to your AI agent; it will install and start the platform:
 
 ```text
-Install and start the Grape platform for me by following SETUP.AGENT.md
+Install and start the Grape platform for me by following https://github.com/grape-dev/grape/blob/main/SETUP.AGENT.md
 ```
 
 Execution engine and model configuration, hosting your first repository, the preflight check and deployment are covered in **[SETUP.AGENT.md](SETUP.AGENT.md)**.
-
-</details>
 
 <details>
 <summary><strong>② Manual installation (one command)</strong></summary>

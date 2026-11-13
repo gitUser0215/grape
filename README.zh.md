@@ -105,18 +105,15 @@ Agent 任务的 59% 集中于流水线两端：VOD 将模糊需求收敛为可�
 
 两种装法，任选其一 —— 交给 Agent，还是自己动手。
 
-<details open>
-<summary><strong>① 让 Agent 装（推荐）</strong></summary>
+### ① 让 Agent 装（推荐）
 
-把下面这句丢给你的 AI Agent，让它全程搞定：
+把下面这段话发给你的 AI Agent，由它完成安装与启动：
 
 ```text
-按 SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
+按 https://github.com/grape-dev/grape/blob/main/SETUP.AGENT.md 里的步骤为我安装 Grape 平台并启动
 ```
 
 执行引擎与模型配置、托管首个仓库、环境自检、上线部署等其余事项，见 **[SETUP.AGENT.md](SETUP.AGENT.md)**。
-
-</details>
 
 <details>
 <summary><strong>② 人工安装（一条命令）</strong></summary>
