@@ -5,12 +5,14 @@
 Copy the whole block below to your coding agent (Claude Code / Codex / Cursor / opencode …); it will clone, install dependencies, start the service and verify it:
 
 ```text
-Please clone https://github.com/grape-dev/grape and verify that the service is reachable (trial mode: no OAuth, mail service or external database).
+Please clone the repository this SETUP.AGENT.md was read from — https://github.com/grape-dev/grape — and verify that the service is reachable (trial mode: no OAuth, mail service or external database).
 Pre-check: Python >= 3.10, Node.js >= 18. If either does not match, stop and report; do not upgrade the system environment.
 Startup: run python -m src.api.run --dev in the background (it blocks the foreground, so use a background job) and wait for port 3000 to be ready.
 Verification: curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/health returning 200 means success.
 When the service is up, tell me; I will register the account. Report every step; on failure, stop and quote the command and the full error — do not retry silently and do not switch approaches on your own.
 ```
+
+> This guide is published on both hosts; use the clone URL of the host you read it from — GitHub `https://github.com/grape-dev/grape` · GitCode `https://gitcode.com/grape-dev/grape`.
 
 Acceptance: `curl -s http://localhost:3000/api/health` returns 200. Account registration is done by a person on the page.
 
