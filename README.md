@@ -150,7 +150,7 @@ The first sign-in, platform-facing configuration and deployment are covered in *
 - **Scenes and cases**: [community and use cases](https://www.grapedev.cn/community.html)
 - **Feedback**: [Issues](https://github.com/grape-dev/grape/issues)
 - **Chat**: <span title="join link coming soon"><img src="assets/community/feishu.svg" width="18" height="18" alt="Feishu"></span>&nbsp;Feishu · <span title="join link coming soon"><img src="assets/community/wechat.svg" width="18" height="18" alt="WeChat"></span>&nbsp;WeChat
-- **Contributing**: bug fixes, feature requests and new Skills are all welcome — see [CONTRIBUTING.md](CONTRIBUTING.md); contributor list in [Contributors](https://github.com/grape-dev/grape/graphs/contributors)
+- **Contributing**: bug fixes, feature requests and new Skills are all welcome — see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Security and privacy
 
