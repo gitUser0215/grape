@@ -78,10 +78,6 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
 ## 四、提效实测
 
 <p align="center">
-  <img src="assets/metrics/zh/kpi.svg" alt="8,037 承载需求 · 49,968 Agent 任务 · 完成率 90.3% · 6.2 任务每需求 · 110 真实用户 · 352 接入仓库">
-</p>
-
-<p align="center">
   <img src="assets/metrics/zh/efficiency.svg" alt="人效：每活跃人每日 Agent 任务 9.4 → 39.4（4.2×）；新增需求 98 → 733 每日（7.5×）">
 </p>
 
@@ -99,10 +95,6 @@ Grape 的目标是将这些环节**全部 AI 化**，让开发者从执行者变
 
 <p align="center">
   <img src="assets/metrics/zh/pipeline.svg" alt="Agent 类型：qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918；事件来源：A2A 18,317 占 39%">
-</p>
-
-<p align="center">
-  <img src="assets/metrics/zh/spread.svg" alt="任务量 Top 6 仓库；grape-dev 自家 5 仓 30.1%，其他组织头部 4 仓 32.5%">
 </p>
 
 

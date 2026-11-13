@@ -78,10 +78,6 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 ## 4. Efficiency, Measured in Production
 
 <p align="center">
-  <img src="assets/metrics/en/kpi.svg" alt="8,037 issues carried · 49,968 agent tasks · 90.3% completion · 6.2 tasks per issue · 110 real users · 352 connected repos">
-</p>
-
-<p align="center">
   <img src="assets/metrics/en/efficiency.svg" alt="Efficiency: agent tasks per active person per day 9.4 -> 39.4 (4.2x); new issues per day 98 -> 733 (7.5x)">
 </p>
 
@@ -99,10 +95,6 @@ Grape's goal is to **AI-ify every one of these steps**, turning developers from 
 
 <p align="center">
   <img src="assets/metrics/en/pipeline.svg" alt="Agent types: qa 16,545 / vod 13,019 / issue 11,073 / coding 6,217 / sre 2,918; event sources: A2A 18,317 = 39%">
-</p>
-
-<p align="center">
-  <img src="assets/metrics/en/spread.svg" alt="Top 6 repos by task volume; grape-dev own 5 repos 30.1%, other orgs top 4 repos 32.5%">
 </p>
 
 
